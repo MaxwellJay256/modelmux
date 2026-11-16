@@ -33,6 +33,7 @@ import { migrateLegacyChannelDirs } from "../../runtime/storage-migrate.js";
 import * as poolUsage from "../../pool/pool-usage.js";
 import { baseUrlOf, displayBase } from "../../http/portfree.js";
 import { detectStaleBuild, staleBuildHint } from "./stale-build.js";
+import { setWatchdogPaused } from "../../runtime/watchdog-flag.js";
 import {
   appendSystem,
   compactPayloads,
@@ -152,6 +153,8 @@ export async function start(options: StartOptions = {}): Promise<number> {
   const waitMs = options.waitMs ?? DEFAULT_WAIT_MS;
   const { quiet = false, auto = false, force = false } = options;
   const name = scope.name;
+  // 显式启动 = 撤销「用户明确要停」的标记，让外层守护恢复保护（见 runtime/watchdog-flag.ts）
+  setWatchdogPaused(false);
   const log = (m: string): void => {
     if (!quiet) console.log(`[${name}] ${m}`);
   };
@@ -304,6 +307,9 @@ export async function stop(options: { quiet?: boolean; addr?: string; cid?: stri
       log("网关在运行但没有 PID 文件（非本机守护拉起），未做处理");
       return 1;
     }
+    // 无 PID 文件且端口上不健康 = 网关确实没在跑，这正是「显式停止」要的结果：
+    // 置标记，否则外层守护下一轮探测失败就会把它重新拉起来
+    setWatchdogPaused(true);
     log("网关未在运行");
     return 0;
   }
@@ -312,7 +318,9 @@ export async function stop(options: { quiet?: boolean; addr?: string; cid?: stri
   // 进程对象还在，都不能声称停止（实测踩过：stop 报成功、删了 PID 文件，
   // 进程照常服务）。端口的最终核验放到 worker 清理完之后做。
   if (!dead || pidAlive(pid)) {
-    // 进程还活着就不能声称「已停止」：留着 PID 文件，下一次 stop 还能再试
+    // 进程还活着就不能声称「已停止」：留着 PID 文件，下一次 stop 还能再试。
+    // 这里**不置**守护暂停标记：标记的语义是「用户不要再拉起」，而网关此刻仍在跑，
+    // 置标记既不会让它停下，只会让守护在它下次崩溃时不再拉回。
     log(`未能停止网关 (PID ${pid})：进程仍在运行，请手动结束`);
     return 1;
   }
@@ -348,6 +356,8 @@ export async function stop(options: { quiet?: boolean; addr?: string; cid?: stri
   } catch {
     /* 已被清掉 */
   }
+  // 显式停止：外层守护不再把它拉回来（用户要的就是「停」）
+  setWatchdogPaused(true);
   log(`已停止网关 (PID ${pid})`);
   return 0;
 }
@@ -537,16 +547,8 @@ export async function status(
       console.log(`签到: -（${info.signin.unsupported.join(", ")} 无签到功能）`);
     }
   }
-  // 下一步建议：有异常才说话，正常不打扰（status 是高频诊断命令的收尾）
-  const notLoggedIn = perChannel.filter((c) => !c.present);
-  if (notLoggedIn.length > 0) {
-    const first = notLoggedIn[0]!;
-    console.log(
-      list.length === 1
-        ? `建议: mx login ${first.cid}（未登录）`
-        : `建议: ${notLoggedIn.length} 个渠道未登录，逐个 mx login <cid>（如 mx login ${first.cid}）`,
-    );
-  }
+  // 不再提示「未登录渠道去 mx login」：谁没登录在控制台账号池里一眼可见，
+  // 没登录就是用户没号或不想走这个渠道，不需要每次 status 都催一遍
   if (stale.stale) console.log(staleBuildHint(stale));
   const message = consoleState?.["message"];
   if (typeof message === "string" && message) console.log(`提示: ${message}`);

@@ -218,10 +218,10 @@ interface Channel {
 
 ### 4.1 对外 id：模型家族裸模型名（`model-family.ts` + `model-registry.ts`）
 
-网关对外只做**家族表里声明的模型**，id 形态是**裸模型名**
-（家族与别名表见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2；`deepseek-flash` 是
-`deepseek-v4.1-flash` 的别名）。
-家族表（对外 id、canonical 归并、别名组、`owned_by`）声明在
+网关对外只做**家族表里声明的模型**，id 形态是**裸模型名**（表见
+[POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2）。客户端只认对外名单里的名字：
+渠道侧等价写法（如 `deepseek-flash`）不在名单里，写了就是 400。
+家族表（对外 id、canonical 归并、`owned_by`）声明在
 `packages/core/gateway/src/pool/model-family.ts` —— 共享层**唯一**允许出现模型名的地方
 （由 `scripts/verify-contract.mjs` 强制）。
 
@@ -333,10 +333,11 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 `LoginUi.requestInput?`（`packages/core/gateway/src/runtime/channel.ts:102-113`）向用户
 要一段输入，返回用户填的内容；**取消 / 无人应答 → `undefined`**。
 
-- **无界面实现不要实现它**（CLI 的 `StdoutLoginUi` 就不实现，见
-  `packages/core/gateway/src/app/lifecycle/headless.ts:152-157`）；渠道**必须先试
-  `requestInput`，拿到 `undefined` 再回落到自己的输入来源**（环境变量 / 文件），
-  否则终端用户会卡在等一个永远不来的输入框（`mx login loomy` 的既有用法全靠环境变量）。
+- **渠道必须先试 `requestInput`，拿到 `undefined` 再回落到自己的输入来源**（环境变量 / 文件），
+  否则终端用户会卡在等一个永远不来的输入框（脚本化用法全靠环境变量）。
+  CLI 的 `StdoutLoginUi` **已实现**它：提示写 stderr、从 stdin 读一行，TTY 与管道都支持
+  （`packages/core/gateway/src/app/lifecycle/headless.ts` 的 `StdinPasteReader`）；
+  长驻模式（`serve`）不开粘贴通道，直接返回 `undefined`，回落路径不变。
 - 控制台侧：`ServiceState.requestInput` 登记请求 → 快照的 `login_input`
   下发到界面（`packages/core/gateway/src/http/console/console.ts` 的 `UiSnapshot`）→
   用户提交经 `submitInput` 动作回来；界面关闭走 `cancelInput`。

@@ -68,6 +68,22 @@ export interface RequestLog {
   outcome?: AccessOutcome;
   error?: string;
   message?: string;
+  /**
+   * 客户端 User-Agent（只在**未知路径 404** 上写）。
+   *
+   * 为什么记它：`/api/hello`、`/.well-known/...` 这类幽灵探针只知道路径，认不出是谁发的
+   * （2026-11-15 排查时 11 天里 69 次 HEAD `/api/hello` 无法定位来源）。只在 404 上记，
+   * 正常请求不落这个字段（省体积、也少一份可识别信息）。
+   */
+  ua?: string;
+  /**
+   * 网关自身异常的详情（诊断用，不发给客户端）。
+   *
+   * 为什么单开字段：`message` 是给客户端的那一句话（如「gateway internal error; see logs」），
+   * 真实异常若也走 `message`，会被随后的 `writeJsonError` 覆盖 —— 500 于是只剩一句空话，
+   * 事后无从定位（2026-11-15 排查 internal_error 时确认）。
+   */
+  detail?: string;
   /** 从请求开始到第一个响应字节（首帧）的毫秒数。 */
   ttfbMs?: number;
   /** 从请求开始到上游响应头到达的毫秒数。 */
@@ -396,6 +412,8 @@ function appendAccessFile(outcome: AccessOutcome, record: RequestLog): void {
       model: record.model,
       cid: record.cid,
       error: record.error,
+      // 详情只在有值时出现：正常业务失败（未知模型、上游 4xx）没有这一项
+      ...(record.detail !== undefined ? { detail: record.detail } : {}),
       duration_ms: record.durationMs,
       ttfb_ms: record.ttfbMs,
       upstream_ms: record.upstreamMs,
@@ -471,6 +489,29 @@ export function noteRequestError(res: ServerResponse, code: string, message: str
   log.outcome = "failure";
   log.error ??= code;
   log.message = message.slice(0, 800);
+}
+
+/**
+ * 记网关自身异常详情（只进日志，不回客户端）。
+ *
+ * 与 `noteRequestError` 分开：那个写的是给客户端看的原因，可能被随后的
+ * `writeJsonError` 用同文案再写一遍；详情走独立字段，不被覆盖。
+ */
+export function noteRequestDetail(res: ServerResponse, detail: string): void {
+  const log = getRequestLog(res);
+  if (!log) return;
+  log.detail = detail.slice(0, 800);
+}
+
+/**
+ * 记客户端 User-Agent（只给未知路径 404 用；见 `RequestLog.ua` 的 why）。
+ *
+ * 截断到 160 字符：UA 可能很长，且这里只为认领「谁在探」。
+ */
+export function noteRequestUa(res: ServerResponse, ua: string | undefined): void {
+  const log = getRequestLog(res);
+  if (!log || !ua) return;
+  log.ua = ua.slice(0, 160);
 }
 
 /** 标记客户端主动断开（不算服务端失败）。 */
@@ -1177,14 +1218,19 @@ function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | nu
  * 查询某天的访问日志。
  *
  * 读量有界：每个 outcome 文件只读尾部 1MB、总扫描行数上限 2 万 —— 超限时
- * `truncated=true`，调用方据此把统计口径标注成「窗口内」，而不是假装是全量。
+ * `truncated=true`，让残缺可见（排障用；界面不展示，列表本身就是窗口内的样本）。
  * 给出的 `stats`（与 `cids`）基于**未过滤**的扫描窗口（当天概览），`total` 才是筛选后的
  * 条数；两组数字唯一的范围差别是**路径**：统计只覆盖 `path` / `paths` 声明的范围
  * （否则分段计数会把列表永远显示不出来的非模型请求算进去，见 `inScope`）。
  */
 export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
   const dates = listAccessDates();
-  const date = query.date !== undefined && dates.includes(query.date) ? query.date : (dates[0] ?? "");
+  /** `all` = 跨**全部**有日志的日期聚合（控制台「全部时间」）。 */
+  const all = query.date === "all";
+  const date = !all && query.date !== undefined && dates.includes(query.date) ? query.date : (dates[0] ?? "");
+  // `listAccessDates()` 本身已是倒序（新的在前），直接沿用：扫描行数上限触发时先读满最新日期，
+  // 被截断丢掉的必须是最旧那几天 —— 否则默认视图（全部时间）会看不到当天与最近几天。
+  const scanDates = all ? dates : [date];
   const limit = Math.min(Math.max(1, query.limit ?? ACCESS_DEFAULT_LIMIT), ACCESS_MAX_LIMIT);
   const offset = Math.max(0, query.offset ?? 0);
   const stats: AccessStats = {
@@ -1201,7 +1247,7 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
     cache: { hit: 0, total: 0, hitRate: null },
   };
   const slowThresholds = { ttfbMs: SLOW_TTFB_MS, tps: SLOW_TPS };
-  if (!date) {
+  if (!date && !all) {
     return { date: "", dates, cids: [], slowThresholds, scanned: 0, truncated: false, total: 0, stats, entries: [] };
   }
 
@@ -1237,10 +1283,11 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
     (query.paths === undefined || query.paths.includes(path ?? ""));
   const seenCids = new Set<string>();
   // 历史 other.log 并入 failure 一起扫（新写入不再产生，只覆盖旧机器上已有的行）
-  const buckets: Array<{ outcome: AccessOutcome; files: string[] }> = [
-    ...ACCESS_OUTCOMES.map((outcome) => ({ outcome, files: accessFiles(date, outcome) })),
-    { outcome: "failure" as const, files: legacyOtherFiles(date) },
-  ];
+  const buckets: Array<{ outcome: AccessOutcome; files: string[] }> = [];
+  for (const d of scanDates) {
+    buckets.push(...ACCESS_OUTCOMES.map((outcome) => ({ outcome, files: accessFiles(d, outcome) })));
+    buckets.push({ outcome: "failure" as const, files: legacyOtherFiles(d) });
+  }
   scan: for (const { outcome, files } of buckets) {
     for (const file of files) {
       const tail = readTail(file, ACCESS_TAIL_BYTES);
@@ -1323,7 +1370,7 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
   matched.sort((a, b) => (a.ts === b.ts ? (a.id < b.id ? 1 : -1) : a.ts < b.ts ? 1 : -1));
 
   return {
-    date,
+    date: all ? "all" : date,
     dates,
     cids,
     slowThresholds,

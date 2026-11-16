@@ -434,7 +434,7 @@ class ServiceState {
       ),
       // 模型偏好**从家族表派生**（`poolModels()`），不依赖 `/v1/models` 轮询结果：
       // 轮询为空（刚起进程 / 上游抖动）时偏好整段会消失，用户根本无处设置。
-      // 只渲染 deepseek 族：glm / qwen 的供给已收窄到唯一渠道，无偏好语义。
+      // 只渲染 PREFS_CANONICALS 声明的族：收窄到唯一渠道的模型没有偏好语义（选了也没别家可换）。
       model_prefs: poolModels()
         .filter((model) => isPrefsModel(model))
         .map((model) => ({
@@ -708,7 +708,9 @@ export async function runServe(options: ServeOptions): Promise<number> {
       const match = /^\[([a-z0-9][a-z0-9.-]*)\]/.exec(message);
       if (match && hasChannel(match[1])) appendChannel(match[1]!, line);
     }
-    if (/(error|failed|timeout|reject|aborted|exception|unauthor)/i.test(line)) {
+    // `info:` 前缀 = 网关自己消化的降级路径（如「该渠道接不住这段输入，换渠道重试」），
+    // 不是故障；关键词匹配会把 UnsupportedInputError 这类字面量骗进错误日志
+    if (!message.startsWith("info:") && /(error|failed|timeout|reject|aborted|exception|unauthor)/i.test(line)) {
       appendError(line);
     }
     if (!json) console.error(line);

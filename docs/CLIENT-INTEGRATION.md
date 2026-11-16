@@ -29,6 +29,8 @@
 | `GET /v1/models` | OpenAI 模型清单 | 所有客户端 |
 
 - 入站**无鉴权**（网关只绑 127.0.0.1）；`apiKey` 字段任意非空值即可。
+- 请求体上限 **32MB**（`http/chat/request.ts` 的 `MAX_BODY`）；超过即 `400`，不读完整包。
+  长上下文请求（实测有 2.5MB / 66 万 tokens 的量级）离上限还远，正常用不会碰到。
 - 访问日志记 `protocol` 字段（`anthropic` / `responses`；缺省 = OpenAI chat），
   `mx log` 与 access 日志文件里可见。
 - 转发管线对三种协议共用：候选挑选、账号轮换、排队探测、额度冷却行为完全一致。
@@ -71,7 +73,8 @@
 `packages/core/gateway/src/pool/inbound-model.ts`）：
 
 1. 剥 `[1m]` 后缀（Claude Code 的 1M 窗口标记）与 `modelmux/` 前缀；
-2. 大小写不敏感 + 别名归并（`deepseek-flash` → `deepseek-v4.1-flash`，家族表唯一事实源）；
+2. 大小写不敏感 + 只认**对外公布的裸名**（当前 `deepseek-v4.1-flash` / `qwen3.8-flash`；
+   渠道侧写法如 `deepseek-flash`、`sn-deepseek-v4-1-flash-1017` 不在名单里，写了就是 400）；
 3. Claude Desktop 的三个角色名（`claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`）
    按 `DESKTOP_ROLE_MODELS` 固定表映射到池模型（见 [CONTRACT-TS.md §4.1.1](./CONTRACT-TS.md)）；
 4. 其余家族外的名字一律 `400 unknown_model`（含 `gpt-*` 与不在角色表里的 `claude-*`）。

@@ -9,8 +9,9 @@
 - **一个网关**：监听 `127.0.0.1:4412`，OpenAI 兼容 `/v1/chat/completions`，
   另有 Anthropic Messages（`/v1/messages`）、OpenAI Responses（`/v1/responses`）、
   `/v1/models` 与 `/health`。
-- **统一模型池**：对外只有家族表里的**裸模型名**（`deepseek-flash` 是
-  `deepseek-v4.1-flash` 的别名）；`/v1/models` 只列「至少一个渠道能供给」的那几个。
+- **统一模型池**：对外只有家族表里公布的那几个**裸模型名**（当前是
+  `deepseek-v4.1-flash` 与 `qwen3.8-flash`，别的一律 400）；`/v1/models` 只列
+  「至少一个渠道能供给」的那些。
 - **多渠道路由**：同一模型的候选渠道按**账号池剩余额度之和降序**，先出额度最多的那家；
   渠道内账号耗尽自动换号，整家烧光则顺延下一家。额度耗尽进冷却（到期自动恢复），
   连败熔断后自动半开试探。
@@ -62,7 +63,6 @@ npm run desktop      # 可选：打成 Windows 安装版 exe
 | 渠道端到端测试 | 技能 `.agents/skills/dsh-mx-test/SKILL.md` |
 | 日志排查 | [docs/LOGGING.md §10](docs/LOGGING.md) |
 | 收尾流程 | 技能 `.agents/skills/repo-sync/SKILL.md` |
-| 探索式开发的收口（dev 分支整理） | 技能 `.agents/skills/dev-flow/SKILL.md` |
 | 渠道用法与上游协议 | [docs/channels/README.md](docs/channels/README.md) · `docs/channels/<cid>/PROTOCOL.md` |
 
 > 技能清单以 [docs/README.md](docs/README.md) §3 的表为准；`verify-docs` 会校验不漏登记。

@@ -61,9 +61,11 @@
 | `status` | number | 最终 HTTP 状态码 | 响应结束时 |
 | `outcome` | string | 结果分类，见 §3.2 | 响应结束时 |
 | `error` | string | 错误码（如 `upstream_error`、`upstream_timeout`） | 出错时 |
+| `detail` | string | **网关自身异常详情**（如 500 的真实异常）。只进 `error/*/error.log` 的镜像行，情况见 §5 第 3 条 | `internal_error` 兜底时（`noteRequestDetail`） |
 | `message` | string | 错误说明（**截断到 800 字符**） | 出错时 |
 | `usage` | object | 上游返回的 token 用量（含各家的缓存命中字段，逐渠道形态不同） | 收到 usage 帧（非流式为聚合后） |
 | `queued` | boolean | **进过上游排队**（收到排队帧并等待重试）。只在为真时写，缺省 = 没收到排队帧 | 排队帧到达时（`noteQueued`） |
+| `ua` | string | 客户端 User-Agent（截断 160 字符）。**只在未知路径 404 上写**：`/api/hello` 这类幽灵探针只能靠它认领来源 | 未知路径应答时（`noteRequestUa`） |
 
 > `ttfbMs` 的语义是「**我们**什么时候开始回字节」，不是「上游什么时候开始吐字」：
 > 流式下两者几乎相同（收到首帧即转发），但**非流式下我们收完才写** —— 该值于是 ≈ `durationMs`，
@@ -190,8 +192,16 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 2. 渠道维度：单渠道运行时写入 `channels/<cid>/<date>.log`；多渠道运行时按消息的
    `[cid]` 前缀路由到对应渠道目录，前缀不匹配已知渠道则不写渠道日志。
 3. 错误判定：消息命中 `error` / `failed` / `timeout` / `reject` / `aborted` / `exception` /
-   `unauthor` 之一（不区分大小写、**前缀匹配**）时，追加写入 `error/<date>/error.log`（结构化行）。
+   `unauthor` 之一（不区分大小写）时，追加写入 `error/<date>/error.log`（结构化行）。
    该判定是**关键词匹配**，不解析上游错误结构。
+   - 消息以 `info:` 开头时**不进**错误日志：网关自己消化的降级（如「该渠道接不住这段输入，
+     换渠道重试」）与逐轮心跳（账单刷新汇总）走这一类 —— 它们的文本里带 `Error` / `failed`
+     字面量，靠关键词判定会被误收（`UnsupportedInputError` 即如此）。
+   - **同因去重**：账单刷新失败按 scope（渠道级 `cid` / 账号级 `cid/key`）记住上一条原因，
+     连续同因只写一行，成功后清账 —— 未登录这类常态原因会持续数天，每轮写一行会把错误日志
+     淹掉（2026-11-15 实测 14 天里 98% 是这类噪音）。
+   - 请求级失败的 `detail` 字段装**网关自身的异常详情**（如 500 的真实异常），与给客户端的
+     `message` 分开：`message` 会被随后的错误应答覆盖，`detail` 不会（同次排查确认）。
 
 ## 6. 轮转、保留与阈值
 
@@ -427,7 +437,7 @@ mx status --json
 客户端响应头 `X-Request-Id` 与日志里的 `id` 一一对应，**按 id 关联，不按时间猜**。
 
 
-### 10.6. 修复后的验证
+### 10.6. 改动后的验证
 
 ```bash
 npm test
