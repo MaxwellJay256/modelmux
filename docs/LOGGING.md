@@ -66,6 +66,7 @@
 | `usage` | object | 上游返回的 token 用量（含各家的缓存命中字段，逐渠道形态不同） | 收到 usage 帧（非流式为聚合后） |
 | `queued` | boolean | **进过上游排队**（收到排队帧并等待重试）。只在为真时写，缺省 = 没收到排队帧 | 排队帧到达时（`noteQueued`） |
 | `ua` | string | 客户端 User-Agent（截断 160 字符）。**只在未知路径 404 上写**：`/api/hello` 这类幽灵探针只能靠它认领来源 | 未知路径应答时（`noteRequestUa`） |
+| `route` | object | **选路快照**：`{ est, candidates[], attempts[], skipped[{cid,why}] }`。`est` 是输入估算 token，`candidates` 是全部候选顺序，`attempts` 是本次实际会试的，`skipped.why` 取 `auth` / `window` / `unauthorized` / `cooling`。落它的原因：路由只在内存里发生，事后「这次为什么走了这家」原本无从查证（2026-11-16 排查 qodercn 单次限流失败时确认） | 候选解析完成时（`noteRequestRoute`） |
 
 > `ttfbMs` 的语义是「**我们**什么时候开始回字节」，不是「上游什么时候开始吐字」：
 > 流式下两者几乎相同（收到首帧即转发），但**非流式下我们收完才写** —— 该值于是 ≈ `durationMs`，
@@ -74,7 +75,7 @@
 >
 > `usage` 在**两条转发路径**上都会采集：渠道翻译器路径与 `openai` 线型的直通路径
 > （`http/wire/sse-stream.ts` 的 `relay`）。因此 openai 线型渠道
-> （workbuddy / lobsterai / loomy / raccoon）的流式请求也有该字段。
+> （workbuddy / loomy / raccoon / codebuddycn）的流式请求也有该字段。
 >
 > 读回时 `usage` 被归一化为 `tokens: { prompt, completion, total, cache }`，其中
 > `cache.{hit,miss}` 是**缓存命中**的归一化结果（各家字段名差异极大，规则见
@@ -393,7 +394,7 @@ mx status --json
 | 大 | 大 | — | 耗时在**上游建连** | 对照该渠道 PROTOCOL 的端点与握手流程 |
 | 正常 | 大或缺失 | 正常 | 耗时在**上游首帧** | 看请求规模（`requestBytes` / `systemChars` / `toolCount`）与该渠道的排队机制 |
 | 正常 | 正常 | 大 | 耗时在**流式输出 / 工具循环 / 客户端读取** | 看 `usage` 与 `toolCount` 判断是否为长 tool 循环 |
-| — | — | — | `error=upstream_timeout`：上游在空闲超时内无任何数据 | 该超时是**空闲**超时（每读一块即重置），持续出字的流不会被切断。默认 120s（`MODELMUX_READ_TIMEOUT_MS`）；声明 `idleTimeoutMs()` 的渠道各有自己的值（qodercn / qwenworkcn 900s、raccoon 180s） |
+| — | — | — | `error=upstream_timeout`：上游在空闲超时内无任何数据 | 该超时是**空闲**超时（每读一块即重置），持续出字的流不会被切断。默认 120s（`MODELMUX_READ_TIMEOUT_MS`）；声明 `idleTimeoutMs()` 的渠道各有自己的值（qwenworkcn 900s、raccoon 180s） |
 
 **报告必须包含**：`id`、`model`、`cid`、`stream`、`status`、`outcome`、三个耗时、`usage`、`error`。
 字段缺失时注明「未采集」，**不要推断或编造**。
@@ -423,7 +424,7 @@ mx status --json
 | --- | --- | --- |
 | `unknown_model` | 模型名不在网关对外清单（家族表裸名） | `GET /v1/models` 核对；`mx model list` 看有货的渠道 |
 | `not_authenticated` / `upstream_unauthenticated` | 凭据缺失或失效 | `mx acct <cid>`、`mx login <cid>`；**不删凭据文件** |
-| `upstream_error` / `upstream_stream_failed` | 上游返回错误或流中断 | 用 `request_id` 查 `error.log` + `worker.log`，再对照该渠道 PROTOCOL |
+| `upstream_error` / `upstream_stream_failed` | 上游返回错误或流中断。流式下**零内容帧**（上游 200 却一个帧都没交付）也归此类：响应头挪到首次写出才落，因此能换下一条候选，全部候选都空流才终局 502 —— 不再把「200 空响应」递给客户端 | 用 `request_id` 查 `error.log` + `worker.log`，再对照该渠道 PROTOCOL |
 | `upstream_timeout` | 上游空闲超时 | 见 §2 第 4 行 |
 | `upstream_queued` | 上游排队，网关已换过所有候选 | 排队即换渠道、不等待；全部候选都排队才回 503。给渠道加供给或换模型 |
 | `insufficient_quota` | 账号额度耗尽 | 账号进入**冷却**（`cooldown_until`，不是标 `error`），到期自动恢复；可等窗口刷新、`mx acct <cid> use <key>` 换号，或 `mx model usage` 看冷却状态 |
