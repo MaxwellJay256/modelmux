@@ -9,13 +9,23 @@
  * 默认隐藏、悬停账号行才出现，触屏常显。
  */
 
-import { ArrowLeftRight, ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
+import { ArrowLeftRight, ChevronDown, ChevronUp, MoreHorizontal, Plus, Trash2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PoolAccount } from "../lib/types";
 import type { ReactElement, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { formatRecoveryAt, formatTokens } from "../lib/log-format";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { Badge } from "./ui/badge";
+import { Card } from "./ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import { Progress } from "./ui/progress";
+import { Skeleton } from "./ui/skeleton";
 
 /**
  * 账号池卡片的数据形状（直接吃 /api/commands 的宽松 JSON）。
@@ -332,6 +342,20 @@ export function AccountCard({
   useEffect(() => {
     if (busyKey !== null) setPendingRemove(null);
   }, [busyKey]);
+  // 取消/确认后把焦点还给「…」触发键。ConfirmDialog 卸载时 Radix FocusScope 会把焦点
+  // 还给 BODY，且归还发生在 commit 之后的异步帧（rAF 实测压不住，effect 同步 focus 同样被覆盖）；
+  // 150ms 是所有 portal 归还链落定后的窗口。删除成功时触发键随行卸载，focus() 落空无害。
+  const hadPendingRemove = useRef(false);
+  useEffect(() => {
+    if (pendingRemove) {
+      hadPendingRemove.current = true;
+      return;
+    }
+    if (hadPendingRemove.current) {
+      hadPendingRemove.current = false;
+      setTimeout(() => removeTriggerRef.current?.focus?.(), 150);
+    }
+  }, [pendingRemove]);
   const accounts = [...pool.index.accounts]
     .map(rowOf)
     .sort((a, b) => {
@@ -398,7 +422,7 @@ export function AccountCard({
     // 现在仍会有行内留白（`items-start` 只让卡片不被拉伸，**行轨道高度仍由该行最高的卡决定**），
     // 但留白落在网格背景上，比整行重排安静得多 —— 这是刻意接受的取舍。
     <>
-    <div className="panel flex flex-col overflow-hidden transition-colors">
+    <Card className="gap-0 overflow-hidden transition-colors">
       {/* 卡头：cid + 账号数（同一行，紧跟渠道名） + 添加按钮；额度周期另起一行。
           状态在各自的账号行上，渠道不显示状态。 */}
       <div className="flex items-center gap-3 px-4 py-3">
@@ -455,8 +479,6 @@ export function AccountCard({
           const bill = billingByKey.get(account.key);
           const status = classifyAccount(account, billing);
           const meta = STATUS_META[status];
-          const health = account.health;
-          const failStreak = Number(account.fail_streak ?? 0);
           // 末行不画下边框（否则与卡底条的上边框叠成双线）。
           return (
             <li
@@ -480,7 +502,7 @@ export function AccountCard({
                 {/*
                   账号行 = 单行（44px），左右两块等分：
                     左：状态点 + 名称（超长截断）
-                    右：状态 pill（与额度条一体）+ 连败计数 + 额度条 | 操作
+                    右：状态 pill（与额度条一体）+ 额度条 | 操作
                 */}
                 <div className="flex h-11 items-center gap-2 px-4 max-md:gap-1.5 max-md:px-3">
                   <span
@@ -495,10 +517,7 @@ export function AccountCard({
                   {/* 状态 + 额度模块：状态 pill 贴着进度条，与名称的分界恒定（两个
                       flex-1 平分一行），视觉上是一组而不是「名称的附件」 */}
                   <div className="flex min-w-0 flex-1 items-center gap-2">
-                    <span className={`pill shrink-0 whitespace-nowrap ${meta.pill}`}>{statusPillText(status)}</span>
-                    {failStreak > 0 && (health === "ok" || health === "unknown") && (
-                      <span className="pill shrink-0 bg-warn/12 text-warn">连败 {failStreak}</span>
-                    )}
+                    <Badge className={`shrink-0 whitespace-nowrap ${meta.pill}`}>{statusPillText(status)}</Badge>
                     {billing?.unsupported === true ? (
                       <span className="shrink-0 text-xs text-ink-faint/70">订阅制 · 无额度概念</span>
                     ) : (
@@ -548,8 +567,8 @@ export function AccountCard({
                     >
                       {billingLoading ? (
                         <>
-                          <span className="h-1.5 min-w-0 flex-1 animate-pulse rounded-full bg-overlay" />
-                          <span className="h-2 w-8 shrink-0 animate-pulse rounded bg-overlay" />
+                          <Skeleton className="h-1.5 min-w-0 flex-1 rounded-full" />
+                          <Skeleton className="h-2 w-8 shrink-0" />
                         </>
                       ) : billingError && !bill?.billing_at ? (
                         <span className="shrink-0 text-xs text-warn">账单失败</span>
@@ -560,35 +579,44 @@ export function AccountCard({
                   )}
                   </div>
                   {/*
-                    操作区：`≥ md` 固定 52px（切换 + 删除两个图标键）；`< md` 放宽到 76px ——
-                    两个键各自撑到 36px 的触控下限后，52px 装不下。
-                    **默认隐藏，鼠标悬停该账号行才出现**（删除/切换不常使用）；
-                    键盘聚焦（`group-focus-within`）时也出现；触屏设备（`pointer-coarse`）常显 ——
-                    触屏没有悬停。
+                    操作区：单枚「…」DropdownMenu，恒可见 —— 旧的两枚行内键靠
+                    `pointer-fine` 悬停显形 + 触屏常显两条路径，菜单版点击展开、
+                    不依赖 hover（更贴「正文信息不得只靠 hover」铁律），行右侧也更干净。
+                    宽度 32px（旧 52/76 是两枚键的占位）。删除仍走 ConfirmDialog，
+                    取消后焦点还给打开菜单的那枚「…」。
                   */}
-                  <div className="flex w-[52px] shrink-0 items-center justify-end gap-0.5 opacity-100 transition-opacity max-md:w-[76px] pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-fine:group-focus-within:opacity-100">
-                    {!active && (
-                      <button
-                        className="tap-square shrink-0 rounded p-1 text-ink-faint transition-colors hover:bg-overlay hover:text-brand disabled:opacity-40"
+                  <div className="flex w-8 shrink-0 items-center justify-end">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        className="tap-square shrink-0 rounded p-1 text-ink-faint transition-colors hover:bg-overlay hover:text-ink data-[state=open]:bg-overlay data-[state=open]:text-ink disabled:opacity-40"
                         disabled={busyKey !== null}
-                        onClick={() => onActivate(pool.cid, account.key)}
-                        aria-label="切换为生效账号"
+                        aria-label={`${displayName(account)} 的操作`}
+                        onPointerDown={(e) => {
+                          // 记下本行触发键：取消确认时焦点要还到这里（见 ConfirmDialog 注释）。
+                          // 不能用 onClick —— Radix 在 pointerdown 就打开菜单并 preventDefault，
+                          // click 不派发（实测 ref 恒 null，归还全落空）；onPointerDown 是 React
+                          // 合成事件，不受 preventDefault 影响，且此刻焦点尚未被菜单 FocusScope 接管。
+                          removeTriggerRef.current = e.currentTarget;
+                        }}
                       >
-                        <ArrowLeftRight className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                    <button
-                      className="tap-square shrink-0 rounded p-1 text-ink-faint transition-colors hover:bg-danger/12 hover:text-danger disabled:opacity-40"
-                      disabled={busyKey !== null}
-                      onClick={(e) => {
-                        // 记下触发键：取消确认时焦点要还到这里（见 ConfirmDialog 注释）
-                        removeTriggerRef.current = e.currentTarget;
-                        setPendingRemove({ key: account.key, name: displayName(account), active });
-                      }}
-                      aria-label={active ? "删除生效账号（同时登出）" : "从池中删除"}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                        <MoreHorizontal className="h-3.5 w-3.5" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {!active && (
+                          <DropdownMenuItem onSelect={() => onActivate(pool.cid, account.key)}>
+                            <ArrowLeftRight />
+                            切换为生效账号
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onSelect={() => setPendingRemove({ key: account.key, name: displayName(account), active })}
+                        >
+                          <Trash2 />
+                          {active ? "删除生效账号（同时登出）" : "从池中删除"}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 </div>
                 </li>
@@ -655,7 +683,7 @@ export function AccountCard({
           }
         />
       )}
-    </div>
+    </Card>
       {/* 额度详情浮层（portal 到 body）：数值逐行 + 状态说明；悬停/聚焦显示、点击固定 */}
       {detail && detailAccount && (
         <AccountDetailPanel anchor={detail.anchor}>
@@ -748,9 +776,7 @@ function QuotaBar({
     tone === "danger" ? "bg-danger" : tone === "warn" ? "bg-warn" : tone === "free" ? "bg-free" : "bg-line-strong";
   return (
     <>
-      <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-overlay">
-        <span className={`block h-full rounded-full ${fill}`} style={{ width: `${pct ?? 0}%` }} />
-      </span>
+      <Progress value={pct ?? 0} className="h-2 min-w-0 flex-1" indicatorClassName={fill} />
       {/*
         百分比在窄卡片上也保留：账号池页首先要回答的是「这个渠道还剩多少」，
         只有一条无刻度的进度条读不出具体数字（`docs/WEB-CONSOLE.md` 的窄屏口径

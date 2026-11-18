@@ -1,15 +1,23 @@
 /**
- * 日志页：网关请求级访问日志（时间 / 结果 / 模型 / 耗时 / TPS / 缓存 / tokens）；
+ * 日志页：网关请求级访问日志（时间 / 响应 / 模型 / 耗时 / TPS / 缓存 / tokens）；
  * 字段语义、落点与读窗口见 docs/LOGGING.md §3。
  *
  * 关键约束（docs/LOGGING.md §3）：
  *   - 行内 `ts` 是 UTC、目录按**本地**日期切分 —— 展示一律转本地时区（UTC+8 凌晨两者差一天）
- *   - 数值列（耗时 / tokens）右对齐 + 等宽数位，与模型表数值列同一约定
+ *   - 表头与单元格内容统一居中：每列「表头中心 == 数据中心」，列间不再靠左沿相碰
  */
 
 import { Fragment, useEffect, useState, type ReactElement, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationNext,
+  PaginationPrevious,
+} from "../components/ui/pagination";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { api } from "../lib/api";
 import {
   countOrDash,
@@ -258,41 +266,44 @@ function LogDetail({ entry }: { entry: AccessLogEntry }): ReactElement {
  */
 /**
  * 列宽（`>` 展开箭头列移除后重新分配；时间列放完整时间戳）。
- * 展开交互改为整行点击 + 行焦点（Enter / 空格），首列的呼吸位由内边距给。
+ * 展开交互改为整行点击 + 行焦点（Enter / 空格），首列的呼吸位由对称内边距给
+ * （居中列的内容中心线要等于列中心线，不对称内边距会把内容推离表头）。
  *
- * 百分比按**最坏宽度 720px**（`md:min-w`）逐列量过：每列 ≥ 内容 + 内边距 ——
- * 时间列装完整时间戳（≈137px + 内边距）、结果 ≈70px、渠道 80px（`qwenworkcn`
- * mono 72 + 8）、缓存列表头 62px、tokens ≈88px。
- * 模型列是唯一弹性列，吃剩余（720 下 ≈137px，`deepseek-v4.1-flash` 一行放得下）；
- * 735–769 视口内容宽不足 720，由外层 ScrollFade 提示横向滚动（不让列折叠换行）。
+ * 百分比按**最坏宽度 688px** 逐列量过（`md:min-w-[720px]` 的 md 断点是 768 ——
+ * 735–767 视口下表格只有容器宽 688，按 720 标定等于没标定，2026-11-18 实测），
+ * 且必须 ≥「表头与数据里较宽的一侧 + 对称内边距」：
+ * `nowrap` 文字超出列宽时 Chrome 的 `text-center` **只向右溢出**（不是两侧对称），
+ * 表头与数据的中心就此错开（实测 tokens 列差 13px、缓存列差 3.6px）。
+ * 时间 149（完整时间戳）、响应 40（点 + 三位码）、渠道 74（`qwenworkcn`）、
+ * 耗时 41、TPS 54（`206 t/s`）、缓存 68（表头「缓存命中率」60）、tokens 150（`71.16 万 / 1.16 万`）。
+ * 模型列允许折行（`BreakableId` 在 `-` `/` `.` 后断），是唯一可压缩列。
  */
 const COL_WIDTHS = {
   // 时间列装**完整时间戳**（`YYYY-MM-DD HH:mm:ss` ≈ 137px + 内边距）：
   // 选了「全部时间」后不同天的同一时刻必须可分，只给 `HH:MM:SS` 会看混
   time: "22%",
-  result: "10.5%",
-  channel: "11.5%",
-  model: "19%",
-  duration: "6.5%",
-  tokensPerSec: "7%",
-  cache: "9%",
-  tokens: "14.5%",
+  result: "6%",
+  channel: "11%",
+  model: "15%",
+  duration: "6%",
+  tokensPerSec: "8%",
+  cache: "10%",
+  tokens: "22%",
 } as const;
 
 /**
  * 窄屏（< 735px）的列宽：时间列是**两行**（日期 + `HH:MM:SS`），日期 72px 内容。
  *
- * 窄屏只留「时间 / 结果 / 模型」三列，模型列仍是唯一弹性列（吃剩余）——
+ * 窄屏只留「时间 / 响应 / 模型」三列，模型列仍是唯一弹性列（吃剩余）——
  * 只有四列时不存在「中间空一大块」的问题。
  *
- * **时间 / 结果用固定 76px，不用百分比**：内容下限 ≈ 70px（`HH:MM:SS` 57 + 首列 `pl-3`
- * 与呼吸位；结果 = 点 + 文案 + 状态码 + 内边距 ≈ 70），在 340px 表宽下 17%/16.3%
- * 只分别拿到 71/55px——时间撞进结果列、结果挤掉状态码（2026-11-15 实测）。
- * 76px + 模型列吃剩余，任何窄视口都不重叠。
+ * **时间 / 响应用固定 px，不用百分比**：时间内容下限 ≈ 70px（`HH:MM:SS` 57 + 内边距）；
+ * 响应列去掉「成功/失败」文字后只剩 点 + 三位状态码（≈46px），56px 够。
+ * 百分比在 340px 表宽下会把这两列削到装不进内容（2026-11-15 实测过撞列）。
  */
 const NARROW_COL_WIDTHS: Record<keyof typeof COL_WIDTHS, string> = {
   time: "76px",
-  result: "76px",
+  result: "56px",
   channel: "18.4%",
   model: "",
   duration: "5.2%",
@@ -311,13 +322,13 @@ const NARROW_COL_WIDTHS: Record<keyof typeof COL_WIDTHS, string> = {
 interface LogCol {
   key: keyof typeof COL_WIDTHS;
   label: string;
-  /** `< md` 丢弃。窄屏只留「时间 / 结果 / 模型」，其余信息在展开行（整行可点）里。 */
+  /** `< md` 丢弃。窄屏只留「时间 / 响应 / 模型」，其余信息在展开行（整行可点）里。 */
   wide?: boolean;
 }
 
 const LOG_COLS: LogCol[] = [
   { key: "time", label: "时间" },
-  { key: "result", label: "结果" },
+  { key: "result", label: "响应" },
   { key: "channel", label: "渠道", wide: true },
   { key: "model", label: "模型" },
   { key: "duration", label: "耗时", wide: true },
@@ -327,25 +338,21 @@ const LOG_COLS: LogCol[] = [
 ];
 
 /**
- * 结果单元格：与同行其它列一样 `align-top`（否则纵向对齐与其余列不一致）。
+ * 响应单元格：色点 + 状态码，整体居中（与表头同中心线）。
  *
- * 三列网格（点 | 结果 | 状态码）：两侧等宽列把**结果文字**夹在列正中。
- * 早先的 `inline-flex` 让点与状态码分列文字两侧，二者宽度不等（点 6px、码 20px），
- * 整块居中时文字被挤偏 —— 实测「成功」比表头「结果」左移 7px（2026-11-11）。
+ * 「成功 / 失败」文字不在列表里重复 —— 展开行「结果」字段给全了，列里再写只是占宽；
+ * 成败由点的颜色承担，sr-only 保住读屏语义（正文信息不依赖 hover 的同一口径）。
  */
 function ResultCell({ entry }: { entry: AccessLogEntry }): ReactElement {
   const meta = OUTCOME_META[entry.outcome];
   return (
-    <td className="whitespace-nowrap px-1 py-2 align-top">
-      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-1.5 text-xs">
-        <span
-          className={`justify-self-end block h-1.5 w-1.5 rounded-full ${meta.dot}`}
-          aria-hidden="true"
-        />
-        <span className={meta.text}>{meta.label}</span>
-        <span className="justify-self-start font-mono text-ink-faint">{entry.status ?? "-"}</span>
+    <TableCell className="whitespace-nowrap px-1 py-2 align-top">
+      <div className="flex items-center justify-center gap-1.5 text-xs">
+        <span className={`block h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} aria-hidden="true" />
+        <span className="sr-only">{meta.label}</span>
+        <span className="font-mono text-ink-faint">{entry.status ?? "-"}</span>
       </div>
-    </td>
+    </TableCell>
   );
 }
 
@@ -363,15 +370,16 @@ function LogCell({
   entry: AccessLogEntry;
   narrow: boolean;
 }): ReactElement {
-  // 末列（tokens）右内边距加大：数据与表格右沿留出呼吸位，不与滚动条/边缘贴死
+  // 内边距全部**对称**：居中列里不对称的左右距会把内容中心推离表头中心（实测过差 4–9px）
   // 对齐由 table 的 text-center 统一给（数值列不再右对齐：居中后表头与数据同中心线）
-  const numClass = `whitespace-nowrap ${col.key === "tokens" ? "pl-1 pr-4" : "px-1"} py-2 align-top font-mono text-xs tabular text-ink-soft`;
+  const numClass = `whitespace-nowrap ${col.key === "tokens" ? "px-4" : "px-1"} py-2 align-top font-mono text-xs tabular text-ink-soft`;
   switch (col.key) {
-    // 时间列是全表首列：左侧 `pl-3` 给呼吸位（`>` 箭头列移除后行贴左沿，实测很局促）；
+    // 时间列是全表首列：左右等宽 `px-3` 给呼吸位（`>` 箭头列移除后行贴左沿，实测很局促；
+    // 不对称的 `pl-3 pr-1` 会让内容与表头中心错开，居中口径下必须等宽）；
     // 宽屏一行完整 `YYYY-MM-DD HH:MM:SS`（「全部时间」下跨天看混过）；窄屏拆两行（日期在上）
     case "time":
       return (
-        <td className="whitespace-nowrap py-2 pl-3 pr-1 align-top font-mono text-xs tabular text-ink-soft">
+        <TableCell className="whitespace-nowrap px-3 py-2 align-top font-mono text-xs tabular text-ink-soft">
           {narrow ? (
             <span className="flex flex-col items-center leading-tight">
               <span>{formatDate(entry.ts)}</span>
@@ -380,34 +388,34 @@ function LogCell({
           ) : (
             formatTimestamp(entry.ts)
           )}
-        </td>
+        </TableCell>
       );
     case "result":
       return <ResultCell entry={entry} />;
     case "channel":
       return (
-        <td className="whitespace-nowrap px-1 py-2 align-top font-mono text-xs text-ink-soft">
+        <TableCell className="whitespace-nowrap px-1 py-2 align-top font-mono text-xs text-ink-soft">
           {entry.cid ?? <span className="text-ink-faint">-</span>}
-        </td>
+        </TableCell>
       );
     case "model":
       return (
-        <td className="break-words px-1 py-2 align-top text-xs text-ink-soft">
+        <TableCell className="break-words px-1 py-2 align-top text-xs text-ink-soft">
           {entry.model ? (
             <BreakableId value={entry.model} />
           ) : (
             <span className="font-mono text-ink-faint">{entry.path ?? "-"}</span>
           )}
-        </td>
+        </TableCell>
       );
     case "duration":
-      return <td className={numClass}>{formatDuration(entry.durationMs)}</td>;
+      return <TableCell className={numClass}>{formatDuration(entry.durationMs)}</TableCell>;
     case "tokensPerSec":
-      return <td className={numClass}>{formatTokensPerSec(entry)}</td>;
+      return <TableCell className={numClass}>{formatTokensPerSec(entry)}</TableCell>;
     case "cache":
-      return <td className={numClass}>{cacheHitRateText(entry.tokens?.cache)}</td>;
+      return <TableCell className={numClass}>{cacheHitRateText(entry.tokens?.cache)}</TableCell>;
     case "tokens":
-      return <td className={numClass}>{tokensPairText(entry.tokens)}</td>;
+      return <TableCell className={numClass}>{tokensPairText(entry.tokens)}</TableCell>;
   }
 }
 
@@ -443,7 +451,7 @@ function LogTable({
   // 两行文字在各自行内的相对位置不同（实测差约 3px）
   const headClass = (key: string): string =>
     `whitespace-nowrap text-center align-top ${
-      key === "tokens" ? "pl-1 pr-4" : key === "time" ? "pl-3 pr-1" : "px-1"
+      key === "tokens" ? "px-4" : key === "time" ? "px-3" : "px-1"
     } py-2 font-normal`;
   return (
     <div className="panel flex min-h-0 flex-1 flex-col">
@@ -455,27 +463,27 @@ function LogTable({
         */}
         {/* min-w 340：三列的窄表里「HH:MM:SS」需要 57px（时间 17%），300px 下再怎么调
             比例都装不下 —— 低于 340 的视口转内层横滚，ScrollFade 在右缘提示 */}
-        <table className="w-full table-fixed border-collapse text-center text-sm min-w-[340px] md:min-w-[720px]">
+        <Table className="w-full table-fixed border-collapse text-center text-sm min-w-[340px] md:min-w-[720px]">
           <colgroup>
             {cols.map((col) => (
               <col key={col.key} style={widths[col.key] ? { width: widths[col.key] } : undefined} />
             ))}
           </colgroup>
-          <thead>
-            <tr className="border-b border-line text-left text-xs text-ink-faint">
+          <TableHeader>
+            <TableRow className="border-b border-line text-xs text-ink-faint">
               {cols.map((col) => (
-                <th key={col.key} className={headClass(col.key)}>
+                <TableHead key={col.key} className={headClass(col.key)}>
                   {col.label}
-                </th>
+                </TableHead>
               ))}
-            </tr>
-          </thead>
-          <tbody>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {page.entries.map((entry) => {
               const open = expanded === entry.id;
               return (
                 <Fragment key={entry.id}>
-                  <tr
+                  <TableRow
                     // `>` 箭头列移除后，展开交互 = 整行点击 + 行焦点（键盘 Enter / 空格）
                     tabIndex={0}
                     aria-expanded={open}
@@ -493,19 +501,19 @@ function LogTable({
                     {cols.map((col) => (
                       <LogCell key={col.key} col={col} entry={entry} narrow={narrow} />
                     ))}
-                  </tr>
+                  </TableRow>
                   {open && (
-                    <tr className="border-b border-line">
-                      <td colSpan={cols.length} className="p-0">
+                    <TableRow className="border-b border-line">
+                      <TableCell colSpan={cols.length} className="p-0">
                         <LogDetail entry={entry} />
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )}
                 </Fragment>
               );
             })}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </ScrollFade>
 
       <Pager
@@ -534,34 +542,34 @@ function Pager({
   onPageChange: (page: number) => void;
   loading: boolean;
 }): ReactElement {
-  const navCls = (disabled: boolean): string =>
-    `tap-square grid h-7 w-7 place-items-center rounded-lg border border-line text-ink-soft transition-colors hover:border-line-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-40`;
   return (
-    <div className="shrink-0 border-t border-line/70 bg-canvas/95 px-3 py-2">
-      <div className="flex items-center justify-end gap-2">
-        <button
-          type="button"
-          aria-label="上一页"
-          disabled={pageNum <= 1 || loading}
-          onClick={() => onPageChange(pageNum - 1)}
-          className={navCls(pageNum <= 1 || loading)}
-        >
-          <ChevronLeft className="h-4 w-4" />
-        </button>
-        <span className="min-w-16 text-center text-xs tabular text-ink-soft">
-          {pageNum} / {totalPages}
-        </span>
-        <button
-          type="button"
-          aria-label="下一页"
-          disabled={pageNum >= totalPages || loading}
-          onClick={() => onPageChange(pageNum + 1)}
-          className={navCls(pageNum >= totalPages || loading)}
-        >
-          <ChevronRight className="h-4 w-4" />
-        </button>
-      </div>
-    </div>
+    <Pagination aria-label="分页" className="shrink-0 border-t border-line/70 bg-canvas/95 px-3 py-2">
+      <PaginationContent className="w-full justify-end gap-2">
+        <PaginationItem>
+          <PaginationPrevious
+            disabled={pageNum <= 1 || loading}
+            onClick={() => onPageChange(pageNum - 1)}
+            className="tap-square h-7"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </PaginationPrevious>
+        </PaginationItem>
+        <PaginationItem>
+          <span className="min-w-16 text-center text-xs tabular text-ink-soft">
+            {pageNum} / {totalPages}
+          </span>
+        </PaginationItem>
+        <PaginationItem>
+          <PaginationNext
+            disabled={pageNum >= totalPages || loading}
+            onClick={() => onPageChange(pageNum + 1)}
+            className="tap-square h-7"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </PaginationNext>
+        </PaginationItem>
+      </PaginationContent>
+    </Pagination>
   );
 }
 
