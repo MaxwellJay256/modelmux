@@ -7,7 +7,7 @@
  * 窄屏（<sm）锚点折成顶部一行横滑，不挤压内容列。
  */
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Dialog,
   DialogClose,
@@ -16,7 +16,8 @@ import {
   DialogPortal,
   DialogTitle,
 } from "./ui/dialog";
-import { ExternalLink, Info, Loader2, Palette, Power, RefreshCw, RotateCw, ScrollText, Server, Settings, Tag, X } from "lucide-react";
+import { Boxes, ExternalLink, Info, KeyRound, Loader2, Palette, Power, RefreshCw, RotateCw, ScrollText, Server, Settings, Tag, X } from "lucide-react";
+import { Link } from "react-router";
 import { useEffect, useState, type ComponentType, type ReactElement, type ReactNode } from "react";
 
 import { Segmented } from "./Segmented";
@@ -46,18 +47,20 @@ const THEME_ITEMS: ReadonlyArray<{ key: ThemeMode; label: string }> = [
   { key: "light", label: "浅色" },
 ];
 
-type SectionKey = "general" | "look" | "about";
+type SectionKey = "general" | "channels" | "look" | "about";
 
 /** 行首 / 锚点图标：lucide 组件与 GithubMark 都只吃 className，共用同一形态。 */
 type IconType = ComponentType<{ className?: string }>;
 
 const SECTION_ITEMS: ReadonlyArray<{ key: SectionKey; label: string; icon: IconType }> = [
   { key: "general", label: "通用", icon: RefreshCw },
+  { key: "channels", label: "渠道", icon: Boxes },
   { key: "look", label: "外观", icon: Palette },
   { key: "about", label: "关于", icon: Info },
 ];
 
-/** 分区内的一行设置：图标 + 左标题说明、右控件；两端结构，窄屏先让说明换行。 */
+/** 分区内的一行设置：图标 + 左标题说明、右控件；两端结构，窄屏先让说明换行。
+ *  `description` 省略时整行不收说明（渠道开关这类「标题即全部信息」的行用）。 */
 function ModalRow({
   icon: Icon,
   title,
@@ -66,7 +69,7 @@ function ModalRow({
 }: {
   icon: IconType;
   title: string;
-  description: string;
+  description?: string;
   children: ReactNode;
 }): ReactElement {
   return (
@@ -80,7 +83,7 @@ function ModalRow({
         </span>
         <div className="min-w-0">
           <div className="text-sm text-ink">{title}</div>
-          <div className="mt-0.5 text-xs text-ink-faint">{description}</div>
+          {description !== undefined && <div className="mt-0.5 text-xs text-ink-faint">{description}</div>}
         </div>
       </div>
       <div className="ml-auto flex flex-none items-center gap-2">{children}</div>
@@ -113,9 +116,41 @@ function IntervalRow({
   );
 }
 
+
+/**
+ * 网关状态行：原顶栏「运行中」信号迁入设置弹窗。
+ *
+ * 只读（与旧 GatewayStatus 同口径）：控制台本身就是网关进程的一部分，从页面启停
+ * 网关会让页面当场不可达 —— 启停一律走本机终端 `mx`。
+ */
+const STATE_LABEL: Record<string, string> = {
+  running: "运行中",
+  probing: "准备中",
+  login: "登录中",
+  down: "网关未运行",
+  unknown: "状态未知",
+};
+
+function GatewayRow(): ReactElement {
+  const state = useQuery({ queryKey: ["state"], queryFn: api.getState });
+  const raw = state.data?.ui_state ?? "";
+  const running = raw === "running";
+  const label = state.data ? (STATE_LABEL[raw] ?? raw ?? "不可达") : "加载中…";
+  const base = state.data?.base_url ?? "";
+  return (
+    <ModalRow icon={Power} title="网关状态" description={base !== "" ? `接入地址 ${base}` : "网关存活状态"}>
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs text-ink-soft">
+        <span className={`h-1.5 w-1.5 rounded-full ${running ? "bg-free live-dot" : "bg-ink-faint"}`} aria-hidden="true" />
+        {label}
+      </span>
+    </ModalRow>
+  );
+}
+
 export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }): ReactElement {
   // `["state"]` 轮询归布局层所有，这里只订阅同一份缓存（同 GatewayStatus）
   const state = useQuery({ queryKey: ["state"], queryFn: api.getState });
+  const qc = useQueryClient();
   const toast = useToast();
   const { mode, select } = useThemeMode();
   const [section, setSection] = useState<SectionKey>("general");
@@ -149,6 +184,37 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
     } catch (err) {
       setAutostart(!next);
       toast.error(`开机自启动设置失败：${errorText(err)}`);
+    }
+  };
+
+  const toggleChannel = async (cid: string, enabled: boolean): Promise<void> => {
+    try {
+      const res = await api.commands.setChannelEnabled(cid, enabled);
+      if (!res.ok) {
+        toast.error(res.error ?? "渠道开关保存失败");
+        return;
+      }
+      // 开关影响三处视图：设置页自身、账号池卡片、选路派生（state 里的模型矩阵）
+      void qc.invalidateQueries({ queryKey: ["state"] });
+      void qc.invalidateQueries({ queryKey: ["accounts"] });
+      void qc.invalidateQueries({ queryKey: ["billing"] });
+    } catch (err) {
+      toast.error(`渠道开关保存失败：${errorText(err)}`);
+    }
+  };
+
+  /** 开关「要求 API key」：写入 setting.json，需重启网关生效（装配期决定）。 */
+  const toggleApiKeyRequired = async (enabled: boolean): Promise<void> => {
+    try {
+      const res = await api.commands.setApiKeyRequired(enabled);
+      if (!res.ok) {
+        toast.error(res.error ?? "设置失败");
+        return;
+      }
+      toast.info(enabled ? "已开启校验，重启网关后生效" : "已关闭校验，重启网关后生效");
+      void qc.invalidateQueries({ queryKey: ["state"] });
+    } catch (err) {
+      toast.error(`设置失败：${errorText(err)}`);
     }
   };
 
@@ -242,7 +308,21 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
             >
               {section === "general" && (
                 <div>
-                  <div className="mb-3 text-xs font-medium text-ink-faint">偏好设置</div>
+                  <div className="mb-3 text-xs font-medium text-ink-faint">状态与去处</div>
+                  <div className="divide-y divide-line">
+                    <GatewayRow />
+                    <ModalRow icon={Boxes} title="账号池" description="渠道凭据、额度与模型清单">
+                      <Link
+                        to="/accounts"
+                        onClick={() => onOpenChange(false)}
+                        className="tap inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs text-ink transition-colors hover:bg-overlay"
+                      >
+                        <Boxes className="h-3.5 w-3.5" aria-hidden="true" />
+                        打开账号池
+                      </Link>
+                    </ModalRow>
+                  </div>
+                  <div className="mb-3 mt-6 text-xs font-medium text-ink-faint">偏好设置</div>
                   <div className="divide-y divide-line">
                     {CAN_AUTOSTART && (
                       <ModalRow icon={Power} title="开机自启动" description="登录 Windows 后自动启动并收进托盘">
@@ -256,6 +336,50 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                     )}
                     <IntervalRow icon={RefreshCw} page="accounts" title="账号池刷新间隔" description="渠道卡与额度的刷新节奏" />
                     <IntervalRow icon={ScrollText} page="logs" title="请求日志刷新间隔" description="日志列表与统计的刷新节奏" />
+                    <ModalRow
+                      icon={KeyRound}
+                      title="要求 API key"
+                      description="对话请求必须携带有效 key；改动需重启网关生效"
+                    >
+                      <Switch
+                        checked={state.data?.api_key_mode === true}
+                        onChange={() => void toggleApiKeyRequired(state.data?.api_key_mode !== true)}
+                        label={`要求 API key，${state.data?.api_key_mode === true ? "已开启" : "已关闭"}`}
+                      />
+                    </ModalRow>
+                    <ModalRow icon={KeyRound} title="API Keys" description="新建、白名单与限流管理">
+                      <Link
+                        to="/api-keys"
+                        onClick={() => onOpenChange(false)}
+                        className="tap inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs text-ink transition-colors hover:bg-overlay"
+                      >
+                        <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
+                        管理 API Keys
+                      </Link>
+                    </ModalRow>
+                  </div>
+                </div>
+              )}
+
+              {section === "channels" && (
+                <div>
+                  <div className="mb-3 text-xs font-medium text-ink-faint">渠道开关</div>
+                  <p className="mb-3 text-xs text-ink-faint">
+                    关闭的渠道从账号池隐藏、不参与选路；凭据与登录态保留，勾回来即恢复。
+                  </p>
+                  <div className="divide-y divide-line">
+                    {(state.data?.channel_toggles ?? []).map((t) => (
+                      <ModalRow key={t.cid} icon={Boxes} title={t.cid}>
+                        <Switch
+                          checked={t.enabled}
+                          onChange={() => void toggleChannel(t.cid, !t.enabled)}
+                          label={`渠道 ${t.cid}，${t.enabled ? "已开启" : "已关闭"}`}
+                        />
+                      </ModalRow>
+                    ))}
+                    {(state.data?.channel_toggles ?? []).length === 0 && (
+                      <p className="py-3 text-xs text-ink-faint">（没有可选渠道）</p>
+                    )}
                   </div>
                 </div>
               )}

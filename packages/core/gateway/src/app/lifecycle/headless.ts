@@ -22,8 +22,9 @@ import * as gateway from "../../http/server.js";
 import { REPO_UI_PREFIX, version } from "../../runtime/cli-consts.js";
 import { appendChannel, appendError, appendGateway, appendSystem } from "../../runtime/log-store.js";
 import { rootDir } from "../../runtime/paths.js";
-import { loadUserSettings, saveUserSettings, type ThemeMode } from "../../runtime/user-settings.js";
+import { loadUserSettings, saveUserSettings, disabledChannelSet, type ThemeMode } from "../../runtime/user-settings.js";
 import { startUpdateChecks, updateNotice } from "../../runtime/update-check.js";
+import { apiKeyGuard } from "../../runtime/api-key.js";
 import { migrateLegacyChannelDirs } from "../../runtime/storage-migrate.js";
 import { readChannelModels, rollbackChannelModels } from "../../runtime/channel-models.js";
 import { getChannelModelMeta, invalidateCrossModelIndex, poolCandidates, poolModels } from "../../pool/pool-targets.js";
@@ -414,6 +415,9 @@ class ServiceState {
 
   snapshot(): console_.UiSnapshot {
     const base = console_.emptySnapshot();
+    // 快照被 3-5s 轮询：用户设置（主题 + 渠道开关）只读一次，逐项读是同一文件重复解析
+    const settings = loadUserSettings();
+    const disabled = new Set(settings.disabled_channels);
     return {
       ...base,
       ui_state: this.uiState,
@@ -449,7 +453,17 @@ class ServiceState {
       ),
       integrations: integrationStatus(),
       integration_updates: integrationUpdates(),
-      theme_mode: loadUserSettings().theme,
+      theme_mode: settings.theme,
+      // 设置弹窗的渠道开关状态：关闭的渠道从账号池隐藏、不参与选路。
+      // 只给 cid（渠道包里的唯一名，小写），不附展示名 —— 设置页要的就是能对上
+      // packages/core/channels/<cid> 的标识，多一层映射反而对不上号。
+      // settings 只读一次：主题与开关同源，逐项再读是同一文件的重复解析
+      channel_toggles: channels().map((channel) => ({
+        cid: channel.config.cid,
+        enabled: !disabled.has(channel.config.cid),
+      })),
+      // API key 管理页的唯一开关：guard 已装配（设置页开启「要求 API key」时注入）
+      api_key_mode: apiKeyGuard() !== null,
       gateway_error: this.gatewayError,
     };
   }

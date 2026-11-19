@@ -178,6 +178,20 @@ export interface UiSnapshot {
    * 持久化在 `~/.modelmux/setting.json`（写走 POST /api/theme）。
    */
   theme_mode: string;
+  /**
+   * 设置弹窗的渠道开关：`enabled=false` 的渠道从账号池隐藏、不参与选路。
+   *
+   * 只给 `cid`（渠道包名，小写）—— 设置页展示的就是 `packages/core/channels/<cid>`
+   * 里的那个标识，不附展示名，避免多一层映射对不上号。
+   * 关闭 ≠ 注销：凭据与登录态都在，勾回来即恢复（存 setting.json 的 disabled_channels）。
+   */
+  channel_toggles: Array<{ cid: string; enabled: boolean }>;
+  /**
+   * API key 校验是否启用（guard 已装配）。
+   *
+   * 控制台「API Keys」页与设置页开关的唯一显示条件 —— 未启用时恒 false。
+   */
+  api_key_mode: boolean;
   gateway_error: string;
 }
 
@@ -200,6 +214,8 @@ export function emptySnapshot(): UiSnapshot {
     integrations: {},
     integration_updates: {},
     theme_mode: "system",
+    channel_toggles: [],
+    api_key_mode: false,
     gateway_error: "",
   };
 }
@@ -321,6 +337,21 @@ function serveStatic(res: import("node:http").ServerResponse, relPath: string): 
   const cache = relative.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-store";
   res.writeHead(200, { "Content-Type": type, "Cache-Control": cache });
   res.end(readFileSync(file));
+}
+
+/**
+ * 是否本机直连（非公共命令的唯一放行条件）。
+ *
+ * 用 socket 远端地址而不是 Origin/Host 头：头可由客户端伪造，socket 对端不能。
+ *
+ * **明确假设：网关不支持前置反向代理**（含同机 nginx/caddy）。若将来引入代理，
+ * 所有外部请求的对端都会变成 127.0.0.1，这个判定会整体失效 —— 届时必须改为
+ * 「显式配置 trustedProxy + 校验代理注入的源地址头」，不能沿用本实现。
+ * 当前形态（单机自建网关、只监听回环）下不存在该风险。
+ */
+function isLocalDirect(req: import("node:http").IncomingMessage): boolean {
+  const remote = req.socket.remoteAddress ?? "";
+  return LOOPBACK_HOSTS.has(remote) || LOOPBACK_HOSTS.has(remote.replace(/^::ffff:/, ""));
 }
 
 /** 写操作同源校验（比对 host:port，避免只比 hostname 时跨端口请求被放行）。 */
@@ -685,6 +716,8 @@ export function createConsoleHandler(
             action,
             ...(typeof cid === "string" ? { cid } : {}),
             args: typeof args === "object" && args !== null ? args as Record<string, unknown> : {},
+            // 来源标记由路由层注入，覆盖客户端可能自带的同名字段
+            admin: isLocalDirect(req),
           });
           json(res, result, result.ok ? 200 : 400);
         })().catch((err) => {

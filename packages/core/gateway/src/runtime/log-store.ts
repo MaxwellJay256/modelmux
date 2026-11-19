@@ -444,6 +444,18 @@ function appendAccessFile(outcome: AccessOutcome, record: RequestLog): void {
   }
 }
 
+/**
+ * 请求收尾钩子（S2 租户结算的挂点）：组合根在服务形态注册；
+ * 本机形态无人注册，`finishRequestLog` 行为零变化。钩子异常只记日志，
+ * 不得反压请求路径。
+ */
+type FinishHook = (log: RequestLog) => void;
+const finishHooks: FinishHook[] = [];
+
+export function onRequestFinished(hook: FinishHook): void {
+  finishHooks.push(hook);
+}
+
 /** 写一条访问日志；响应 finish/close 时调用，幂等。 */
 export function finishRequestLog(log: RequestLog, status: number): void {
   if (log.written) return;
@@ -461,11 +473,18 @@ export function finishRequestLog(log: RequestLog, status: number): void {
     log.outcome = status >= 200 && status < 400 ? "success" : "failure";
     if (status < 200) log.error ??= "no_status";
   }
-  // 成功的健康检查 / 模型轮询不记访问日志：Web 控制台每 5 秒拉一次 /v1/models，
-  // 记下来只会把真正的 chat 请求淹没。失败与慢请求仍然记录。
-  const routine = log.path === "/health" || log.path === "/v1/models";
+  // 成功的健康检查 / 模型轮询 / 指标抓取不记访问日志：Web 控制台每 5 秒拉一次 /v1/models、
+  // Prometheus 定时刮 /metrics，记下来只会把真正的 chat 请求淹没。失败与慢请求仍然记录。
+  const routine = log.path === "/health" || log.path === "/v1/models" || log.path === "/metrics";
   if (routine && log.outcome === "success" && !slowVerdictOfLog(log).slow) return;
   appendAccessFile(log.outcome, log);
+  for (const hook of finishHooks) {
+    try {
+      hook(log);
+    } catch (err) {
+      console.error(`request finish hook failed (${log.id}): ${String(err)}`);
+    }
+  }
 }
 
 /** 给响应挂上访问日志上下文；返回该上下文供调用方补充 model/cid 等字段。 */

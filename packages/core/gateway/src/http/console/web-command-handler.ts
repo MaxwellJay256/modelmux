@@ -15,6 +15,8 @@ import { poolCandidates, poolModels } from "../../pool/pool-targets.js";
 import { isPrefsModel, loadModelPrefs, setPreferredChannel } from "../../pool/model-prefs.js";
 import { ledgerSnapshot, refreshBilling, sortChannelsByUsage } from "../../pool/pool-usage.js";
 import { listAccounts, activateAccount, clearAccountState, removeAccount, syncPool } from "../../runtime/account-pool.js";
+import { disabledChannelSet, saveUserSettings, setChannelEnabled } from "../../runtime/user-settings.js";
+import { createApiKey, deleteApiKey, listApiKeys, updateApiKey } from "../../runtime/api-key-store.js";
 import { signinTodaySnapshot, type ClaimToday } from "../../auth/signin-ledger.js";
 import { renderChannelPool } from "./web-types.js";
 import type {
@@ -76,11 +78,45 @@ export interface WebCommandDeps {
 
 export type WebCommandHandler = (body: WebCommandBody) => Promise<WebCommandResult>;
 
+/**
+ * 命令分权限类：**正向白名单**。
+ *
+ * 只有列在 `PUBLIC_ACTIONS` 里的命令允许任意来源调用；其余一律要求本机直连
+ * （路由层按 socket 远端地址判定后把 `admin` 放进 body）。
+ * 为什么正向：`ADMIN_ACTIONS` 反向名单在新增命令时默认放行 —— 加一个改全局状态的
+ * action 忘了登记就是漏洞；正向名单忘登记只会「新命令暂时只允许本机」，
+ * 报错可见、不会静默泄露。
+ *
+ * 公共面 = 只读查询 + 与单次请求/单渠道登录交互相关的动作；凡是能改全局配置、
+ * 账号池、API key、渠道开关的，都不在此列。
+ */
+const PUBLIC_ACTIONS = new Set([
+  // 只读视图
+  "status",
+  "billing",
+  "accounts",
+  "modelChannels",
+  "checkUpdate",
+  "apiKeys",
+  // 交互式登录流（本机浏览器授权 / 粘贴回调 / 验证码 / 取消）
+  "login",
+  "pasteCallback",
+  "submitInput",
+  "cancelInput",
+  // 一键接入与还原（写本机客户端配置，动作由用户在控制台显式触发）
+  "integrate",
+  "restore",
+]);
+
 /** /api/commands 的统一入口。 */
 export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHandler {
   return async (body) => {
     const { action, cid, args = {} } = body;
     try {
+      // 非公共命令（= 改全局配置 / 账号池 / API key / 渠道开关）只允许本机直连
+      if (!PUBLIC_ACTIONS.has(action) && body.admin !== true) {
+        return err("该命令仅允许本机直连调用");
+      }
       switch (action) {
         case "login": {
           if (cid === undefined || !hasChannel(cid)) {
@@ -193,7 +229,14 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         return ok({ rows, models: poolModels() });
       }
       case "accounts": {
-        const targets = cid !== undefined && hasChannel(cid) ? [getChannel(cid)] : channels();
+        // 显式指定 cid 时照常返回（诊断入口）；列表模式只列启用的渠道 ——
+        // 设置弹窗关闭的渠道在这里消失，账号池卡片随之隐藏。
+        // 关闭集合循环外取一次：逐渠道 isChannelEnabled 是逐渠道同步读盘
+        const disabled = disabledChannelSet();
+        const targets =
+          cid !== undefined && hasChannel(cid)
+            ? [getChannel(cid)]
+            : channels().filter((channel) => !disabled.has(channel.config.cid));
         if (targets.length === 0) return err("没有渠道被注册");
         const pools = targets.map((channel) => {
           const poolCid = channel.config.cid;
@@ -208,6 +251,58 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         });
         // 展示顺序：用得多在前，同频按 cid（UI 只渲染这个顺序，不自己排）
         return ok({ channels: sortChannelsByUsage(pools as Array<{ cid: string }>) });
+      }
+      case "setApiKeyRequired": {
+        // 装配期开关：写入 setting.json，重启网关后由 store-bootstrap 读取生效
+        const enabled = args["enabled"];
+        if (typeof enabled !== "boolean") return err("参数 enabled 必须是布尔值");
+        saveUserSettings({ api_key_required: enabled });
+        return ok({ api_key_required: enabled, restart_required: true });
+      }
+      // —— API key 管理（新建/删除/改白名单与限流；明文只在新建时返回一次）——
+      case "apiKeys": {
+        // 哈希不外发：列表只给 id / 名称 / 前缀 / 白名单 / 限流 / 时间
+        return ok({
+          keys: listApiKeys().map(({ keyHash: _hash, ...rest }) => rest),
+        });
+      }
+      case "createApiKey": {
+        const name = typeof args["name"] === "string" ? args["name"] : "";
+        if (name.trim() === "") return err("参数 name 必填");
+        const allowed = Array.isArray(args["allowedModels"])
+          ? (args["allowedModels"] as unknown[]).filter((m): m is string => typeof m === "string")
+          : [];
+        const rpm = typeof args["rpmLimit"] === "number" ? args["rpmLimit"] : 0;
+        const { record, plain } = createApiKey({ name, allowedModels: allowed, rpmLimit: rpm });
+        const { keyHash: _hash, ...shown } = record;
+        // plain 只在这里出现一次，前端必须当场展示并提示保存
+        return ok({ key: shown, plain });
+      }
+      case "updateApiKey": {
+        const id = typeof args["id"] === "string" ? args["id"] : "";
+        if (id === "") return err("参数 id 必填");
+        const patch: { name?: string; allowedModels?: string[]; rpmLimit?: number } = {};
+        if (typeof args["name"] === "string") patch.name = args["name"];
+        if (Array.isArray(args["allowedModels"])) {
+          patch.allowedModels = (args["allowedModels"] as unknown[]).filter((m): m is string => typeof m === "string");
+        }
+        if (typeof args["rpmLimit"] === "number") patch.rpmLimit = args["rpmLimit"];
+        const rec = updateApiKey(id, patch);
+        if (rec === null) return err("key 不存在");
+        const { keyHash: _hash, ...shown } = rec;
+        return ok({ key: shown });
+      }
+      case "deleteApiKey": {
+        const id = typeof args["id"] === "string" ? args["id"] : "";
+        if (id === "") return err("参数 id 必填");
+        return deleteApiKey(id) ? ok({ id }) : err("key 不存在");
+      }
+      case "setChannelEnabled": {
+        if (cid === undefined || !hasChannel(cid)) return err("参数 cid 必须是已注册渠道");
+        const enabled = args["enabled"];
+        if (typeof enabled !== "boolean") return err("参数 enabled 必须是布尔值");
+        setChannelEnabled(cid, enabled);
+        return ok({ cid, enabled });
       }
       case "activateAccount": {
         if (cid === undefined || !hasChannel(cid)) return err("参数 cid 必须是已注册渠道");

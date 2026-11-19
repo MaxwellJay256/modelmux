@@ -34,6 +34,7 @@
 | [USAGE-STATS.md](./USAGE-STATS.md) | **用量口径**：仪表盘用量区块的数据源、指标公式（只计模型请求 / 缓存分母 / 连续天数）、与 ZCode「使用统计」的内容设计对照与交互差异 |
 | [DESKTOP-APP.md](./DESKTOP-APP.md) | **桌面壳（Windows 安装版 exe）**：形态与行为、构建步骤、路径敏感性实测、MotW 与签名真相、存储根与凭据红线 |
 | [DESKTOP-FIRST.md](./DESKTOP-FIRST.md) | **桌面壳主体化迁移方案（设计方案）**：厚壳 + 进程外网关的目标架构、shell token 鉴权、生命周期重划、PR 拆分与决策点；现行壳契约仍在 DESKTOP-APP.md |
+| [SAAS-REDESIGN.md](./SAAS-REDESIGN.md) | **服务化重构方案（设计方案）**：多租户 / 多实例目标架构 —— PostgreSQL + Redis 选型、RLS 数据模型、租约半开、计费闭环、S0-S4 路线与决策点；现行单实例契约仍在 CONTRACT-TS.md / POOL-ARCHITECTURE.md |
 | [CLIENT-INTEGRATION.md](./CLIENT-INTEGRATION.md) | **客户端接入指南**：三种入站协议（OpenAI chat / Anthropic Messages / OpenAI Responses）、模型名解析（家族裸名 + Claude Desktop 角色映射 + 家族外 400）、客户端一键接入与手工配置、真机验证矩阵 |
 | [backup/translation/TRANSLATION.md](./backup/translation/TRANSLATION.md) | **请求上下文翻译（已下线，方案留档）**：英译中的判定算法、分块与缓存策略、网关代发的取舍、入参上限 —— 功能随上下文弹窗移除，代码已删，方案留给后续项目复用 |
 | [DASHBOARD-DESIGN.md](./DASHBOARD-DESIGN.md) | **仪表盘设计方案**：/web/ 首页运行视图的模块划分、布局与数据通道；现行规则见 WEB-CONSOLE.md |
@@ -48,6 +49,20 @@
 | [LOG-PAYLOAD-DESIGN.md](./LOG-PAYLOAD-DESIGN.md) | **日志正文抓取的设计依据**：单条上限 10MB、超限双端兜底；现行规则见 LOGGING.md §9 |
 | [CACHE-HIT-RATE.md](./CACHE-HIT-RATE.md) | **缓存命中率口径**：DeepSeek 官方字段与加和关系、命中率公式（官方无明文，业界推导）、12 天实测的各渠道字段形态表、三类形态的分派归一化规则、展示精度规则 |
 | [REFERENCES.md](./REFERENCES.md) | **第三方参考与许可证登记**（唯一事实源）：各参考仓库的许可证、只借鉴不复制代码的边界、npm 生态依赖许可证、新增参考的登记流程 |
+
+## 2. 项目官网 `docs/index.html`
+
+面向项目外部读者的单页站点，同时是 GitHub Pages 的发布入口（仓库 Settings → Pages →
+Source = Deploy from a branch，`main` / `/docs`；**不需要 workflow**）。与 Web 控制台
+**互不复用**——控制台是"用这个网关的人"看的运维界面，官网是"还没用的人"看的介绍页。
+
+| 文件 | 用途 |
+| --- | --- |
+| [index.html](./index.html) | 单文件站点（内联 CSS，无外链资源；file:// 直接打开也可用） |
+
+> Pages 根目录 = `/docs`，所以站点文件必须留在这一层，不要挪进子目录。
+> `docs/index.html` 与 `docs/README.md` 并存不冲突：GitHub 仓库页优先渲染 README，
+> Pages 优先 serve index.html。
 
 ## 2. 渠道文档 `docs/channels/<cid>/`
 

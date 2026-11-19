@@ -1,7 +1,7 @@
 /**
  * 控制台根组件：React Query 客户端 + 路由挂载（`/` 仪表盘、`/accounts` 账号池、
- * `/logs` 请求日志；未知路径兜底回仪表盘）。设置不是路由页面，是顶栏齿轮弹窗
- * （`components/SettingsModal.tsx`）。
+ * `/logs` 请求日志、`/api-keys` API key 管理；未知路径兜底回仪表盘）。
+ * 设置不是路由页面，是顶栏齿轮弹窗（`components/SettingsModal.tsx`）。
  *
  * 路由 `basename` 必须与 `vite.config.ts` 的 `base` 一致（挂 `/web`）——
  * 只改 Vite 的 `base` 不改 Router 会整页空白。
@@ -15,6 +15,7 @@ import { ToastProvider } from "./components/Toast";
 import { Dashboard } from "./pages/Dashboard";
 import { Accounts } from "./pages/Accounts";
 import { Logs } from "./pages/Logs";
+import { ApiKeys } from "./pages/ApiKeys";
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1 } } });
 
@@ -30,19 +31,18 @@ const BASENAME = "/web";
 export function App(): ReactElement {
   return (
     <QueryClientProvider client={qc}>
-      {/* Toast 挂在这里：两个页面都要能用，且不受路由切换影响（见 components/Toast.tsx） */}
+      {/* Toast 挂在这里：各页面都要能用，且不受路由切换影响（见 components/Toast.tsx） */}
       <ToastProvider>
         <BrowserRouter basename={BASENAME}>
           <Routes>
-            {/* 布局重构（Strangler）：单栏 LayoutSingle 已切换；旧 Layout 保留可回退，
-                阶段 3 删侧栏时一并移除 */}
             <Route element={<LayoutSingle />}>
               <Route path="/" element={<Dashboard />} />
               <Route path="/accounts" element={<Accounts />} />
               <Route path="/logs" element={<Logs />} />
+              <Route path="/api-keys" element={<ApiKeys />} />
             </Route>
-            {/* 兜底：历史链接/书签里的旧路径（如已下线的 /web/models）不匹配任何路由时
-                连 Layout 都不渲染，整页只剩底色 —— 重定向回仪表盘（2026-11-14 实测） */}
+            {/* 兜底：历史链接/书签里的旧路径（如已下线的 /web/models、/web/admin/*）不匹配
+                任何路由时连 Layout 都不渲染，整页只剩底色 —— 重定向回仪表盘 */}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>

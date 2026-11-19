@@ -11,6 +11,7 @@
 
 import { channels, getChannel, hasChannel, type Channel } from "../runtime/channel.js";
 import { runInChannel } from "../runtime/channel-context.js";
+import { disabledChannelSet } from "../runtime/user-settings.js";
 import { readCatalogCache } from "../runtime/catalog-cache.js";
 import { readModelSpecs, type ModelSpecEntry } from "../runtime/model-specs.js";
 import {
@@ -429,8 +430,11 @@ export function poolCandidates(model: PoolModel): PoolCandidate[] {
   const declared = new Set(providersOf(canonical));
   const only = SINGLE_CHANNEL_SUPPLY[canonical];
   const out: PoolCandidate[] = [];
+  // 设置弹窗关闭的渠道 = 不参与选路；集合在循环外取一次（逐渠道读盘是热路径回退）
+  const disabled = disabledChannelSet();
   for (const channel of channels()) {
     const cid = channel.config.cid;
+    if (disabled.has(cid)) continue;
     if (only && cid !== only) continue;
     if (!declared.has(cid) && !channelExposes(canonical, cid, channel)) continue;
     out.push({ cid, channel, exposedId: canonical });

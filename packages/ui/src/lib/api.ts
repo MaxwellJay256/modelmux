@@ -2,6 +2,7 @@
  * 控制台 API 客户端：统一封装 `/web/api/*` 的读写。
  *
  * 关键约束：基址固定为 `<origin>/web`（单端口模式下 UI 与控制台 API 共用网关端口）。
+ * API key 管理走命令面（`commands.apiKeys/createApiKey/...`），不单独开路由。
  */
 
 import type {
@@ -142,6 +143,16 @@ export interface WebApi {
      * `restored` 是写回原内容的文件，`removed` 是接入时新建、还原时删掉的文件。
      */
     restore(target: "zcode" | "dsh"): Promise<CommandData>;
+    /** 设置弹窗的渠道开关：关闭 = 账号池隐藏 + 选路跳过（凭据与登录态保留）。 */
+    setChannelEnabled(cid: string, enabled: boolean): Promise<CommandData>;
+    /** 开关「要求 API key」：写入 setting.json，需重启网关生效。 */
+    setApiKeyRequired(enabled: boolean): Promise<CommandData>;
+    /** API key 列表（不含哈希；明文永不回读）。 */
+    apiKeys(): Promise<CommandData>;
+    /** 新建 key：返回 `plain`（明文，仅此一次）与记录。 */
+    createApiKey(name: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
+    updateApiKey(id: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
+    deleteApiKey(id: string): Promise<CommandData>;
     /**
      * 手动检查更新（设置页「检查更新」按钮）。
      *
@@ -245,6 +256,12 @@ export const api: WebApi = {
     cancelInput: () => command("cancelInput", undefined),
     integrate: (target) => command("integrate", undefined, { target }),
     restore: (target) => command("restore", undefined, { target }),
+    setChannelEnabled: (cid, enabled) => command("setChannelEnabled", cid, { enabled }),
+    setApiKeyRequired: (enabled) => command("setApiKeyRequired", undefined, { enabled }),
+    apiKeys: () => command("apiKeys", undefined),
+    createApiKey: (name, allowedModels, rpmLimit) => command("createApiKey", undefined, { name, allowedModels, rpmLimit }),
+    updateApiKey: (id, allowedModels, rpmLimit) => command("updateApiKey", undefined, { id, allowedModels, rpmLimit }),
+    deleteApiKey: (id) => command("deleteApiKey", undefined, { id }),
     checkUpdate: () => command("checkUpdate", undefined),
   },
 };

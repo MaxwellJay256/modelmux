@@ -13,6 +13,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { channelCapabilities, type Channel } from "../../runtime/channel.js";
 import { getRequestLog, noteClientPayload, noteRequestError } from "../../runtime/log-store.js";
+import { apiKeyGuard } from "../../runtime/api-key.js";
 import { ROTATABLE_CODES, rotateExhaustedAccount } from "../../pool/account-rotate.js";
 import { resolveInboundModel } from "../../pool/inbound-model.js";
 import type { GatewayOptions } from "../server.js";
@@ -52,6 +53,40 @@ function chatHostRotator(channel: Channel): (() => boolean) | undefined {
 // ── 路由 ──────────────────────────────────────────────────────────────────────
 
 /**
+ * API key 预检：guard 未注入（默认本机形态）直通，请求路径零变化。
+ *
+ * 启用后依次判：key 是否有效 → 模型是否在白名单 → 每分钟请求上限。
+ * 白名单与限流都对**归一后的对外模型名**判定（角色名/别名先过家族表）。
+ * 模型解析不出来（未知模型）时不拦 —— 让下游照常回 400 unknown_model，
+ * 避免鉴权层把一个明确的路由错误伪装成权限错误。
+ */
+async function withApiKeyGuard(
+  req: IncomingMessage,
+  res: ServerResponse,
+  model: string,
+  next: () => Promise<void>,
+): Promise<void> {
+  const guard = apiKeyGuard();
+  if (guard === null) {
+    await next();
+    return;
+  }
+  const resolved = resolveInboundModel(model);
+  const canonical = resolved.target ?? null;
+  const auth = String(req.headers.authorization ?? "");
+  const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+  const decision = await guard.check(apiKey, canonical);
+  if (!decision.ok) {
+    const code = decision.reason === "invalid" ? 401 : decision.reason === "forbidden" ? 403 : 429;
+    const type =
+      decision.reason === "invalid" ? "authentication_error" : decision.reason === "forbidden" ? "permission_error" : "rate_limit_error";
+    writeJsonError(res, code, type, decision.message);
+    return;
+  }
+  await next();
+}
+
+/**
  * 失败后**允许**先查账单再换号的错误码。
  *
  * 集合本体在 `pool/account-rotate.ts` —— 产出点（`attempt.ts` 的额度短路与上游额度
@@ -67,7 +102,7 @@ export async function handleChat(
   // A 段：请求解析与校验（已应答则直接返回）
   const parsed = await parseChatRequest(req, res);
   if (!parsed) return;
-  await dispatchChat(parsed, res, opts, null);
+  await withApiKeyGuard(req, res, parsed.model, () => dispatchChat(parsed, res, opts, null));
 }
 
 // ── 入站协议：Anthropic Messages 与 OpenAI Responses ─────────────────────────
@@ -148,16 +183,18 @@ export async function handleMessages(
   const model = resolved.target;
   attachProtocol(res, anthropicProtocol, model);
   noteChatRequestStats(res, text.payload, model, text.messages, parsedBody.raw);
-  await dispatchChat(
-    {
-      payload: { ...text.payload, model },
-      model,
-      messages: text.messages,
-      raw: parsedBody.raw,
-    },
-    res,
-    opts,
-    anthropicProtocol,
+  await withApiKeyGuard(req, res, model, () =>
+    dispatchChat(
+      {
+        payload: { ...text.payload, model },
+        model,
+        messages: text.messages,
+        raw: parsedBody.raw,
+      },
+      res,
+      opts,
+      anthropicProtocol,
+    ),
   );
 }
 
@@ -185,16 +222,18 @@ export async function handleResponses(
   const model = resolved.target;
   attachProtocol(res, responsesProtocol, model);
   noteChatRequestStats(res, text.payload, model, text.messages, parsedBody.raw);
-  await dispatchChat(
-    {
-      payload: { ...text.payload, model },
-      model,
-      messages: text.messages,
-      raw: parsedBody.raw,
-    },
-    res,
-    opts,
-    responsesProtocol,
+  await withApiKeyGuard(req, res, model, () =>
+    dispatchChat(
+      {
+        payload: { ...text.payload, model },
+        model,
+        messages: text.messages,
+        raw: parsedBody.raw,
+      },
+      res,
+      opts,
+      responsesProtocol,
+    ),
   );
 }
 
