@@ -1,8 +1,8 @@
 /**
- * 账号池存储端口（S0，docs/SAAS-REDESIGN.md §2/§13）。
+ * 账号池存储端口（本机文件实现）。
  *
  * 把 account-pool / pool-usage 的「存储落点」抽成接口：fs 适配器保持现有
- * 文件语义（原子写 + 0600 + mtime 失效依据），S1 的 pg 适配器把同一组方法
+ * 文件语义（原子写 + 0600 + 内容哈希失效依据）：
  * 落到表上。领域逻辑（索引规范化、账本合并、熔断退避计算）留在调用方，
  * 端口只搬运数据 —— 两套适配器共享语义，行为不因迁移漂移。
  *
@@ -55,30 +55,6 @@ export interface PoolStore {
   readPrefs(): unknown | null;
   writePrefs(prefs: unknown): void;
   /**
-   * 访问日志条目（§10：服务形态落 `access_log_entries` 表，跨实例可查；
-   * fs 形态 no-op —— JSONL 就是它的家）。
-   */
-  writeAccess(entry: {
-    requestId: string;
-    tsIso: string;
-    tenantId: string | null;
-    status: number | null;
-    outcome: string | null;
-    model: string | null;
-    cid: string | null;
-    raw: unknown;
-  }): void;
-  /**
-   * 半开试探租约（S3，docs/SAAS-REDESIGN.md §8.1）：熔断到期时多实例只放行一次
-   * 试探 —— 抢到租约返回 true（放行），未抢到 false（继续短路）。
-   * fs 形态单进程恒 true（读-改-写天然串行，无竞态可言）。
-   */
-  claimProbeLease(cid: string, key: string, ttlMs: number): boolean;
-  /**
-   * API key 记录（`<root>/api-keys.json`）：列表整读整写。
-   *
-   * 明文 key 不在这里 —— 存储只放哈希与前缀，创建时的明文由调用方一次性回显。
-   * fs 形态读写原文件（0600），pg 形态落 `pool_kv`（kind='apikey'）。
    */
   readApiKeys(): unknown | null;
   writeApiKeys(keys: unknown): void;
@@ -109,6 +85,60 @@ function readJsonOrNull(path: string): unknown | null {
   }
 }
 
+/**
+ * 读 JSON；**主文件损坏时从 `.bak` 自愈**。
+ *
+ * 「文件不存在」是合法空态（不碰 bak）；「存在但解析失败」才是损坏 —— 此时
+ * `.bak`（上次成功写入的版本）是唯一可回退的副本，恢复成功要留痕（排障时
+ * 「数据怎么少了一段」的答案就在这条日志里），恢复失败保持 null 不抛。
+ */
+function readJsonWithBackup(path: string): unknown | null {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    text = ""; // 读失败（权限等）：按损坏处理，试 bak
+  }
+  // 「文件存在但内容不是合法 JSON 对象」= 损坏（与缺失区分开），才走 bak 自愈
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  if (parsed !== null && typeof parsed === "object") return parsed;
+  const bak = `${path}.bak`;
+  try {
+    text = readFileSync(bak, "utf8");
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  if (parsed !== null && typeof parsed === "object") {
+    console.error(`[modelmux] ${path} 损坏，已从 ${bak} 恢复（${text.length} 字节）`);
+    return parsed;
+  }
+  console.error(`[modelmux] ${path} 损坏且 ${bak} 不可用（相关能力按空数据处理）`);
+  return null;
+}
+
+/**
+ * 写 JSON 并留一份 `.bak`（= 本次成功写入的内容）。
+ *
+ * rename 的原子性保证主文件不会写一半；真正的损坏来自外部（手改 / 磁盘错误 /
+ * 其他进程写坏），此时 bak =「最后一次已知正确的数据」—— 恢复目标不是退回旧
+ * 版本，而是回到最后一次成功状态。bak 写失败不影响主文件。
+ */
+function writeJsonWithBackup(path: string, value: unknown, writer: (p: string, v: unknown) => void): void {
+  writer(path, value);
+  try {
+    writeJsonFile(`${path}.bak`, value);
+  } catch {
+    // bak 写失败不回滚主文件：主数据优先
+  }
+}
+
 /** 复制后收紧权限：与 account-pool 原 copyFileSync+chmod 语义一致（失败忽略）。 */
 function copySecret(from: string, to: string): void {
   copyFileSync(from, to);
@@ -119,7 +149,7 @@ function copySecret(from: string, to: string): void {
   }
 }
 
-/** 本机文件适配器：保持 S0 之前的全部落点与写盘语义。 */
+/** 本机文件适配器：全部落点与写盘语义都在这里。 */
 export class FsPoolStore implements PoolStore {
   private indexFile(cid?: string): string {
     return join(channelDir(cid), INDEX_NAME);
@@ -129,12 +159,12 @@ export class FsPoolStore implements PoolStore {
   }
 
   readIndex(cid?: string): unknown | null {
-    return readJsonOrNull(this.indexFile(cid));
+    return readJsonWithBackup(this.indexFile(cid));
   }
   writeIndex(index: unknown, cid?: string): void {
     ensureDir(cid);
     mkdirSync(this.accountDir(cid), { recursive: true });
-    writeJsonSecret(this.indexFile(cid), index);
+    writeJsonWithBackup(this.indexFile(cid), index, writeJsonSecret);
   }
   indexStamp(cid?: string): number {
     return mtimeOrZero(this.indexFile(cid));
@@ -194,10 +224,10 @@ export class FsPoolStore implements PoolStore {
   }
 
   readLedger(): unknown | null {
-    return readJsonOrNull(poolUsagePath());
+    return readJsonWithBackup(poolUsagePath());
   }
   writeLedger(ledger: unknown): void {
-    writeJsonSecret(poolUsagePath(), ledger);
+    writeJsonWithBackup(poolUsagePath(), ledger, writeJsonSecret);
   }
   ledgerStamp(): number {
     return mtimeOrZero(poolUsagePath());
@@ -205,44 +235,22 @@ export class FsPoolStore implements PoolStore {
 
   readPrefs(): unknown | null {
     // 与 model-prefs.ts 原读路径同语义：缺失/损坏 = null（调用方回落空表）
-    return readJsonOrNull(rootFile("model-prefs.json"));
+    return readJsonWithBackup(rootFile("model-prefs.json"));
   }
   writePrefs(prefs: unknown): void {
-    writeFileSync(rootFile("model-prefs.json"), `${JSON.stringify(prefs, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  }
-
-  writeAccess(entry: {
-    requestId: string;
-    tsIso: string;
-    tenantId: string | null;
-    status: number | null;
-    outcome: string | null;
-    model: string | null;
-    cid: string | null;
-    raw: unknown;
-  }): void {
-    // fs 形态：访问日志的家是 JSONL（appendAccessFile），表落点 no-op
-    void entry;
-  }
-
-  claimProbeLease(cid: string, key: string, ttlMs: number): boolean {
-    // 单进程形态无竞态：恒放行（与 S0 之前的行为一致）
-    void cid;
-    void key;
-    void ttlMs;
-    return true;
+    writeJsonWithBackup(rootFile("model-prefs.json"), prefs, writeJsonFile);
   }
 
   readApiKeys(): unknown | null {
-    return readJsonOrNull(rootFile(API_KEYS_NAME));
+    return readJsonWithBackup(rootFile(API_KEYS_NAME));
   }
 
   writeApiKeys(keys: unknown): void {
-    writeJsonFile(rootFile(API_KEYS_NAME), keys);
+    writeJsonWithBackup(rootFile(API_KEYS_NAME), keys, writeJsonFile);
   }
 }
 
-// 组合根注入点：默认 fs；服务化形态（S1+）在装配时替换为 pg 适配器。
+// 组合根注入点：默认 fs（唯一实现）。
 let currentStore: PoolStore = new FsPoolStore();
 
 export function setPoolStore(store: PoolStore): void {

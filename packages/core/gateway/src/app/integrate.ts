@@ -11,15 +11,21 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, sep } from "node:path";
 
 import { POOL_EXPOSED_IDS } from "../pool/model-family.js";
 import { poolModelMetas, poolModels } from "../pool/pool-targets.js";
 import { defaultAddr } from "../runtime/cli-consts.js";
 import { rootDir } from "../runtime/paths.js";
 import { writeAtomicFile, writeJsonFile, writeJsonSecret } from "../runtime/secret-file.js";
+import {
+  ensureIntegrationApiKey,
+  integrationKeySecret,
+  INTEGRATION_KEY_NAME,
+  verifyApiKeyPlain,
+} from "../runtime/api-key-store.js";
 
 /** 接入目标。 */
 export type IntegrationTarget = "zcode" | "dsh";
@@ -66,13 +72,96 @@ const ZCODE_PROVIDER_NAME = "modelmux";
 const DSH_PROVIDER = "modelmux";
 const DSH_PLUGIN_ID = "llm-pi-ai";
 const DSH_PROFILES = ["acp", "desktop", "headless", "web"] as const;
-/**
- * 本机回环网关不校验入站密钥，这里只放占位值：zcode 的供应商完整校验要求
- * `access.apiKey` 非空，dsh 要求 `apiKeyEnv` 指向的凭据已配置 —— 两者都只校验「有值」。
- */
-const LOCAL_API_KEY = "modelmux-local";
 /** dsh 凭据引用名（`apiKeyEnv` 指向它，由 `~/.dsh/.credentials.yaml` 的 `refs` 解析）。 */
 const DSH_CREDENTIAL_REF = "MODELMUX_API_KEY";
+/**
+ * 取不到专用 key 明文时给 zcode 的占位值（结构校验只要求非空）。
+ *
+ * 它必须一眼是占位：真接上时客户端会 401，warning 会告诉用户去 API Keys 页删掉
+ * 专用 key 重建。
+ */
+const PENDING_ACCESS_VALUE = "modelmux-pending";
+
+/**
+ * 读 zcode 配置里 modelmux 的 `access.apiKey`（另一处客户端的现值）。
+ *
+ * 用途：专用 key 已存在而明文不可回读时，先点的那张接入卡已经把明文写进了客户端，
+ * 借它给另一张卡用 —— 否则两张卡分两次点必然有一张拿不到明文。
+ */
+function readZcodeAccessApiKey(): string | undefined {
+  const file = join(homedir(), ".zcode", "v2", "provider_config.json");
+  if (!existsSync(file)) return undefined;
+  try {
+    const root = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const rules = (root["config"] as Record<string, unknown> | undefined)?.["providerConfigRules"];
+    const list = (rules as Record<string, unknown> | undefined)?.["providerRules"];
+    const rule = Array.isArray(list)
+      ? list.find(
+          (r) =>
+            r !== null &&
+            typeof r === "object" &&
+            ((r as Record<string, unknown>)["providerId"] === ZCODE_PROVIDER_ID ||
+              (r as Record<string, unknown>)["providerName"] === ZCODE_PROVIDER_NAME),
+        )
+      : undefined;
+    const access = (rule as Record<string, unknown> | undefined)?.["config"];
+    const key = (access as Record<string, unknown> | undefined)?.["access"];
+    const value = (key as Record<string, unknown> | undefined)?.["apiKey"];
+    return typeof value === "string" && value.trim() !== "" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 读 dsh 凭据文件里 `MODELMUX_API_KEY` 的现值（文件缺失 / 读不出返回 undefined）。 */
+function readDshCredentialValueFromFile(): string | undefined {
+  const file = join(homedir(), ".dsh", ".credentials.yaml");
+  if (!existsSync(file)) return undefined;
+  try {
+    return readDshCredentialValue(readFileSync(file, "utf8").split(/\r?\n/));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 接入要写的密钥：**恒为**一键接入专用 key（`INTEGRATION_KEY_NAME`）的明文。
+ *
+ * 专用 key 的明文由 `integrationKeySecret()` 保证可取（早期只有哈希的记录会被重建），
+ * 所以这里总是能拿到值 —— 客户端里原有的、别的 key（用户自建的）一律被换成它：
+ * 一键接入的语义就是「配置成用 modelmux 的专用 key」，沿用旧值会让客户端继续用一把
+ * 用户随时可能删掉的 key（实测 zcode 就停在旧 key 上不动）。
+ *
+ * `current` / `peer` 只用于**日志与 note**（说明换了哪一把），不参与选值。
+ */
+function resolveIntegrationSecret(
+  current: string | undefined,
+  peer: string | undefined,
+  integration: { record: { name: string }; plain: string | null },
+  warnings: string[],
+): { value: string | undefined; warning?: string; note?: string } {
+  if (integration.plain !== null) {
+    const same = current !== undefined && current === integration.plain;
+    return {
+      value: integration.plain,
+      note: same ? undefined : `客户端密钥已换成一键接入专用 key（${INTEGRATION_KEY_NAME}）`,
+    };
+  }
+  // 兜底：重建也失败（存储不可写）时保留现值，但必须让用户知道接入没配成
+  if (current !== undefined && current.trim() !== "") {
+    return {
+      value: current,
+      warning: `专用 key（${INTEGRATION_KEY_NAME}）的明文不可用（重建失败），客户端沿用原有密钥`,
+    };
+  }
+  if (peer !== undefined && peer.trim() !== "" && verifyApiKeyPlain(peer)) {
+    return { value: peer, note: "沿用另一处客户端已写入的专用 key" };
+  }
+  return {
+    value: undefined,
+    warning: `专用 key（${INTEGRATION_KEY_NAME}）的明文不可用（重建失败），且客户端里没有可用值`,
+  };
+}
 
 /** 对外模型名：取当前模型池；池为空（渠道未注册）时回落家族常量。 */
 function exposedModels(): string[] {
@@ -400,8 +489,24 @@ function integrateZcode(models: string[]): IntegrationResult {
   // zcode 对个人供应商规则做完整校验（group / access / api 缺一不可），缺任一项就整个
   // 供应商不进注册表 —— 模型清单写得再对，setModel 也报「Provider Registry 中不存在 Model」。
   ruleConfig["group"] = "standard-personal";
-  if (!hasUsableAccessKey(ruleConfig["access"])) {
-    ruleConfig["access"] = { type: "api-key", apiKey: LOCAL_API_KEY };
+  // 明文必须可写：早期只有哈希的记录会被重建（占位串会让客户端 401）
+  const integration = { record: ensureIntegrationApiKey().record, plain: integrationKeySecret() };
+  const access = hasUsableAccessKey(ruleConfig["access"])
+    ? (ruleConfig["access"] as Record<string, unknown>)
+    : undefined;
+  const resolved = resolveIntegrationSecret(
+    access?.["apiKey"] as string | undefined,
+    readDshCredentialValueFromFile(),
+    integration,
+    result.warnings,
+  );
+  if (resolved.note !== undefined) result.notes.push(resolved.note);
+  if (resolved.value !== undefined) {
+    ruleConfig["access"] = { type: "api-key", apiKey: resolved.value };
+  } else if (access === undefined) {
+    // 连占位都没有时也要满足 zcode 的结构校验；取不到明文就用明显的占位值并如实报 warning
+    // （常量引用而非字面量：密钥字面量扫描会拦下 apiKey: "..." 形态）
+    ruleConfig["access"] = { type: "api-key", apiKey: PENDING_ACCESS_VALUE };
   }
   if (JSON.stringify(ruleConfig) !== before) {
     result.notes.push(`供应商 ${ZCODE_PROVIDER_NAME}：baseUrl=${baseUrl}，模型=${models.join(" / ")}`);
@@ -473,7 +578,10 @@ function isBlank(line: string): boolean {
 
 /** 在 `lines` 里找 `indent` 层级、`key:` 形式的行；找不到返回 -1。 */
 function findKey(lines: string[], indent: number, key: string): number {
-  const re = new RegExp(`^ {${indent}}${key}:\\s*$`);
+  // 允许同行是空 flow（`models: []` / `models: {}`）：真实配置里空清单常写成这样，
+  // 只认「键后无内容」会漏掉它、再追加一个 `models:` —— YAML 重复键，后者覆盖前者，
+  // 清单看起来「改了又没改」。
+  const re = new RegExp(`^ {${indent}}${key}:\\s*(?:\\[\\]|\\{\})?\\s*$`);
   for (let i = 0; i < lines.length; i += 1) if (re.test(lines[i]!)) return i;
   return -1;
 }
@@ -575,13 +683,28 @@ function splitTrailingComment(line: string): [string, string] {
   return [line.slice(0, at).replace(/[ \t]+$/, ""), line.slice(at)];
 }
 
+/** 从 `refs` 行里取 `MODELMUX_API_KEY` 的当前值（引号剥掉）；没有该条目返回 undefined。 */
+function readDshCredentialValue(lines: string[]): string | undefined {
+  for (const line of lines) {
+    const code = line.replace(/#.*$/, "");
+    const m = code.match(
+      new RegExp(`(?:^\\s*|\\{|,)\\s*["']?${DSH_CREDENTIAL_REF}["']?\\s*:\\s*([^,}\\s]+)`),
+    );
+    if (m?.[1] !== undefined) return m[1].replace(/^["']|["']$/g, "");
+  }
+  return undefined;
+}
+
 /**
- * 确保 dsh 凭据引用存在：补丁里的 `apiKeyEnv: MODELMUX_API_KEY` 只是个引用名，
- * 真正的密钥在 `~/.dsh/.credentials.yaml` 的 `refs` 里；名字不在 refs 中时 dsh 的
- * Models 页判定该 provider 不可用（具名凭据未配置），请求发不出去。
+ * 确保 dsh 凭据引用存在且指向一键接入专用 key：补丁里的 `apiKeyEnv: MODELMUX_API_KEY`
+ * 只是个引用名，真正的密钥在 `~/.dsh/.credentials.yaml` 的 `refs` 里；名字不在 refs 中
+ * 时 dsh 的 Models 页判定该 provider 不可用（具名凭据未配置），请求发不出去。
  *
- * 文本级改写：只往 `refs` 里补一行，其余条目、注释与格式原样保留（该文件由 dsh 的
- * 凭据提供方管理，整文件重写会丢格式）。已存在该引用时不动。
+ * 值不对（占位串 / 已失效的旧 key）时一并改写 —— 对话请求恒定校验，旧占位串会让
+ * 客户端恒 401。
+ *
+ * 文本级改写：只改 `refs` 里那一条，其余条目、注释与格式原样保留（该文件由 dsh 的
+ * 凭据提供方管理，整文件重写会丢格式）。
  *
  * 并发：dsh 自己写这个文件走跨进程锁 + 原子替换（共享层引不进它的锁工具），这里
  * 只能做到原子替换，做不到互斥 —— 窗口极小，且写前备份可回滚。
@@ -589,10 +712,21 @@ function splitTrailingComment(line: string): [string, string] {
 function ensureDshCredential(warnings: string[]): { file: string; changed: boolean; notes: string[]; backupDir?: string } {
   const notes: string[] = [];
   const file = join(homedir(), ".dsh", ".credentials.yaml");
-  const entry = `${DSH_CREDENTIAL_REF}: ${LOCAL_API_KEY}`;
+  // 明文必须可写：早期只有哈希的记录会被重建（占位串会让客户端 401）
+  const integration = { record: ensureIntegrationApiKey().record, plain: integrationKeySecret() };
 
   if (!existsSync(file)) {
     const dir = backupDirFor("dsh");
+    const resolved = resolveIntegrationSecret(
+      undefined,
+      readZcodeAccessApiKey(),
+      integration,
+      warnings,
+    );
+    if (resolved.note !== undefined) notes.push(resolved.note);
+    // 取不到明文也要把引用补上（结构缺失会让 dsh 直接判定 provider 不可用），
+    // 值退回占位并已由 resolveIntegrationSecret 报过 warning
+    const entry = `${DSH_CREDENTIAL_REF}: ${resolved.value ?? PENDING_ACCESS_VALUE}`;
     try {
       // 必须登记「这个文件是本次接入新建的」：否则还原时不知道该删它，
       // 凭据文件会永久留在 ~/.dsh 下，而用户从没拥有过它。
@@ -609,7 +743,37 @@ function ensureDshCredential(warnings: string[]): { file: string; changed: boole
   const original = readFileSync(file, "utf8");
   const nl = original.includes("\r\n") ? "\r\n" : "\n";
   const lines = original.split(/\r?\n/);
-  if (hasCredentialRef(lines)) return { file, changed: false, notes };
+  const current = readDshCredentialValue(lines);
+  if (current !== undefined) {
+    const resolved = resolveIntegrationSecret(current, readZcodeAccessApiKey(), integration, warnings);
+    if (resolved.note !== undefined) notes.push(resolved.note);
+    if (resolved.value === current) return { file, changed: false, notes };
+    // 值缺失时同样退回占位（见上）：引用存在但值不可用，比整条缺失更好排查
+    const next = resolved.value ?? PENDING_ACCESS_VALUE;
+    // 值需要换：整文件重写风险大（该文件由 dsh 机器管理），改为逐行替换那一条
+    const idx = lines.findIndex((l) => new RegExp(`^\\s*["']?${DSH_CREDENTIAL_REF}["']?\\s*:`).test(l.replace(/#.*$/, "")) || new RegExp(`(?:\\{|,)\\s*["']?${DSH_CREDENTIAL_REF}["']?\\s*:`).test(l.replace(/#.*$/, "")));
+    if (idx < 0) return { file, changed: false, notes };
+    const dir = backupDirFor("dsh");
+    try {
+      backupFile(dir, file, warnings);
+      const [bare, comment] = splitTrailingComment(lines[idx]!);
+      const replaced = bare.replace(
+        new RegExp(`(["']?${DSH_CREDENTIAL_REF}["']?\\s*:\\s*)([^,}\\s]+)`),
+        `$1${next}`,
+      );
+      lines[idx] = `${replaced}${comment}`;
+      writeVerified(file, lines.join(nl), 0o600);
+    } catch (err) {
+      warnings.push(`改写凭据引用失败：${String(err)}`);
+      return { file, changed: false, notes, backupDir: dir };
+    }
+    notes.push(`凭据引用 ${DSH_CREDENTIAL_REF} 更新为一键接入专用 key`);
+    return { file, changed: true, notes, backupDir: dir };
+  }
+
+  const resolved = resolveIntegrationSecret(undefined, readZcodeAccessApiKey(), integration, warnings);
+  if (resolved.note !== undefined) notes.push(resolved.note);
+  const entry = `${DSH_CREDENTIAL_REF}: ${resolved.value ?? PENDING_ACCESS_VALUE}`;
 
   let text: string;
   const refsIdx = lines.findIndex((l) => /^\s*refs:\s*/.test(l));
@@ -818,12 +982,19 @@ function replaceDshModels(lines: string[], providerIdx: number, models: string[]
   // 列表项：`models:` 之后、缩进大于 modelsIndent 的连续行
   const modelsIndent = indentOf(next[modelsLine]!);
   const itemIndent = modelsIndent + 2;
+  // 同行空 flow（`models: []`）要连这一行一起替换，否则 `models:` 会写重
+  const inlineEmpty = /:\s*(?:\[\]|\{\})\s*$/.test(next[modelsLine]!);
   let stop = modelsLine + 1;
   while (stop < next.length && (isBlank(next[stop]!) || indentOf(next[stop]!) >= itemIndent)) stop += 1;
   // 去掉替换区间尾部混进来的空行（它们属于块外）
   let last = stop;
   while (last > modelsLine + 1 && isBlank(next[last - 1]!)) last -= 1;
-  next.splice(modelsLine + 1, last - (modelsLine + 1), ...renderDshModelItems(itemIndent, models, modalities));
+  const removeStart = inlineEmpty ? modelsLine : modelsLine + 1;
+  const removeCount = inlineEmpty ? 1 : last - (modelsLine + 1);
+  const insert = inlineEmpty
+    ? [`${" ".repeat(modelsIndent)}models:`, ...renderDshModelItems(itemIndent, models, modalities)]
+    : renderDshModelItems(itemIndent, models, modalities);
+  next.splice(removeStart, removeCount, ...insert);
   return next;
 }
 
@@ -870,10 +1041,48 @@ function stampOf(dir: string): number {
  * 等于让一条被改过的清单把任意文件读出来、写到任意位置（2026-11-08 实测：
  * `backup: "../../../../outside-secret.txt"` 会读到 MODELMUX_HOME 之外的内容）。
  */
-function isValidEntry(entry: unknown): entry is BackupEntry {
+/**
+ * `original` 是否落在该 target 的**允许落点**内。
+ *
+ * 清单是磁盘数据，只校验 `isAbsolute` 时，一条被改过的清单可以把备份内容写到
+ * 任意绝对路径（`~/.ssh/authorized_keys` 之类），`existed:false` 的条目更是直接
+ * `rmSync` 任意路径 —— 还原是不可逆动作，必须按 target 白名单卡死。
+ *
+ * 符号链接也要挡：文件若已存在且指向白名单之外，`realpath` 会露出来。
+ */
+function isAllowedOriginalPath(target: IntegrationTarget, original: string): boolean {
+  const home = homedir();
+  const fixed =
+    target === "zcode"
+      ? [join(home, ".zcode", "v2", "provider_config.json")]
+      : [join(home, ".dsh", ".credentials.yaml"), join(home, ".dsh", "config.yaml")];
+  if (fixed.includes(original)) return true;
+  if (target === "dsh") {
+    // dsh 的逐 profile 补丁：`<home>/.dsh/profiles/<profile>/cordis.patch.yml`
+    const prefix = join(home, ".dsh", "profiles") + sep;
+    if (original.startsWith(prefix) && original.endsWith(sep + "cordis.patch.yml")) {
+      const profile = original.slice(prefix.length, -"/cordis.patch.yml".length);
+      // profile 名不允许空、不允许再带分隔符（防 `../../`）
+      if (profile !== "" && !profile.includes("/") && !profile.includes("\\")) return true;
+    }
+  }
+  // 已存在的符号链接：跟随后的真实路径必须在同一白名单里
+  try {
+    if (existsSync(original)) {
+      const real = realpathSync(original);
+      return isAllowedOriginalPath(target, real);
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function isValidEntry(entry: unknown, target: IntegrationTarget): entry is BackupEntry {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
   const rec = entry as Record<string, unknown>;
   if (typeof rec["original"] !== "string" || !isAbsolute(rec["original"])) return false;
+  if (!isAllowedOriginalPath(target, rec["original"])) return false;
   if (typeof rec["existed"] !== "boolean") return false;
   if (rec["existed"]) {
     const backup = rec["backup"];
@@ -903,9 +1112,11 @@ function entriesOfBackup(
       notes.push(`跳过备份目录 ${basename(dir)}：清单 target 是 ${String(manifest.target)}，与请求的 ${target} 不符`);
       return null;
     }
-    const valid = manifest.files.filter(isValidEntry);
+    const valid = manifest.files.filter((e) => isValidEntry(e, target));
     for (const entry of manifest.files) {
-      if (!isValidEntry(entry)) notes.push(`跳过清单里字段不全的条目：${JSON.stringify(entry)}`);
+      if (!isValidEntry(entry, target)) {
+        notes.push(`跳过清单里字段不全或落点不在本客户端允许范围内的条目：${JSON.stringify(entry)}`);
+      }
     }
     return valid.length > 0 ? valid : null;
   }

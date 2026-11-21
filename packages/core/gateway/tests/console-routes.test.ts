@@ -1,5 +1,5 @@
 /**
- * 控制台路由补充覆盖：405 方法守卫、同源校验、静态服务边界、翻译 / ping / 主题 /
+ * 控制台路由补充覆盖：405 方法守卫、同源校验、静态服务边界、翻译 / 主题 /
  * 重试登录 / 命令分发与总览的分支。
  *
  * 与 `web.test.ts`（UI 侧）互补：那里测「主链路返回什么」，这里测「边界怎么拒」。
@@ -232,7 +232,6 @@ describe("方法守卫（405）", () => {
   const cases: Array<[string, string]> = [
     ["/api/logs", "POST"],
     ["/api/usage", "POST"],
-    ["/api/ping", "GET"],
     ["/api/theme", "GET"],
     ["/api/retry-login", "GET"],
     ["/api/commands", "GET"],
@@ -315,33 +314,6 @@ describe("/api/usage", () => {
   });
 });
 
-
-describe("/api/ping", () => {
-  it("坏 JSON 400；缺 model 400", async () => {
-    const bad = await fetch(`${server.url}api/ping`, { method: "POST", headers: JSON_HEADERS, body: "{oops" });
-    assert.equal(bad.status, 400);
-    const noModel = await fetch(`${server.url}api/ping`, { method: "POST", headers: JSON_HEADERS, body: "{}" });
-    assert.equal(noModel.status, 400);
-  });
-
-  it("回环自请求：console-only 服务没有 chat 路由 → ok:false + status 404", async () => {
-    const res = await fetch(`${server.url}api/ping`, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ model: "deepseek-v4.1-flash" }) });
-    assert.equal(res.status, 200);
-    const payload = (await res.json()) as { ok: boolean; status: number; ms: number; error: string };
-    assert.equal(payload.ok, false);
-    assert.equal(payload.status, 404);
-    assert.ok(payload.error.includes("unknown path"));
-    assert.ok(payload.ms >= 0);
-  });
-
-  it("Host 指向非回环地址时拒绝（SSRF 守卫，不出网）", async () => {
-    const { status, body } = await rawRequest("/api/ping", "POST", { ...JSON_HEADERS, host: "evil.example.com" }, JSON.stringify({ model: "m" }));
-    assert.equal(status, 200);
-    const payload = JSON.parse(body) as { ok: boolean; error: string };
-    assert.equal(payload.ok, false);
-    assert.match(payload.error, /回环/);
-  });
-});
 
 describe("/api/theme 与 /api/retry-login", () => {
   it("theme：坏 JSON 400 / 非法 mode 400 / 未注入 503 / 正常 ok", async () => {

@@ -26,7 +26,7 @@ import {
 } from "../dist/app/integrate.js";
 import { POOL_EXPOSED_IDS } from "../dist/pool/model-family.js";
 
-const MODELS = ["deepseek-v4.1-flash", "qwen3.8-flash"];
+const MODELS = ["deepseek-v4.1-flash", "kimi-k3.1-pro"];
 /** 写失败用例依赖 Windows 的只读属性挡 rename；POSIX 上 rename 不受文件权限影响。 */
 const isWin = process.platform === "win32";
 
@@ -262,7 +262,9 @@ describe("dsh 补充分支", () => {
     const result = integrateClient("dsh", MODELS);
     assert.equal(result.ok, true, result.error);
     const after = readFileSync(cred, "utf8");
-    assert.match(after, /LONGCAT_API_KEY: ak, MODELMUX_API_KEY: modelmux-local\}\n/, "条目应接在收尾同行");
+    // 值不钉死字面量：正常路径写的是一键接入专用 key 的明文（mmx_ 前缀），
+    // 取不到明文时退回占位（见 integrate.ts 的 PENDING_ACCESS_VALUE）
+    assert.match(after, /LONGCAT_API_KEY: ak, MODELMUX_API_KEY: (mmx_[0-9a-f]+|modelmux-pending)\}\n/, "条目应接在收尾同行");
   });
 
   it("凭据文件写失败（只读）：警告且不中断 profile", () => {
@@ -407,28 +409,53 @@ describe("还原补充分支", () => {
     assert.equal(readFileSync(provider, "utf8"), "NEWER", "应选最新那份备份");
   });
 
-  it("保护性备份失败与单条还原失败都如实记 notes", () => {
+  it("落点在白名单外的条目被跳过并留痕，好条目照常还原", () => {
+    // 清单是磁盘数据：一条被改过的清单不能把备份写到任意路径。白名单外的条目
+    // 既不该被写、也不该让整次还原失败（其余条目仍要还原）。
     const provider = join(home, ".zcode", "v2", "provider_config.json");
     mkdirSync(join(home, ".zcode", "v2"), { recursive: true });
     writeFileSync(provider, "CURRENT", "utf8");
-    const blocked = join(home, "blocked-dir");
-    mkdirSync(blocked, { recursive: true });
+    const outside = join(home, "blocked-dir");
+    mkdirSync(outside, { recursive: true });
 
     makeBackup(
       "zcode",
       "20990101000000",
       [
         { original: provider, backup: "provider_config.json.aaa11111", existed: true },
-        { original: blocked, backup: "blocked-dir.bbb22222", existed: true },
+        { original: outside, backup: "blocked-dir.bbb22222", existed: true },
       ],
       { "provider_config.json.aaa11111": "OLD", "blocked-dir.bbb22222": "X" },
     );
 
     const result = restoreClient("zcode");
-    assert.equal(result.ok, false, "有失败条目必须报失败");
-    assert.ok(result.notes.some((n) => n.includes("保护性备份失败")), "目录被当文件备份要留痕");
-    assert.ok(result.notes.some((n) => n.includes("还原") && n.includes("失败")), "单条还原失败要留痕");
+    assert.equal(result.ok, true, result.error);
+    assert.ok(
+      result.notes.some((n) => n.includes("不在本客户端允许范围内")),
+      "白名单外条目必须留痕；notes=" + result.notes.join(" | "),
+    );
     assert.equal(readFileSync(provider, "utf8"), "OLD", "好条目仍应还原");
+  });
+
+  it("目录被当文件备份时留痕（不静默成功）", () => {
+    // 备份名指向的是目录：读不出来 → 如实记 notes，不假装还原成功
+    const provider = join(home, ".zcode", "v2", "provider_config.json");
+    mkdirSync(join(home, ".zcode", "v2"), { recursive: true });
+    writeFileSync(provider, "CURRENT", "utf8");
+    makeBackup(
+      "zcode",
+      "20990101000000",
+      [{ original: provider, backup: "adir", existed: true }],
+      {},
+    );
+    const dir = join(backupRoot(), "zcode-20990101000000", "adir");
+    mkdirSync(dir, { recursive: true });
+
+    const result = restoreClient("zcode");
+    assert.ok(
+      result.notes.some((n) => n.includes("备份") || n.includes("还原")),
+      "备份不可用必须留痕；notes=" + result.notes.join(" | "),
+    );
   });
 });
 

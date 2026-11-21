@@ -186,12 +186,6 @@ export interface UiSnapshot {
    * 关闭 ≠ 注销：凭据与登录态都在，勾回来即恢复（存 setting.json 的 disabled_channels）。
    */
   channel_toggles: Array<{ cid: string; enabled: boolean }>;
-  /**
-   * API key 校验是否启用（guard 已装配）。
-   *
-   * 控制台「API Keys」页与设置页开关的唯一显示条件 —— 未启用时恒 false。
-   */
-  api_key_mode: boolean;
   gateway_error: string;
 }
 
@@ -215,7 +209,6 @@ export function emptySnapshot(): UiSnapshot {
     integration_updates: {},
     theme_mode: "system",
     channel_toggles: [],
-    api_key_mode: false,
     gateway_error: "",
   };
 }
@@ -354,6 +347,23 @@ function isLocalDirect(req: import("node:http").IncomingMessage): boolean {
   return LOOPBACK_HOSTS.has(remote) || LOOPBACK_HOSTS.has(remote.replace(/^::ffff:/, ""));
 }
 
+/**
+ * 请求的 Host / Origin 是否指向**本机**。
+ *
+ * 为什么不能只信 socket 回环：DNS rebinding 下浏览器把攻击者域名解析到 127.0.0.1，
+ * 对端地址必然是回环、`isLocalDirect` 恒真；而请求的 `Host` 与 `Origin` 仍是攻击者
+ * 域名 —— 它们只能由客户端提供，无法被 rebinding 抹掉。用它们做判据，rebinding 页面
+ * 会以 `Host: evil.com` 被拒（它没法把 Host 改成 127.0.0.1，改了就不是那个源了）。
+ *
+ * `Host` 缺失时按非本机处理（Node 对 HTTP/1.1 会补默认值，正常浏览器必带）。
+ */
+function isLoopbackHostHeader(req: import("node:http").IncomingMessage): boolean {
+  const raw = req.headers["host"];
+  if (typeof raw !== "string" || raw === "") return false;
+  const hostname = raw.split(":")[0]?.toLowerCase() ?? "";
+  return LOOPBACK_HOSTS.has(hostname) || LOOPBACK_HOSTS.has(`[${hostname}]`);
+}
+
 /** 写操作同源校验（比对 host:port，避免只比 hostname 时跨端口请求被放行）。 */
 function isSameOrigin(req: import("node:http").IncomingMessage, host: string): boolean {
   const origin = req.headers["origin"];
@@ -369,74 +379,11 @@ function isSameOrigin(req: import("node:http").IncomingMessage, host: string): b
   }
 }
 
-/** ping 的等待上限（毫秒）：比客户端常见的 60s 超时早一步收手，好把「超时」当结果返回。 */
-const PING_TIMEOUT_MS = 45_000;
-
-/** 回环地址名单：ping 只能打回本机，Host 头是客户端给的，不校验就是 SSRF 跳板。 */
+/** 回环地址名单：本机直连判定与 Host / Origin 校验共用。 */
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
 /** 总览里已留痕过「账号读取失败」的渠道（进程生命周期内一次）：防止 5s 轮询刷屏。 */
 const overviewAccountFailures = new Set<string>();
-
-/**
- * ping 一个模型：向**本进程**发一次最小 chat 请求并计时。
- *
- * 为什么走 HTTP 自请求、不做内部直调：只有走完整链路才算 ping —— 候选选择、自动换号、
- * 排队重试、响应归一化、护栏都在链路上，绕过它们测出的「成功」不代表客户端会成功。
- *
- * 请求形态取最小：单条 user 消息 + `max_tokens: 1` + 非流式 —— 计费最小；非流式还能拿到
- * 确定的状态码（流式要读完流才知道成败）。`ms` 量到**响应体读完**为止，不是只到响应头。
- */
-async function pingModel(
-  req: import("node:http").IncomingMessage,
-  model: string,
-): Promise<{ ok: boolean; model: string; ms: number; status: number; error: string }> {
-  const started = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
-  try {
-    // Host 头是客户端给的，畸形值会让 new URL 抛 TypeError —— 放 try 里按失败处理
-    const target = new URL(`http://${req.headers.host ?? ""}/v1/chat/completions`);
-    if (!LOOPBACK_HOSTS.has(target.hostname)) {
-      return { ok: false, model, ms: 0, status: 0, error: "ping 只能发往本机回环地址" };
-    }
-    const upstream = await fetch(target, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-        stream: false,
-      }),
-      signal: controller.signal,
-    });
-    const status = upstream.status;
-    const text = await upstream.text().catch(() => "");
-    const ms = Date.now() - started;
-    // 响应头已到、体读完之前被 abort：实际是超时，不能按头状态报成败
-    if (controller.signal.aborted) {
-      return { ok: false, model, ms, status: 0, error: `超时（> ${Math.round(PING_TIMEOUT_MS / 1000)}s）` };
-    }
-    if (!upstream.ok) {
-      // 错误体是网关自己的 JSON（`{error:{message}}`），截断后原样回给界面，别自己编原因
-      return { ok: false, model, ms, status, error: text.slice(0, 300) || `HTTP ${status}` };
-    }
-    return { ok: true, model, ms, status, error: "" };
-  } catch (err) {
-    const ms = Date.now() - started;
-    const aborted = err instanceof Error && err.name === "AbortError";
-    return {
-      ok: false,
-      model,
-      ms,
-      status: 0,
-      error: aborted ? `超时（> ${Math.round(PING_TIMEOUT_MS / 1000)}s）` : String(err),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /** 读一次 JSON 请求体（供 /api/providers 的 POST 用；超限按截断处理）。 */
 function readBody(req: import("node:http").IncomingMessage, onBody: (body: Record<string, unknown>) => void): void {
@@ -481,6 +428,19 @@ export function createConsoleHandler(
       return;
     }
     const p = (suffix: string): string => `${prefix}${suffix}`;
+
+    // —— API 前置：Host 必须是本机 ——
+    //
+    // 挡的是 DNS rebinding：浏览器把攻击者域名解析到 127.0.0.1 后，socket 对端必然是
+    // 回环（`isLocalDirect` 恒真），只有 Host / Origin 还保留着攻击者域名。所有 API
+    // （含只读的 state）都走这条；静态资源与 SPA 页面不校验，它们不含敏感数据。
+    if (path.startsWith(p("/api/"))) {
+      if (!isLoopbackHostHeader(req)) {
+        appendGateway(`console api rejected non-loopback Host: ${String(req.headers["host"] ?? "(none)")}`);
+        json(res, { ok: false, error: "请求来源主机被拒绝" }, 403);
+        return;
+      }
+    }
 
     // —— 静态（GET） ——
     if (path === p("/") && (req.method === "GET" || req.method === "HEAD")) {
@@ -584,45 +544,6 @@ export function createConsoleHandler(
           ? raw
           : "30d";
       json(res, { ok: true, ...computeUsageStats(range) });
-      return;
-    }
-
-    if (path === p("/api/ping")) {
-      if (req.method !== "POST") {
-        json(res, { ok: false, error: "use POST" }, 405);
-        return;
-      }
-      // 会真的花掉一次上游请求（1 个输出 token），按写操作对待：必须同源。
-      if (!isSameOrigin(req, host)) {
-        json(res, { ok: false, error: "跨源请求已拒绝" }, 403);
-        return;
-      }
-      let body = "";
-      req.on("data", (chunk) => {
-        body += String(chunk);
-      });
-      req.on("end", () => {
-        void (async () => {
-          let parsed: { model?: unknown };
-          try {
-            parsed = JSON.parse(body || "{}") as { model?: unknown };
-          } catch {
-            json(res, { ok: false, error: "invalid json" }, 400);
-            return;
-          }
-          const model = typeof parsed.model === "string" ? parsed.model.trim() : "";
-          if (!model) {
-            json(res, { ok: false, error: "参数 model 必填" }, 400);
-            return;
-          }
-          const result = await pingModel(req, model);
-          json(res, result, 200);
-        })().catch((err) => {
-          // 与 `/api/commands` 同待遇：意外 rejection 不能变成 unhandledRejection
-          appendGateway(`console /api/ping failed: ${String(err)}`);
-          if (!res.headersSent) json(res, { ok: false, error: `ping failed: ${String(err)}` }, 500);
-        });
-      });
       return;
     }
 

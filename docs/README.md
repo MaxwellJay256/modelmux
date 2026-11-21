@@ -34,7 +34,6 @@
 | [USAGE-STATS.md](./USAGE-STATS.md) | **用量口径**：仪表盘用量区块的数据源、指标公式（只计模型请求 / 缓存分母 / 连续天数）、与 ZCode「使用统计」的内容设计对照与交互差异 |
 | [DESKTOP-APP.md](./DESKTOP-APP.md) | **桌面壳（Windows 安装版 exe）**：形态与行为、构建步骤、路径敏感性实测、MotW 与签名真相、存储根与凭据红线 |
 | [DESKTOP-FIRST.md](./DESKTOP-FIRST.md) | **桌面壳主体化迁移方案（设计方案）**：厚壳 + 进程外网关的目标架构、shell token 鉴权、生命周期重划、PR 拆分与决策点；现行壳契约仍在 DESKTOP-APP.md |
-| [SAAS-REDESIGN.md](./SAAS-REDESIGN.md) | **服务化重构方案（设计方案）**：多租户 / 多实例目标架构 —— PostgreSQL + Redis 选型、RLS 数据模型、租约半开、计费闭环、S0-S4 路线与决策点；现行单实例契约仍在 CONTRACT-TS.md / POOL-ARCHITECTURE.md |
 | [CLIENT-INTEGRATION.md](./CLIENT-INTEGRATION.md) | **客户端接入指南**：三种入站协议（OpenAI chat / Anthropic Messages / OpenAI Responses）、模型名解析（家族裸名 + Claude Desktop 角色映射 + 家族外 400）、客户端一键接入与手工配置、真机验证矩阵 |
 | [backup/translation/TRANSLATION.md](./backup/translation/TRANSLATION.md) | **请求上下文翻译（已下线，方案留档）**：英译中的判定算法、分块与缓存策略、网关代发的取舍、入参上限 —— 功能随上下文弹窗移除，代码已删，方案留给后续项目复用 |
 | [DASHBOARD-DESIGN.md](./DASHBOARD-DESIGN.md) | **仪表盘设计方案**：/web/ 首页运行视图的模块划分、布局与数据通道；现行规则见 WEB-CONSOLE.md |
@@ -58,9 +57,11 @@ Source = Deploy from a branch，`main` / `/docs`；**不需要 workflow**）。�
 
 | 文件 | 用途 |
 | --- | --- |
-| [index.html](./index.html) | 单文件站点（内联 CSS，无外链资源；file:// 直接打开也可用） |
+| [index.html](./index.html) | 单页站点（内联 CSS；HTML 不依赖任何 CDN，仅引用同源 `assets/`） |
+| [assets/](./assets/) | 站点图片：品牌标志与 favicon，复用 `packages/ui/src/assets/` 的原图 |
 
-> Pages 根目录 = `/docs`，所以站点文件必须留在这一层，不要挪进子目录。
+> Pages 根目录 = `/docs`，所以站点文件必须留在这一层，不要挪进子目录；`index.html` 里的
+> `assets/…` 是相对根路径的写法，部署到 `/modelmux/` 子目录下同样成立。
 > `docs/index.html` 与 `docs/README.md` 并存不冲突：GitHub 仓库页优先渲染 README，
 > Pages 优先 serve index.html。
 
@@ -106,7 +107,7 @@ Source = Deploy from a branch，`main` / `/docs`；**不需要 workflow**）。�
 
 网关是一个**普通 HTTP 端点**，不依赖 ZCode：任何能配 OpenAI 兼容 base url 的客户端直接指向
 `http://127.0.0.1:4412/v1` 就能用。模型 id 是**对外模型家族的裸模型名**（当前为 `deepseek-v4.1-flash` 与
-`qwen3.8-flash`，`/v1/models` 只列有渠道供给的那几个）—— 渠道对客户端透明，由网关按账号池剩余额度自动挑；
+`kimi-k3.1-pro`，`/v1/models` 只列有渠道供给的那几个）—— 渠道对客户端透明，由网关按账号池剩余额度自动挑；
 家族外的模型名一律 400（见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2）。
 
 **不需要**为任何客户端做适配层：网关就是标准 OpenAI 兼容端点，任何客户端把 base url

@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>modelmux — 一个端点，几个模型，额度自适应</title>
 <meta name="description" content="modelmux 是本地 LLM 网关：7 个渠道的额度汇成一个 OpenAI 兼容端点，对外只有几个裸模型名，选路、换号、熔断、签到全自动。" />
+<!-- 图标与控制台同源（复用 packages/ui/src/assets），Pages 根是 /docs，所以走相对路径 -->
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon-180.png" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="modelmux — 一个端点，几个模型，额度自适应" />
+<meta property="og:description" content="本地 LLM 网关：7 个渠道的额度汇成一个 OpenAI 兼容端点，对外只有几个裸模型名。" />
+<meta property="og:image" content="https://bluechonk.github.io/modelmux/assets/logo-192.png" />
+<meta name="twitter:card" content="summary" />
 <style>
   :root {
     --ink: #0c0d0e;
@@ -43,6 +51,10 @@
     color: var(--text-faint); font-family: var(--mono);
   }
   hr.sep { border: 0; border-top: 1px solid var(--line); margin: 0; }
+  /* hero 品牌锁：52px 角色图与 eyebrow 同一基线，窄屏缩到 40px 给文字让位 */
+  .mark-row { display: flex; align-items: center; gap: 12px; }
+  .mark-row img { width: 52px; height: 52px; object-fit: contain; flex: none; }
+  @media (max-width: 620px) { .mark-row img { width: 40px; height: 40px; } }
 
   /* ——— 顶栏 ——— */
   header.top {
@@ -53,7 +65,8 @@
   }
   .top .wrap { display: flex; align-items: center; gap: 20px; height: 56px; }
   .brand { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 500; letter-spacing: -0.01em; }
-  .brand svg { display: block; }
+  /* 品牌图是透明底 192px 方图，按 24px 等比缩放；object-fit 防止纵向被压扁 */
+  .brand img { display: block; width: 24px; height: 24px; object-fit: contain; }
   nav.main { display: flex; gap: 2px; margin-left: 8px; }
   nav.main a { padding: 6px 10px; border-radius: 8px; font-size: 13px; color: var(--text-soft); }
   nav.main a:hover { color: var(--text); background: var(--raised); }
@@ -101,8 +114,15 @@
     padding: 9px 12px; border-bottom: 1px solid var(--line);
     background: var(--raised); font-family: var(--mono); font-size: 11px; color: var(--text-faint);
   }
+  /* 标题栏右端放品牌图：与真实控制台窗口的标题栏位置一致 */
+  .term .bar img { margin-left: auto; width: 15px; height: 15px; object-fit: contain; opacity: 0.9; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-strong); }
   .term pre { margin: 0; padding: 16px; font-size: 12.5px; line-height: 1.75; overflow-x: auto; }
+  /* 极窄屏代码仍需横滚（11px 是字号下限）：细滚动条让它是「可滚的代码块」而非溢出 */
+  pre { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+  pre::-webkit-scrollbar { height: 6px; }
+  pre::-webkit-scrollbar-track { background: transparent; }
+  pre::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 3px; }
   .term .c { color: var(--text-faint); }
   .term .g { color: var(--signal); }
   .term .w { color: var(--warn); }
@@ -113,6 +133,8 @@
   @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
 
   /* ——— 章节 ——— */
+  /* 锚点跳转的落点补偿：吸顶栏 57px，不留白会把章节标题压在栏下（390 实测压 5px） */
+  section[id] { scroll-margin-top: 72px; }
   section { padding: 72px 0; border-bottom: 1px solid var(--line); }
   .sec-head { display: flex; align-items: baseline; gap: 16px; margin-bottom: 34px; flex-wrap: wrap; }
   h2 { margin: 0; font-size: 28px; letter-spacing: -0.02em; font-weight: 500; }
@@ -182,6 +204,19 @@
   .models-inline { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; }
   .pill { font-family: var(--mono); font-size: 11.5px; color: var(--text-soft); border: 1px solid var(--line-strong); border-radius: 20px; padding: 3px 10px; }
 
+  /* 桌面版 */
+  .desktop-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 28px; align-items: start; }
+  .desk-main { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .desk-row { display: grid; grid-template-columns: 76px minmax(0,1fr); gap: 16px; padding: 13px 16px; border-top: 1px solid var(--line); font-size: 13.5px; }
+  .desk-row:first-child { border-top: 0; }
+  .desk-k { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); padding-top: 2px; }
+  .desk-v { color: var(--text-soft); }
+  /* 安装路径是不可断词的长 token：320px 下需要 350px，不放开换行会顶破容器 */
+  .desk-v code { color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; }
+  .desk-side { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 20px; }
+  .desk-side h3 { margin: 0 0 8px; font-size: 13px; font-weight: 500; letter-spacing: 0.02em; }
+  .desk-side p { margin: 0 0 16px; font-size: 13px; color: var(--text-soft); }
+
   /* 边界 */
   .limits { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
   .limit { background: var(--surface); padding: 20px 22px; }
@@ -190,19 +225,53 @@
 
   footer { padding: 40px 0 56px; }
   footer .wrap { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; font-size: 12.5px; color: var(--text-faint); }
-  footer .links { display: flex; gap: 16px; }
+  footer .brandline { display: flex; align-items: center; gap: 8px; }
+  footer .brandline img { width: 18px; height: 18px; object-fit: contain; }
+  /* 链接靠右：品牌字标在左，链接组在右，窄屏换行后仍各自成组 */
+  footer .links { display: flex; gap: 16px; margin-left: auto; }
   footer a:hover { color: var(--text); }
 
   @media (max-width: 940px) {
-    .hero-grid, .route, .install { grid-template-columns: minmax(0,1fr); }
+    .hero-grid, .route, .install, .desktop-grid { grid-template-columns: minmax(0,1fr); }
     .routing-note { border-left: 0; padding-left: 0; padding-top: 8px; border-top: 1px solid var(--line); margin-top: 4px; }
     .cols { grid-template-columns: minmax(0,1fr); }
     .limits { grid-template-columns: minmax(0,1fr); }
-    nav.main { display: none; }
+  }
+  /* 320 档：h1 高亮段独立成行。30px 下「几个模型，额度自己挑」需要 300px，
+     容器只有 257px，不拆行会只剩一个「挑」掉到第三行 */
+  @media (max-width: 360px) {
+    .hero h1 .dim { display: block; }
+    /* 四项数字在 320 会折成 3+1（第三项之后断行），改两列正好 2+2 */
+    .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 12px; }
   }
   @media (max-width: 620px) {
+    /* 桌面版行改上下堆叠：两列时值列只剩 ~200px，长路径会被从单词中间断开 */
+    .desk-row { grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 12px 14px; }
+    .desk-k { padding-top: 0; }
+    .desk-v code { font-size: 11.5px; }
+    /* 代码块收字号 + 内边距：12.5px 下 `login loomy` 那行在 390 会出横滚条 */
+    .step pre { font-size: 11px; padding: 9px 10px; }
+    /* 首屏终端同样收一档：12.5px 下状态表在 390 溢出 57px（需横滚才看得到 ok 列） */
+    .term pre { font-size: 11px; }
+
+    /* 渠道表在窄屏改两列堆叠：四列表格在 320–390 会裁掉「签到」列（实测 346 > 326） */
+    .chans thead { display: none; }
+    .chans tbody tr {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto;
+      gap: 3px 12px; padding: 12px 14px; border-top: 1px solid var(--line);
+    }
+    .chans tbody tr:first-child { border-top: 0; }
+    .chans tbody td { padding: 0; border: 0; }
+    .chans tbody td:nth-child(1) { grid-column: 1; grid-row: 1; }
+    .chans tbody td:nth-child(2) { grid-column: 1; grid-row: 2; color: var(--text-faint); font-size: 12px; }
+    .chans tbody td:nth-child(3) { grid-column: 2; grid-row: 1; text-align: right; white-space: nowrap; }
+    .chans tbody td:nth-child(4) { grid-column: 2; grid-row: 2; text-align: right; white-space: nowrap; }
+    .chans tbody tr:hover { background: transparent; }
+
     /* 窄屏 h1 收到 30px：56→34 时「额度自己挑」仍会掉到第三行只剩一个「挑」 */
     h1 { font-size: 30px; letter-spacing: -0.02em; }
+    /* 导航在 620 以下才收起：768 平板宽度放得下，收起只留一片空白 */
+    nav.main { display: none; }
     .hero { padding: 56px 0 44px; }
     section { padding: 52px 0; }
     .lane { grid-template-columns: 88px minmax(0,1fr) 68px; }
@@ -212,16 +281,12 @@
   }
 </style>
 </head>
-<body>
+<body id="top">
 
 <header class="top">
   <div class="wrap">
     <a class="brand" href="#top" aria-label="modelmux 首页">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <rect x="2" y="6" width="5" height="12" rx="1.6" stroke="currentColor" stroke-width="1.6"/>
-        <rect x="9.5" y="3" width="5" height="18" rx="1.6" stroke="currentColor" stroke-width="1.6"/>
-        <rect x="17" y="8" width="5" height="8" rx="1.6" stroke="currentColor" stroke-width="1.6"/>
-      </svg>
+      <img src="assets/logo-192.png" width="24" height="24" alt="" />
       modelmux
     </a>
     <nav class="main" aria-label="站点导航">
@@ -229,6 +294,7 @@
       <a href="#capability">能力</a>
       <a href="#channels">渠道</a>
       <a href="#start">开始</a>
+      <a href="#desktop">桌面版</a>
       <a href="#limits">边界</a>
     </nav>
     <div class="right">
@@ -238,12 +304,15 @@
   </div>
 </header>
 
-<main id="top">
+<main>
   <section class="hero">
     <div class="wrap hero-grid">
       <div>
-        <div class="eyebrow">本地 LLM 网关 · OpenAI 兼容</div>
-        <h1>一个端点<br />几个模型<span class="dim">，额度自己挑</span></h1>
+        <div class="mark-row">
+          <img src="assets/logo-192.png" width="52" height="52" alt="modelmux 标志" />
+          <div class="eyebrow">本地 LLM 网关 · OpenAI 兼容</div>
+        </div>
+        <h1>一个端点<br />几个模型，<span class="dim">额度自己挑</span></h1>
         <p class="lede">
           把在册渠道的额度汇成一个端点。对外只有家族表里的裸模型名，
           哪家渠道出、用哪个账号、额度烧完怎么顺延，全在网关里跑完，客户端不用知道。
@@ -260,7 +329,7 @@
         </div>
       </div>
       <div class="term" role="img" aria-label="终端示例：网关启动、账号池状态与一次请求的选路输出">
-        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">mx status</span></div>
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">mx status</span><img src="assets/logo-192.png" width="15" height="15" alt="" /></div>
         <pre><span class="c">$</span> <span class="t">mx start</span>
 <span class="g">✓</span> gateway listening <span class="t">127.0.0.1:4412</span>
 
@@ -400,7 +469,7 @@ qwenworkcn         1        <span class="c">—</span>      ok
     <div class="wrap">
       <div class="sec-head">
         <h2>四步跑起来</h2>
-        <p>Node ≥ 22。本机单用户形态不需要数据库、不需要 Redis，也不需要先建 API key。</p>
+        <p>Node ≥ 22。本机单用户形态不需要数据库、不需要 Redis，也不需要先建 API key。不想碰命令行的话，直接用<a href="#desktop" style="color:var(--text);text-decoration:underline;text-underline-offset:3px">Windows 桌面版</a>。</p>
       </div>
       <div class="install">
         <div class="steps">
@@ -445,12 +514,57 @@ npm run build</pre>
           </div>
           <div class="models-inline" aria-label="当前对外模型">
             <span class="pill">deepseek-v4.1-flash</span>
-            <span class="pill">qwen3.8-flash</span>
+            <span class="pill">kimi-k3.1-pro</span>
           </div>
           <p style="margin-top:16px;margin-bottom:0;font-size:12px;color:var(--text-faint);line-height:1.6">
-            需要多设备共享又不想裸奔？设置里开启「要求 API key」，每个 key 可限定模型白名单与每分钟请求数。
+            对话请求需带 API key，每个 key 可限定模型白名单与每分钟请求数。
           </p>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="desktop">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Windows 桌面版</h2>
+        <p>不想碰命令行就用安装包：双击装完，桌面一个快捷方式，剩下的它自己办。</p>
+      </div>
+      <div class="desktop-grid">
+        <div class="desk-main">
+          <div class="desk-row">
+            <span class="desk-k">安装包</span>
+            <span class="desk-v">NSIS 一键安装，装到 <code>%LOCALAPPDATA%\Programs\modelmux-desktop</code></span>
+          </div>
+          <div class="desk-row">
+            <span class="desk-k">零依赖</span>
+            <span class="desk-v">不需要 Node.js / npm / CLI，也不需要 VC++ 运行时（CRT 静态链接）</span>
+          </div>
+          <div class="desk-row">
+            <span class="desk-k">启动</span>
+            <span class="desk-v">双击快捷方式自启网关并显示控制台；已有网关在跑就复用，不重复起实例</span>
+          </div>
+          <div class="desk-row">
+            <span class="desk-k">常驻</span>
+            <span class="desk-v">关窗收进托盘，网关继续在后台接请求；托盘菜单退出才真退</span>
+          </div>
+          <div class="desk-row">
+            <span class="desk-k">自愈</span>
+            <span class="desk-v">每 10 秒探一次 <code>/health</code>：网关断了换说明页，起来了自动载回控制台</span>
+          </div>
+          <div class="desk-row">
+            <span class="desk-k">窗口</span>
+            <span class="desk-v">1000×720，记住上次位置与尺寸；标题栏隐藏，顶栏即拖拽区</span>
+          </div>
+        </div>
+        <aside class="desk-side">
+          <h3>系统要求</h3>
+          <p>Windows 10 1809+ / 11，x64。首次使用要在控制台逐渠道登录 —— 安装包不附带任何凭据。</p>
+          <a class="btn" href="https://github.com/bluechonk/modelmux/releases">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            下载安装包
+          </a>
+        </aside>
       </div>
     </div>
   </section>
@@ -485,7 +599,7 @@ npm run build</pre>
 
 <footer>
   <div class="wrap">
-    <span>modelmux · v0.1.5 · MIT</span>
+    <span class="brandline"><img src="assets/logo-192.png" width="18" height="18" alt="" />modelmux · v0.1.5 · MIT</span>
     <span class="links">
       <a href="https://github.com/bluechonk/modelmux">GitHub</a>
       <a href="https://github.com/bluechonk/modelmux/tree/main/docs">文档</a>

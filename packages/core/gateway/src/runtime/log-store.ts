@@ -444,18 +444,6 @@ function appendAccessFile(outcome: AccessOutcome, record: RequestLog): void {
   }
 }
 
-/**
- * 请求收尾钩子（S2 租户结算的挂点）：组合根在服务形态注册；
- * 本机形态无人注册，`finishRequestLog` 行为零变化。钩子异常只记日志，
- * 不得反压请求路径。
- */
-type FinishHook = (log: RequestLog) => void;
-const finishHooks: FinishHook[] = [];
-
-export function onRequestFinished(hook: FinishHook): void {
-  finishHooks.push(hook);
-}
-
 /** 写一条访问日志；响应 finish/close 时调用，幂等。 */
 export function finishRequestLog(log: RequestLog, status: number): void {
   if (log.written) return;
@@ -478,13 +466,6 @@ export function finishRequestLog(log: RequestLog, status: number): void {
   const routine = log.path === "/health" || log.path === "/v1/models" || log.path === "/metrics";
   if (routine && log.outcome === "success" && !slowVerdictOfLog(log).slow) return;
   appendAccessFile(log.outcome, log);
-  for (const hook of finishHooks) {
-    try {
-      hook(log);
-    } catch (err) {
-      console.error(`request finish hook failed (${log.id}): ${String(err)}`);
-    }
-  }
 }
 
 /** 给响应挂上访问日志上下文；返回该上下文供调用方补充 model/cid 等字段。 */
@@ -835,7 +816,6 @@ export interface AccessEntry {
 export const MODEL_REQUEST_PATHS = ["/v1/chat/completions", "/v1/messages", "/v1/responses"] as const;
 
 /** 旧常量（OpenAI 路径）；统计口径已换成 `isModelRequestPath`。 */
-export const MODEL_REQUEST_PATH = MODEL_REQUEST_PATHS[0];
 
 /** 是否为模型请求路径（统计只看是不是模型调用，不分协议）。 */
 export function isModelRequestPath(path: string | undefined): boolean {
@@ -1358,11 +1338,16 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
    *
    * 渠道同理：统计条是「当前筛选下的这一批请求」的画像 —— 选了某个渠道，成功率 /
    * 慢 / 平均 TPS 就该是那个渠道的，否则换渠道时这几个数纹丝不动，读者会以为统计没生效。
+   * 模型筛选同理（否则「全部 16137」与列表 8 条同屏，更像统计坏了）。
+   * `outcome` / `stream` / `slow` / `q` 有意不进这里：它们各自的命中数就在列表里，
+   * 再收口会让「成功率」随结果分段变化（选「失败」显示 100% 失败），自相矛盾。
    */
-  const inScope = (path: string | undefined, cid: string | undefined): boolean =>
+  const modelNeedle = query.model?.toLowerCase();
+  const inScope = (path: string | undefined, cid: string | undefined, model: string | undefined): boolean =>
     (query.path === undefined || path === query.path) &&
     (query.paths === undefined || query.paths.includes(path ?? "")) &&
-    (query.cid === undefined || cid === query.cid);
+    (query.cid === undefined || cid === query.cid) &&
+    (modelNeedle === undefined || (model ?? "").toLowerCase().includes(modelNeedle));
   /**
    * 下拉用的渠道集合：只受**路径**范围约束，不受 `cid` 约束 ——
    * 否则选中某个渠道后，下拉里只剩它自己，用户没法再切回别的渠道。
@@ -1394,7 +1379,7 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
         if (!entry) continue;
         // 渠道下拉先收（路径范围内全部渠道），再按 cid 收口统计
         if (pathInScope(entry.path) && entry.cid !== undefined) seenCids.add(entry.cid);
-        if (!inScope(entry.path, entry.cid)) continue;
+        if (!inScope(entry.path, entry.cid, entry.model)) continue;
         scanned.push(entry);
         stats.requests += 1;
         stats[outcome] += 1;
@@ -1445,9 +1430,6 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
     if (query.cid !== undefined && e.cid !== query.cid) return false;
     if (query.stream !== undefined && e.stream !== query.stream) return false;
     if (query.slow === true && !e.slow) return false;
-    if (query.model !== undefined && !(e.model ?? "").toLowerCase().includes(query.model.toLowerCase())) {
-      return false;
-    }
     if (needle !== undefined && needle !== "") {
       const hay = `${e.id} ${e.model ?? ""} ${e.error ?? ""} ${e.message ?? ""}`.toLowerCase();
       if (!hay.includes(needle)) return false;

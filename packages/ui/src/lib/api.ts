@@ -12,7 +12,6 @@ import type {
   CommandResult,
   LogQuery,
   OverviewResponse,
-  PingResult,
   PoolRow,
   UiSnapshot,
   UsageRange,
@@ -84,12 +83,6 @@ export interface WebApi {
   usage(range: UsageRange): Promise<UsageStats>;
   /** 仪表盘聚合视图（`GET /web/api/overview`）：一次拿到 KPI + 渠道 + 模型池 + 最近请求。 */
   overview(): Promise<OverviewResponse>;
-  /**
-   * ping 一个模型（`POST /web/api/ping`）：向网关自身发一次最小 chat 请求并回耗时。
-   *
-   * 服务端只允许回环地址，会真的花掉一次上游请求（约 1 个输出 token），并落一条访问日志。
-   */
-  ping(model: string): Promise<PingResult>;
   readonly commands: {
     /** 各方法返回**已解包 data 的扁平对象**（含 ok / message / error）。 */
     login(cid: string, force: boolean): Promise<CommandData>;
@@ -145,14 +138,14 @@ export interface WebApi {
     restore(target: "zcode" | "dsh"): Promise<CommandData>;
     /** 设置弹窗的渠道开关：关闭 = 账号池隐藏 + 选路跳过（凭据与登录态保留）。 */
     setChannelEnabled(cid: string, enabled: boolean): Promise<CommandData>;
-    /** 开关「要求 API key」：写入 setting.json，需重启网关生效。 */
-    setApiKeyRequired(enabled: boolean): Promise<CommandData>;
     /** API key 列表（不含哈希；明文永不回读）。 */
     apiKeys(): Promise<CommandData>;
     /** 新建 key：返回 `plain`（明文，仅此一次）与记录。 */
     createApiKey(name: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
-    updateApiKey(id: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
+    updateApiKey(id: string, name: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
     deleteApiKey(id: string): Promise<CommandData>;
+    regenerateApiKey(id: string): Promise<CommandData>;
+    revealApiKey(id: string): Promise<CommandData>;
     /**
      * 手动检查更新（设置页「检查更新」按钮）。
      *
@@ -236,7 +229,6 @@ export const api: WebApi = {
       })}`,
     ),
   usage: (range) => get(`/api/usage${queryString({ range })}`),
-  ping: (model) => post("/api/ping", { model }),
   overview: () => get("/api/overview"),
   commands: {
     login: (cid, force) => command("login", cid, { force }),
@@ -257,11 +249,12 @@ export const api: WebApi = {
     integrate: (target) => command("integrate", undefined, { target }),
     restore: (target) => command("restore", undefined, { target }),
     setChannelEnabled: (cid, enabled) => command("setChannelEnabled", cid, { enabled }),
-    setApiKeyRequired: (enabled) => command("setApiKeyRequired", undefined, { enabled }),
     apiKeys: () => command("apiKeys", undefined),
     createApiKey: (name, allowedModels, rpmLimit) => command("createApiKey", undefined, { name, allowedModels, rpmLimit }),
-    updateApiKey: (id, allowedModels, rpmLimit) => command("updateApiKey", undefined, { id, allowedModels, rpmLimit }),
+    updateApiKey: (id, name, allowedModels, rpmLimit) => command("updateApiKey", undefined, { id, name, allowedModels, rpmLimit }),
     deleteApiKey: (id) => command("deleteApiKey", undefined, { id }),
+    regenerateApiKey: (id) => command("regenerateApiKey", undefined, { id }),
+    revealApiKey: (id) => command("revealApiKey", undefined, { id }),
     checkUpdate: () => command("checkUpdate", undefined),
   },
 };

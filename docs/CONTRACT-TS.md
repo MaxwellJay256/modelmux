@@ -406,6 +406,10 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 - `quotaResetAt(bodySnippet)`（**可选**）：从上游**错误体**里认出「额度耗尽 + 下次刷新时刻」
   （epoch ms；认不出返回 `null`）。共享层命中额度信号后用它定冷却截止，`null` 回落次日本地 0 点。
   **不要编造时间**：编错会让账号冷却到错误的时刻。语义与判定见 POOL-ARCHITECTURE.md §2.4。
+- `isCapacityError(status, body)`（**可选**）：判定一个**非 200** 响应是否是**上游容量型过载**
+  （推理集群无空闲实例一类）。命中时网关仍记渠道级冷却（候选让给别家），但**不计账号连败** ——
+  这类错误换账号没用，计入连败会把健康账号误熔断（上游排队高峰整批 5xx 的场景）。
+  渠道业务码由渠道声明，共享层不硬编码渠道知识（守卫与 `quotaSignal` 同思路）。
 - `quotaSignal(status, body)`（**可选**）：声明本渠道的**额度信号** —— 共享层只认通用措辞，
   渠道业务码与专有措辞**必须**经本钩子上报（共享层不许硬编码渠道知识）。
   - 返回 `usage_limit` = 账户级用量限额（对所有模型生效，含倍率 0 的）→ 一律冷却；
@@ -880,10 +884,6 @@ mx <组名> <子命令> [参数]        # 命令组
 - 仓库级动词（`start` / `stop` / `restart` / `serve` / `web`）不带 cid；
   `status` / `model` / `bill` / `acct` / `path` / `login` / `relogin` 都可以带 cid ——
   `mx status <cid>` 才是「某渠道的状态」。
-- `mx migrate pg` 是服务化迁移入口（fs 账号池 → PostgreSQL）：迁前自动备份到
-  `<root>/backups/migrate-pg-<stamp>/`，原 JSON 不动；`--dsn`（或 `MODELMUX_PG_DSN`）、
-  `--cid`（单渠道）、`--dry-run`（只报告）。设 `MODELMUX_MASTER_KEYS` 时凭据信封加密落库。
-  目标名写在动词后（`migrate <目标>`），与 `model <子命令>` 同属命令组形态。
 - 命令组是「组名在前、子命令在后」：`mx model list` / `mx model usage`。
   这与「渠道动词在前」不冲突，是两类不同形态。
 - `log` 也可以带 cid，但只有配 `--kind channel` 才有区别：

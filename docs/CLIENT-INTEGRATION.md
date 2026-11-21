@@ -28,7 +28,9 @@
 | `POST /v1/responses` | OpenAI Responses | Codex（`wire_api="responses"`） |
 | `GET /v1/models` | OpenAI 模型清单 | 所有客户端 |
 
-- 入站**无鉴权**（网关只绑 127.0.0.1）；`apiKey` 字段任意非空值即可。
+- **对话请求必须带 API key**：`Authorization: Bearer <key>`，key 在控制台「API Keys」页创建。
+  判定顺序 401 无效 key → 403 模型不在该 key 白名单 → 429 每分钟请求超限。
+  模型列表（`GET /v1/models`）与健康检查不校验。
 - 请求体上限 **32MB**（`http/chat/request.ts` 的 `MAX_BODY`）；超过即 `400`，不读完整包。
   长上下文请求（实测有 2.5MB / 66 万 tokens 的量级）离上限还远，正常用不会碰到。
 - 访问日志记 `protocol` 字段（`anthropic` / `responses`；缺省 = OpenAI chat），
@@ -73,7 +75,7 @@
 `packages/core/gateway/src/pool/inbound-model.ts`）：
 
 1. 剥 `[1m]` 后缀（Claude Code 的 1M 窗口标记）与 `modelmux/` 前缀；
-2. 大小写不敏感 + 只认**对外公布的裸名**（当前 `deepseek-v4.1-flash` / `qwen3.8-flash`；
+2. 大小写不敏感 + 只认**对外公布的裸名**（当前 `deepseek-v4.1-flash` / `kimi-k3.1-pro`；
    渠道侧写法如 `deepseek-flash`、`sn-deepseek-v4-1-flash-1017` 不在名单里，写了就是 400）；
 3. Claude Desktop 的三个角色名（`claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`）
    按 `DESKTOP_ROLE_MODELS` 固定表映射到池模型（见 [CONTRACT-TS.md §4.1.1](./CONTRACT-TS.md)）；
@@ -89,6 +91,10 @@
 仪表盘「接入 dsh / 接入 zcode」分别写 `~/.dsh/profiles/<profile>/cordis.patch.yml`
 （只换 `providers.modelmux.models` 块）与 `~/.zcode/v2/provider_config.json`
 （modelmux 供应商规则的 api / 模型清单），细节见 `app/integrate.ts` 与其测试。
+
+两处写的密钥都是**一键接入专用 key**（API Keys 页名称 `modelmux` 的那条）：不存在时
+自动创建，值仍有效的客户端原样保留。专用 key 的明文只写进客户端、网关侧不回读，
+因此两处分两次接入时，后接的那处沿用先接那处已写入的明文。
 
 ## 4. 验证矩阵
 

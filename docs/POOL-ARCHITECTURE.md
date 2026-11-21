@@ -51,7 +51,7 @@
 | 对外模型 id | 渠道侧等价写法（只用于内部归一） | `owned_by` | 候选渠道（**以渠道目录实时声明为准**，下列为实测示例） |
 |---|---|---|---|
 | `deepseek-v4.1-flash` | `deepseek-flash`（workbuddy 的上游 id） | `deepseek` | traecn、loomy、workbuddy、raccoon、codebuddycn、catpaw（渠道级窗口 600k）—— 上游写法逐渠道不同（如 raccoon 的 `sn-deepseek-v4-1-flash-1017`），catpaw 的渠道级窗口见注册表 `channels.catpaw.contextWindow` |
-| `qwen3.8-flash` | — | `alibaba` | qwenworkcn（`flash`）…（千问办公只卖「标准」档，底层型号由上游池化；候选经单渠道收窄表只出 qwenworkcn） |
+| `kimi-k3.1-pro` | `sn-kimi-k3-1-pro`（raccoon 的上游 id） | `moonshot` | codebuddycn、workbuddy、qwenworkcn、raccoon、traecn、catpaw —— 上游写法逐渠道见注册表 `channels` 段 |
 
 **客户端只认这两个名字**：入站解析放行的只有对外公布的裸名（大小写不敏感，可带
 `modelmux/` 前缀与 `[1m]` 后缀）。渠道侧等价写法（`deepseek-flash`、
@@ -616,6 +616,8 @@ interface CredModule {
 - **连败标记**：连续**瞬时**失败达 `FAIL_STREAK_LIMIT = 3` 次即熔断（`error` + `trip_until`），
   **凭证一律保留**；到期自动放行一次半开试探（成功恢复、再失败退避翻倍）。
   也可用后端命令 `resetAccount` 提前恢复、切号（`mx acct <cid> use <key>`）或重登提前恢复。
+  例外：渠道经 `upstream.isCapacityError` 声明的**容量型过载**（推理集群无空闲实例，
+  换账号没用）不计连败，只记渠道级冷却 —— 钩子语义见 `CONTRACT-TS.md` 的上游模块钩子清单。
 - **额度耗尽自动换号**：请求失败（错误码属「可能是额度问题」那类）后按**账单证据**
   决定是否换到池内有额度的账号，并在**同一请求**里重试一次；判据与边界见 §2.4。
   自动切号有**两条**路径（额度问题是可恢复的，故与凭据失效区别对待）：失败后的自动换号

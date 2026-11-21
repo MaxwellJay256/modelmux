@@ -24,8 +24,6 @@ import { appendChannel, appendError, appendGateway, appendSystem } from "../../r
 import { rootDir } from "../../runtime/paths.js";
 import { loadUserSettings, saveUserSettings, disabledChannelSet, type ThemeMode } from "../../runtime/user-settings.js";
 import { startUpdateChecks, updateNotice } from "../../runtime/update-check.js";
-import { apiKeyGuard } from "../../runtime/api-key.js";
-import { migrateLegacyChannelDirs } from "../../runtime/storage-migrate.js";
 import { readChannelModels, rollbackChannelModels } from "../../runtime/channel-models.js";
 import { getChannelModelMeta, invalidateCrossModelIndex, poolCandidates, poolModels } from "../../pool/pool-targets.js";
 import { isPrefsModel, preferredChannelOf } from "../../pool/model-prefs.js";
@@ -462,8 +460,6 @@ class ServiceState {
         cid: channel.config.cid,
         enabled: !disabled.has(channel.config.cid),
       })),
-      // API key 管理页的唯一开关：guard 已装配（设置页开启「要求 API key」时注入）
-      api_key_mode: apiKeyGuard() !== null,
       gateway_error: this.gatewayError,
     };
   }
@@ -699,13 +695,6 @@ export async function runServe(options: ServeOptions): Promise<number> {
     realm = "auto",
     cid,
   } = options;
-  // 旧布局迁移（幂等）：0.1.0/0.1.1 的 `<root>/<cid>/` 搬进 `channels/<cid>/` 并留软链，
-  // 旧版本可执行文件经软链继续可用。发生迁移才提示，否则静默。
-  const migration = migrateLegacyChannelDirs(rootDir());
-  if (migration.moved.length > 0) {
-    console.error(`[modelmux] 已把 ${migration.moved.length} 个渠道目录迁入 channels/（旧位置留软链兼容旧版本）`);
-  }
-
   const targets: Channel[] = cid !== undefined ? [getChannel(cid)] : channels();
   const multi = targets.length > 1;
   const prefix = `[${gateway.serviceName(cid)}]`;

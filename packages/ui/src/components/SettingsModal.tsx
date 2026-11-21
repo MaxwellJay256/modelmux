@@ -17,7 +17,6 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { Boxes, ExternalLink, Info, KeyRound, Loader2, Palette, Power, RefreshCw, RotateCw, ScrollText, Server, Settings, Tag, X } from "lucide-react";
-import { Link } from "react-router";
 import { useEffect, useState, type ComponentType, type ReactElement, type ReactNode } from "react";
 
 import { Segmented } from "./Segmented";
@@ -203,21 +202,6 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
     }
   };
 
-  /** 开关「要求 API key」：写入 setting.json，需重启网关生效（装配期决定）。 */
-  const toggleApiKeyRequired = async (enabled: boolean): Promise<void> => {
-    try {
-      const res = await api.commands.setApiKeyRequired(enabled);
-      if (!res.ok) {
-        toast.error(res.error ?? "设置失败");
-        return;
-      }
-      toast.info(enabled ? "已开启校验，重启网关后生效" : "已关闭校验，重启网关后生效");
-      void qc.invalidateQueries({ queryKey: ["state"] });
-    } catch (err) {
-      toast.error(`设置失败：${errorText(err)}`);
-    }
-  };
-
   const checkUpdate = async (): Promise<void> => {
     if (checking) return;
     setChecking(true);
@@ -253,7 +237,10 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
         <DialogContent
           // 关闭钮是自绘的（头部那枚），不用组件内置角标，避免两枚重叠
           showCloseButton={false}
-          className="fixed left-1/2 top-1/2 z-50 flex h-[min(600px,85vh)] w-[min(96vw,48rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-line bg-raised shadow-[0_24px_64px_-28px_rgba(0,0,0,0.9)]"
+          // 尺寸**恒定**：高度取视口比例（80vh，上限 42rem），宽度取 48rem（上限 96vw）。
+          // 高度随内容伸缩时，切左侧标签会让弹窗上下跳、把背后页面内容顶得移位；
+          // 内容多的分区（渠道）由面板自身 `overflow-y-auto` 滚动，不撑高弹窗。
+          className="fixed left-1/2 top-1/2 z-50 flex h-[min(80vh,42rem)] w-[min(96vw,48rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-line bg-raised shadow-[0_24px_64px_-28px_rgba(0,0,0,0.9)]"
           aria-describedby={undefined}
         >
           <div className="flex flex-none items-center gap-3 px-5 pb-3 pt-4">
@@ -308,19 +295,9 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
             >
               {section === "general" && (
                 <div>
-                  <div className="mb-3 text-xs font-medium text-ink-faint">状态与去处</div>
+                  <div className="mb-3 text-xs font-medium text-ink-faint">状态</div>
                   <div className="divide-y divide-line">
                     <GatewayRow />
-                    <ModalRow icon={Boxes} title="账号池" description="渠道凭据、额度与模型清单">
-                      <Link
-                        to="/accounts"
-                        onClick={() => onOpenChange(false)}
-                        className="tap inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs text-ink transition-colors hover:bg-overlay"
-                      >
-                        <Boxes className="h-3.5 w-3.5" aria-hidden="true" />
-                        打开账号池
-                      </Link>
-                    </ModalRow>
                   </div>
                   <div className="mb-3 mt-6 text-xs font-medium text-ink-faint">偏好设置</div>
                   <div className="divide-y divide-line">
@@ -336,27 +313,6 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                     )}
                     <IntervalRow icon={RefreshCw} page="accounts" title="账号池刷新间隔" description="渠道卡与额度的刷新节奏" />
                     <IntervalRow icon={ScrollText} page="logs" title="请求日志刷新间隔" description="日志列表与统计的刷新节奏" />
-                    <ModalRow
-                      icon={KeyRound}
-                      title="要求 API key"
-                      description="对话请求必须携带有效 key；改动需重启网关生效"
-                    >
-                      <Switch
-                        checked={state.data?.api_key_mode === true}
-                        onChange={() => void toggleApiKeyRequired(state.data?.api_key_mode !== true)}
-                        label={`要求 API key，${state.data?.api_key_mode === true ? "已开启" : "已关闭"}`}
-                      />
-                    </ModalRow>
-                    <ModalRow icon={KeyRound} title="API Keys" description="新建、白名单与限流管理">
-                      <Link
-                        to="/api-keys"
-                        onClick={() => onOpenChange(false)}
-                        className="tap inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs text-ink transition-colors hover:bg-overlay"
-                      >
-                        <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
-                        管理 API Keys
-                      </Link>
-                    </ModalRow>
                   </div>
                 </div>
               )}
