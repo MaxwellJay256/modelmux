@@ -12,17 +12,21 @@ import { createInterface, type Interface } from "node:readline";
 
 import * as authFlow from "../../auth/auth-flow.js";
 import { startAutoSignin } from "../../auth/auto-signin.js";
+import { integrateClient, integrationStatus, integrationUpdates, restoreClient } from "../integrate.js";
+import { refreshCatalog } from "../../pool/catalog-snapshot.js";
 import { captureActive, syncPool } from "../../runtime/account-pool.js";
 import { runInChannel } from "../../runtime/channel-context.js";
 import { channels, getChannel, hasChannel, channelCapabilities, type Channel } from "../../runtime/channel.js";
 import * as console_ from "../../http/console/console.js";
 import * as gateway from "../../http/server.js";
-import { REPO_UI_PREFIX } from "../../runtime/cli-consts.js";
+import { REPO_UI_PREFIX, version } from "../../runtime/cli-consts.js";
 import { appendChannel, appendError, appendGateway, appendSystem } from "../../runtime/log-store.js";
 import { rootDir } from "../../runtime/paths.js";
-import { migrateLegacyChannelDirs } from "../../runtime/storage-migrate.js";
+import { loadUserSettings, saveUserSettings, disabledChannelSet, type ThemeMode } from "../../runtime/user-settings.js";
+import { startUpdateChecks, updateNotice } from "../../runtime/update-check.js";
 import { readChannelModels, rollbackChannelModels } from "../../runtime/channel-models.js";
-import { poolModelMetas } from "../../pool/pool-targets.js";
+import { getChannelModelMeta, invalidateCrossModelIndex, poolCandidates, poolModels } from "../../pool/pool-targets.js";
+import { isPrefsModel, preferredChannelOf } from "../../pool/model-prefs.js";
 import * as poolUsage from "../../pool/pool-usage.js";
 
 /** 输出一行 JSON 事件。解析方应跳过无法解析的行（第三方库也可能打印 stdout）。 */
@@ -58,9 +62,13 @@ function catalogRefreshIntervalMs(): number {
  * 只在 TTY 下生效等于把管道场景整个废掉。
  */
 class StdinPasteReader {
-  private pending: string | undefined;
+  /** 待取的行（**队列**：管道里多行可能早于提问到达，单槽会丢掉先到的行）。 */
+  private readonly pendingLines: string[] = [];
   private readonly rl: Interface | null = null;
   private buffer = "";
+  /** 正在等一条回答（交互式提问）时，把行交给它而不是排队。 */
+  private waiter: ((line: string | null) => void) | undefined;
+
   /** 非 TTY 分支的 data 监听（收尾时按引用摘掉）。 */
   private readonly onData = (chunk: string): void => {
     this.buffer += chunk;
@@ -68,17 +76,32 @@ class StdinPasteReader {
     while (idx >= 0) {
       const line = this.buffer.slice(0, idx).trim();
       this.buffer = this.buffer.slice(idx + 1);
-      if (line) this.pending = line;
+      if (line) this.deliver(line);
       idx = this.buffer.indexOf("\n");
     }
   };
+
+  /** 一行到达：优先喂给正在等待的提问，否则按到达顺序排队。 */
+  private deliver(text: string): void {
+    const w = this.waiter;
+    if (w) {
+      this.waiter = undefined;
+      w(text);
+      return;
+    }
+    this.pendingLines.push(text);
+  }
 
   constructor() {
     if (process.stdin.isTTY) {
       this.rl = createInterface({ input: process.stdin });
       this.rl.on("line", (line: string) => {
         const text = line.trim();
-        if (text) this.pending = text;
+        if (text) this.deliver(text);
+      });
+      this.rl.on("close", () => {
+        this.waiter?.(null);
+        this.waiter = undefined;
       });
       return;
     }
@@ -88,15 +111,31 @@ class StdinPasteReader {
     process.stdin.resume();
   }
 
-  /** 取走一行用户输入（只消费一次）；没有则返回 undefined。 */
+  /** 取走最早一行用户输入（只消费一次）；没有则返回 undefined。 */
   take(): string | undefined {
-    const v = this.pending;
-    this.pending = undefined;
-    return v;
+    return this.pendingLines.shift();
+  }
+
+  /**
+   * 问一句、等一行（提示写 stderr —— `--json` 时 stdout 要保持干净的 JSON 流）。
+   *
+   * CLI 无界面时替渠道要手机号 / 验证码；TTY 与管道都支持。
+   * 先取走可能已到达的一行（管道里输入常比提问早到），再挂等待器。
+   * stdin 关闭（Ctrl+C / EOF）返回 `undefined`，交回渠道回落自己的输入来源。
+   */
+  question(prompt: string): Promise<string | undefined> {
+    process.stderr.write(prompt);
+    const queued = this.take();
+    if (queued !== undefined) return Promise.resolve(queued);
+    return new Promise<string | undefined>((resolve) => {
+      this.waiter = (line) => resolve(line ?? undefined);
+    });
   }
 
   /** 收尾：关掉 readline / 摘掉 data 监听，避免进程挂着不退。 */
   close(): void {
+    this.waiter?.(null);
+    this.waiter = undefined;
     this.rl?.close();
     if (!this.rl) process.stdin.off("data", this.onData);
   }
@@ -177,11 +216,14 @@ class StdoutLoginUi implements authFlow.LoginUi {
   /**
    * 向用户要一段输入（渠道两步登录，如 loomy 的短信验证码）。
    *
-   * 有观察者（控制台）时转给 `ServiceState` 弹输入卡；**CLI 没有界面，直接返回
-   * `undefined`** —— 渠道据此回落到环境变量，`mx login loomy` 的既有用法不受影响。
+   * 有观察者（控制台）时转给 `ServiceState` 弹输入卡；CLI 无界面时走
+   * `stdinPaste` **交互式提问**（提示写 stderr），TTY 与管道都支持。
+   * 没开粘贴通道（如 `serve` 长驻）或 stdin 关闭时返回 `undefined` ——
+   * 渠道据此回落到自己的输入来源（环境变量等）。
    */
   requestInput(req: authFlow.LoginInputRequest): Promise<string | undefined> {
-    return this.observer?.requestInput?.(req) ?? Promise.resolve(undefined);
+    if (this.observer?.requestInput) return this.observer.requestInput(req);
+    return this.stdinPaste?.question(req.prompt) ?? Promise.resolve(undefined);
   }
 
   /** 登录结束后关掉 stdin 监听（否则进程挂着不退）。 */
@@ -218,7 +260,9 @@ class ServiceState {
   readonly base: string;
   readonly baseUrl: string;
   readonly chatUrl: string;
-  private uiState = "probing"; // 状态取值（英文枚举）：probing / login / error / running
+  private uiState = "probing"; // 网关状态（英文枚举）：probing / login / running
+  /** 上一轮登录的一次性结果：`idle` / `done` / `error`。不占 `ui_state`。 */
+  private loginResult: "idle" | "done" | "error" = "idle";
   private stateMessage = "";
   private authUrl = "";
   private qrUrl = "";
@@ -247,13 +291,37 @@ class ServiceState {
     this.chatUrl = `${described.url}/v1/chat/completions`;
   }
 
+  /**
+   * 记录一次状态变化。
+   *
+   * `ui_state` 只回答「网关现在能不能用」（running / probing / down），
+   * **不承载登录结果**。早先 `error` / `done` 直接写进 `ui_state`，一次登录失败就让
+   * 右上角永久显示「登录失败」，直到下一次登录成功才被覆盖 —— 那是一次性事件，
+   * 不该霸占常驻状态位。
+   *
+   * 所以 `error` / `done` 落到独立的 `loginResult`：界面用它决定页脚/提示，
+   * `ui_state` 同时归位到 `running`（登录流程跑完，网关照常可用）。
+   */
   setState(state: string, message = "", url = ""): void {
-    this.uiState = state;
+    if (state === "error" || state === "done") {
+      // 一次性结果：记下来给界面看，但网关状态回到可用
+      this.loginResult = state;
+      this.uiState = "running";
+    } else {
+      this.uiState = state;
+      if (state === "login" || state === "probing") this.loginResult = "idle";
+    }
     this.stateMessage = message;
     if (url) this.authUrl = url; // 后续状态不带 url 时沿用上一条授权链接
     else if (state !== "login") this.authUrl = ""; // 登录结束/失败后清掉旧授权链接
     if (state !== "login") this.clearQr();
     if (state === "running") this.gatewayError = "";
+  }
+
+  /** 清掉上一轮的登录结果（开始新一轮登录时调用）。 */
+  clearLoginResult(): void {
+    this.loginResult = "idle";
+    this.stateMessage = "";
   }
 
   /** 设置本轮扫码的二维码图片 URL（真正该给用户扫的那张）。 */
@@ -345,28 +413,67 @@ class ServiceState {
 
   snapshot(): console_.UiSnapshot {
     const base = console_.emptySnapshot();
+    // 快照被 3-5s 轮询：用户设置（主题 + 渠道开关）只读一次，逐项读是同一文件重复解析
+    const settings = loadUserSettings();
+    const disabled = new Set(settings.disabled_channels);
     return {
       ...base,
       ui_state: this.uiState,
+      login_result: this.loginResult,
       message: this.stateMessage,
       auth_url: this.authUrl,
       qr_url: this.qrUrl,
       base_url: this.baseUrl,
       chat_url: this.chatUrl,
-      models: [...this.modelsShown],
+      version: version(),
+      update: updateNotice(),
+      models: this.modelsShown.flatMap((model) =>
+        poolCandidates(model).map((candidate) => ({
+          model,
+          cid: candidate.cid,
+          meta: getChannelModelMeta(candidate.cid, candidate.exposedId),
+        })),
+      ),
+      // 模型偏好**从家族表派生**（`poolModels()`），不依赖 `/v1/models` 轮询结果：
+      // 轮询为空（刚起进程 / 上游抖动）时偏好整段会消失，用户根本无处设置。
+      // 只渲染 PREFS_CANONICALS 声明的族：收窄到唯一渠道的模型没有偏好语义（选了也没别家可换）。
+      model_prefs: poolModels()
+        .filter((model) => isPrefsModel(model))
+        .map((model) => ({
+          model,
+          channels: poolCandidates(model).map((candidate) => candidate.cid),
+          preferred: preferredChannelOf(model),
+        })),
       // 待回答的输入请求（渠道两步登录）：null = 当前没有。
       login_input: this.pendingInput?.req ?? null,
-      // 一次枚举只建一次跨渠道索引（`poolModelMetas` 内部构建）
-      model_info: Object.fromEntries(poolModelMetas(this.modelsShown)),
       channel_caps: Object.fromEntries(
         channels().map((channel) => [channel.config.cid, channelCapabilities(channel.config)]),
       ),
+      integrations: integrationStatus(),
+      integration_updates: integrationUpdates(),
+      theme_mode: settings.theme,
+      // 设置弹窗的渠道开关状态：关闭的渠道从账号池隐藏、不参与选路。
+      // 只给 cid（渠道包里的唯一名，小写），不附展示名 —— 设置页要的就是能对上
+      // packages/core/channels/<cid> 的标识，多一层映射反而对不上号。
+      // settings 只读一次：主题与开关同源，逐项再读是同一文件的重复解析
+      channel_toggles: channels().map((channel) => ({
+        cid: channel.config.cid,
+        enabled: !disabled.has(channel.config.cid),
+      })),
       gateway_error: this.gatewayError,
     };
   }
 
   setModels(ids: string[]): void {
+    // 集合没变就不动（这个 worker 每 5 秒调一次，无脑失效会让 30s 的索引缓存永远命不中）
+    const next = [...ids].sort();
+    const prev = [...this.modelsShown].sort();
+    const unchanged =
+      next.length === prev.length && next.every((id, i) => id === prev[i]);
+    if (unchanged) return;
     this.modelsShown = ids;
+    // 池集合变了 → 跨渠道索引失效（新增/下线模型要立刻反映到控制台）
+    invalidateCrossModelIndex();
   }
 }
 
@@ -588,13 +695,6 @@ export async function runServe(options: ServeOptions): Promise<number> {
     realm = "auto",
     cid,
   } = options;
-  // 旧布局迁移（幂等）：0.1.0/0.1.1 的 `<root>/<cid>/` 搬进 `channels/<cid>/` 并留软链，
-  // 旧版本可执行文件经软链继续可用。发生迁移才提示，否则静默。
-  const migration = migrateLegacyChannelDirs(rootDir());
-  if (migration.moved.length > 0) {
-    console.error(`[modelmux] 已把 ${migration.moved.length} 个渠道目录迁入 channels/（旧位置留软链兼容旧版本）`);
-  }
-
   const targets: Channel[] = cid !== undefined ? [getChannel(cid)] : channels();
   const multi = targets.length > 1;
   const prefix = `[${gateway.serviceName(cid)}]`;
@@ -611,7 +711,9 @@ export async function runServe(options: ServeOptions): Promise<number> {
       const match = /^\[([a-z0-9][a-z0-9.-]*)\]/.exec(message);
       if (match && hasChannel(match[1])) appendChannel(match[1]!, line);
     }
-    if (/(error|failed|timeout|reject|aborted|exception|unauthor)/i.test(line)) {
+    // `info:` 前缀 = 网关自己消化的降级路径（如「该渠道接不住这段输入，换渠道重试」），
+    // 不是故障；关键词匹配会把 UnsupportedInputError 这类字面量骗进错误日志
+    if (!message.startsWith("info:") && /(error|failed|timeout|reject|aborted|exception|unauthor)/i.test(line)) {
       appendError(line);
     }
     if (!json) console.error(line);
@@ -622,10 +724,17 @@ export async function runServe(options: ServeOptions): Promise<number> {
 
   const bridge: console_.ControlBridge = {
     provider: () => state.snapshot(),
-    setTheme: () => {}, // 无窗口模式没有主题
+    // 主题持久化到 ~/.modelmux/setting.json（mode 已由路由层校验过取值域）；
+    // 快照每次重算都会重新读文件，下一次轮询即带新值
+    setTheme: (mode) => saveUserSettings({ theme: mode as ThemeMode }),
     retryLogin: () => {
       state.retryRequested = true;
     },
+    // 控制台的「一键接入」按钮：改写本机 harness 的模型配置（实现见 app/integrate.ts，
+    // 写的是 ~/.zcode / ~/.dsh —— 不是网关运行时，故不能放在 http 层）
+    integrate: (target) => integrateClient(target),
+    // 控制台的「一键还原」：把目标恢复成接入前状态（同 app/integrate.ts 的 restoreClient）
+    restore: (target) => restoreClient(target),
     // 控制台的「登录」按钮经此回调触发真实登录流程（本函数在 app 层，
     // 控制台层不认识它 —— 见 scripts/verify-layering.mjs）
     triggerLogin: (cid, force) => {
@@ -770,8 +879,14 @@ export async function runServe(options: ServeOptions): Promise<number> {
         console: consoleEnabled ? `http://${state.base}${REPO_UI_PREFIX}/` : "",
       });
     }
+    // `/v1/models` 读目录快照文件：注册完全部渠道后必须重建一次，否则清单还是旧的
+    refreshCatalog();
+
     // 网关 ready 即挂自动签到：逐渠道（未登录跳过 / 台账已签跳过 / 连败 3 次当日熔断）
     startAutoSignin(logLine);
+
+    // 版本更新检测：每天一次，结果进控制台顶栏的版本胶囊（见 runtime/update-check.ts）
+    startUpdateChecks(() => version(), logLine);
 
     // 额度保鲜：每 5 分钟并行查一遍全部有账单能力的渠道（控制台的额度展示靠它，
     // 不再依赖 8 小时的 TTL 或用户手动 `mx bill`）。间隔见 BILLING_REFRESH_INTERVAL_MS。
@@ -803,6 +918,8 @@ export async function runServe(options: ServeOptions): Promise<number> {
           const gone = before.filter((m) => !after.some((a) => a.id === m.id)).map((m) => m.id);
           const added = after.filter((m) => !before.some((b) => b.id === m.id)).map((m) => m.id);
           if (gone.length > 0 || added.length > 0) {
+            // 目录真的变了 → 跨渠道索引必须失效（它缓存了 30s，见 `CROSS_INDEX_TTL_MS`）
+            invalidateCrossModelIndex();
             logLine(
               `[catalog] reconciled (${cid}): ${after.length} models` +
                 (added.length > 0 ? `, +${added.length} (${added.slice(0, 5).join(", ")})` : "") +

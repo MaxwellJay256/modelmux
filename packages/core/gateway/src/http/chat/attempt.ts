@@ -21,19 +21,18 @@ import {
 } from "../../runtime/account-pool.js";
 import { QUOTA_EXHAUSTED_CODE } from "../../pool/account-rotate.js";
 import { resolvePoolModel } from "../../pool/model-pool.js";
-import { noteFailure, noteSuccess } from "../../pool/pool-usage.js";
+import { FAIL_COOLDOWN_MS, noteFailure, noteSuccess } from "../../pool/pool-usage.js";
 import { logThrottled } from "../../runtime/logger.js";
-import { noteQueued, noteRequestError, noteUpstreamPayload, noteUpstreamReady } from "../../runtime/log-store.js";
+import { sinkOf } from "../protocol/types.js";
+import { getRequestLog, noteQueued, noteRequestError, noteUpstreamPayload, noteUpstreamReady } from "../../runtime/log-store.js";
 import { inChannel, isCustomWire } from "./channel.js";
 import { activeKeyOf } from "./candidates.js";
-import { isQuotaExhausted, isUsageLimit, writeJsonError } from "./errors.js";
+import { isQuotaExhausted, isUnsupportedInputError, isUsageLimit, writeJsonError } from "./errors.js";
 import {
   consumeQueueProbe,
   loadCredentialSafe,
   PROBE_RETRY_BASE_MS,
   PROBE_RETRY_MAX,
-  queueBudgetMs,
-  QUEUE_RETRY_MAX_DELAY_MS,
   type ProbeFrames,
   type QueueProbe,
 } from "./queue.js";
@@ -41,9 +40,21 @@ import { callUpstream } from "./auth.js";
 import { openStream, type UpstreamCall } from "./upstream.js";
 import { relayUpstream } from "./forward.js";
 import type { PoolCandidate } from "../../pool/pool-targets.js";
-import { getPoolModelMeta } from "../../pool/pool-targets.js";
+import { getChannelModelMeta } from "../../pool/pool-targets.js";
 
 /** 一次失败的错误三元组：状态码 + 错误码 + 文案（回给客户端的信封内容）。 */
+/**
+ * 客户端可见的 503 文案。
+ *
+ * 只说「当前没有可用账号」，不夹「去登录」这类指令 —— 谁没登录在控制台一眼可见，
+ * 网关不必每次请求都催 (2026-11-15 口径)。上游给的技术原因照旧带上（便于客户端判断
+ * 是「账号被拒」还是「额度耗尽」），只把 `not logged in` 这种措辞抹掉。
+ */
+function unavailableMessage(detail: string): string {
+  const text = detail.replace(/not logged in:?\s*/gi, "").trim();
+  return text === "" ? "no available account for this request" : `no available account for this request（${text}）`;
+}
+
 export interface ChatError {
   status: number;
   code: string;
@@ -59,10 +70,12 @@ export interface ChatError {
 export interface ProbeState {
   /** 探测消费掉的帧，按原序交回转发层。 */
   frames: ProbeFrames;
-  /** 排队等待预算耗尽（转发层据此给明确错误）。 */
-  queuedOut: boolean;
-  /** 排队放弃文案：预算耗尽时由探测层填，转发层据此回**正常应答**而不是错误帧。 */
-  giveUpText: string | null;
+  /**
+   * 一出现排队就放弃本候选、换下一个渠道。
+   *
+   * 置位后返回 `retry`，编排层换下一条候选 —— 排队请求永不被接受。
+   */
+  switchChannel: boolean;
   /** 探测层失败（这条流已死，不能进转发层）。 */
   failed: boolean;
   /** 探测失败时的错误三元组（未失败时用兜底值占位）。 */
@@ -107,12 +120,164 @@ interface ProbeEnv {
   sendBody: Buffer;
 }
 
+/**
+ * 透传给客户端的上游错误文案上限。
+ *
+ * 上游错误体可能很大（HTML 错误页、超长 JSON）；客户端需要的是**可行动的原因**，
+ * 不是整个响应体 —— 截断到 300 字符，完整原文仍在本地日志里。
+ */
+const PASSTHROUGH_SNIPPET_MAX = 300;
+
+function snippetOf(text: string): string {
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  return trimmed.length > PASSTHROUGH_SNIPPET_MAX ? `${trimmed.slice(0, PASSTHROUGH_SNIPPET_MAX)}…` : trimmed;
+}
+
+/**
+ * 是否渠道声明的**凭据失效**错误（`upstream.UpstreamUnauthorized`）。
+ *
+ * 渠道在 `prepareChat` 这类**建连之前**的前置里也可能发现令牌已死（如上游回渠道
+ * 自己的鉴权业务码）—— 不认出来就会被当成
+ * 「上游瞬时故障」反复重试同一条候选，而重试永远不会成功。
+ */
+function isUpstreamUnauthorized(channel: Channel, err: unknown): boolean {
+  const ctor = channel.upstream.UpstreamUnauthorized;
+  if (ctor !== undefined && err instanceof ctor) return true;
+  // 跨包 / 跨进程边界时 `instanceof` 可能失配，按类名兜底（与 `NotLoggedInError` 同式）
+  return err instanceof Error && err.constructor?.name === "UpstreamUnauthorized";
+}
+
+/** 刷新凭据的结果（决定「凭据真失效」还是「瞬时故障」）。 */
+type RefreshOutcome =
+  | { kind: "ok" }
+  /** 凭据真失效（未登录 / 刷新被上游按鉴权拒绝）—— 才可以标终态。 */
+  | { kind: "unauthorized"; error: string }
+  /** 网络 / 读盘 / 上游瞬时失败 —— **不能**当凭据失效处理。 */
+  | { kind: "failed"; error: string };
+
+/**
+ * 刷新当前账号的 token（只刷，不重跑前置）。
+ *
+ * 渠道的 `refresh` 普遍把网络失败包成普通 `Error`（有的渠道包成带 retryable 字样的
+ * 普通错误），只有抛 `UpstreamUnauthorized` /
+ * `NotLoggedInError` 才是凭据层面的结论 —— 区分二者是这里存在的唯一理由。
+ */
+async function tryRefreshCredential(
+  channel: Channel,
+  logger: (m: string) => void,
+): Promise<RefreshOutcome> {
+  let credential: ReturnType<typeof loadCredentialSafe>;
+  try {
+    credential = loadCredentialSafe(channel);
+  } catch (err) {
+    return { kind: "failed", error: `credential read failed: ${String(err)}` };
+  }
+  if (!credential) return { kind: "unauthorized", error: "not logged in" };
+  try {
+    await inChannel(channel, () => channel.cred.refresh(credential));
+    return { kind: "ok" };
+  } catch (err) {
+    if (isUpstreamUnauthorized(channel, err)) return { kind: "unauthorized", error: String(err) };
+    logger(`token refresh failed: ${String(err)}`);
+    return { kind: "failed", error: String(err) };
+  }
+}
+
+/**
+ * 把账号标成 `unauthorized` 终态并返回换候选的结果。
+ *
+ * `unauthorized` **不可自动恢复**（路由会直接剔除，见 `route.ts`），所以只在这里写；
+ * 记账与写健康态各自的失败只留痕 —— 写盘失败不该把异常抛穿成网关 500。
+ */
+function markUnauthorizedAndRetry(
+  cid: string,
+  logger: (m: string) => void,
+  err: unknown,
+): AttemptResult {
+  logger(`upstream prepare still unauthorized after refresh (channel ${cid}): ${String(err)}`);
+  try {
+    noteFailure(cid, activeKeyOf(cid));
+  } catch (ledgerErr) {
+    logger(`ledger write failed (channel ${cid}): ${String(ledgerErr)}`);
+  }
+  try {
+    markActiveHealth("unauthorized", cid);
+  } catch (healthErr) {
+    logger(`health write failed (channel ${cid}): ${String(healthErr)}`);
+  }
+  return {
+    kind: "retry",
+    error: { status: 503, code: "not_authenticated", message: unavailableMessage(String(err)) },
+  };
+}
+
+/**
+ * 前置阶段凭据失效的处置（与 401 同一条路径：刷新 → 用新凭据重跑前置）。
+ *
+ * 返回 `null` = 已恢复，调用方继续正常建连；否则返回要交给编排层的 retry 结果。
+ * 只有「刷新本身报鉴权失败」或「刷新后前置仍报鉴权失败」才标终态 —— 一次网络
+ * 抖动把健康账号永久踢出候选（还谎报「未登录」）比白跑一趟糟糕得多。
+ */
+async function handlePrepareUnauthorized(
+  channel: Channel,
+  cid: string,
+  logger: (m: string) => void,
+  body: Record<string, unknown>,
+  originalError: unknown,
+): Promise<AttemptResult | null> {
+  logger(`upstream prepare unauthorized (channel ${cid}): ${String(originalError)}; trying token refresh`);
+  const refreshed = await tryRefreshCredential(channel, logger);
+  if (refreshed.kind === "failed") {
+    return {
+      kind: "retry",
+      error: { status: 502, code: "upstream_error", message: `token refresh failed: ${refreshed.error}` },
+    };
+  }
+  if (refreshed.kind === "unauthorized") {
+    return markUnauthorizedAndRetry(cid, logger, originalError);
+  }
+  try {
+    // 用新凭据重跑**同一个** body（渠道已就地改写凭据文件，随后 openStream 读到新 token）
+    await inChannel(channel, () => channel.upstream.prepareChat!(body));
+  } catch (err) {
+    if (isUpstreamUnauthorized(channel, err)) return markUnauthorizedAndRetry(cid, logger, err);
+    // 输入问题 / 上游瞬时故障：按通用 prepare 失败处理，不碰健康态
+    return {
+      kind: "retry",
+      error: {
+        status: 502,
+        code: "upstream_error",
+        message: `upstream prepare request failed: ${String(err)}`,
+      },
+    };
+  }
+  // 刷新成功 = 凭据已活：清掉终态标记（写盘失败只留痕，不影响本次请求）
+  try {
+    markActiveHealth("ok", cid);
+  } catch (healthErr) {
+    logger(`clear unauthorized mark failed (channel ${cid}): ${String(healthErr)}`);
+  }
+  return null;
+}
+
+/**
+ * 上游错误透传文案（有上游报错就透传上游的，禁止只回
+ * 「see gateway logs」—— 那对客户端等于没说；没有上游信息才用网关描述）。
+ *
+ * 素材在 `upstream.ts` 已备好：非 200 时 `call.error.message` = 「HTTP <status>: <错误体>」，
+ * 连接失败时 = 原始网络错误。一律带渠道前缀，客户端才知道该修哪一家。
+ */
+function upstreamDetail(cid: string, call: UpstreamCall): string {
+  const detail = snippetOf(call.error?.message ?? "");
+  return detail ? `[${cid}] ${detail}` : `[${cid}] upstream request failed (no upstream error body)`;
+}
+
 /** 探测失败时的兜底错误三元组（探测层没给出更具体的错误时用）。 */
-function probeFallbackError(): ChatError {
+function probeFallbackError(cid: string): ChatError {
   return {
     status: 502,
     code: "upstream_error",
-    message: "upstream request failed; see gateway logs",
+    message: `upstream request failed (channel ${cid})`,
   };
 }
 
@@ -168,64 +333,22 @@ async function reopenForProbe(
     );
     return null;
   }
-  // 记下这条应答实际发往的主机（成功回报用）
-  const currentHost = channel.upstream.currentChatHost?.();
+  // 记下这条应答实际发往的主机（成功回报用）。
+  // 渠道钩子一律包 `runInChannel`：主机轮换状态属于渠道上下文，裸调会读到别的渠道的落点。
+  const currentHost = inChannel(channel, () => channel.upstream.currentChatHost?.());
   if (currentHost !== undefined) state.host = currentHost;
   // 旧流已死：释放它再换新流（探测用的 reader 已在 consumeQueueProbe 里 releaseLock）
   await call.body?.cancel().catch(() => {});
   return next;
 }
 
-// ── 排队进度（不向客户端输出任何排队文案）──────────────────────
-
 /**
- * 排队放弃文案：超过预算就不再干等，直接劝主人换渠道。
- *
- * 带**真实渠道 id**（不是字面的 `<cid>`）—— 主人要知道是哪一家在拖时间。
- */
-function queueGiveUpText(cid: string, round: number): string {
-  const lines = [
-    `别用垃圾 ${cid} 了！我等到黄花菜都凉了……换一个吧，主人。`,
-    `${cid} 这队伍排到天荒地老了，我放弃了。换一个吧！`,
-    `${cid} 还在排队，我的尾鳍都等扁了。主人，换一个吧！`,
-  ];
-  return lines[(round - 1) % lines.length]!;
-}
-
-/**
- * 排队期间只发 SSE 响应头 + 空 role 帧，**不发任何可见文本**。
- *
- * 为什么不发排队文案：agent 客户端会把上一轮 assistant
- * 输出回灌进下一轮上下文，排队提示（「正在排队…」）会污染模型输入、影响效果。
- * 空 role 帧只为尽早建立流（客户端按 SSE 语法解析），不产生任何可回灌内容。
- * **只对流式请求调用**：非流式没有 SSE 通道，排队期间保持沉默（探测层不写字节）。
- */
-function writeQueueHeaders(
-  res: ServerResponse,
-  payload: Record<string, unknown>,
-  progressId: string,
-  created: number,
-): void {
-  if (res.headersSent) return;
-  res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" });
-  res.write(
-    `data: ${JSON.stringify({
-      id: progressId,
-      object: "chat.completion.chunk",
-      created,
-      model: payload["model"],
-      choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-    })}\n\n`,
-  );
-}
-
-/**
- * 排队探测子循环：响应头发出前把「排队帧」等掉，直到出内容或预算耗尽。
+ * 排队探测子循环：响应头发出前把「排队帧」等掉，一旦确认排队即放弃本候选。
  *
  * 探测消费掉的帧记进 `state.frames`，翻译器记进 `state.translator`：
  *   转发层必须**原序**交出这些帧，并**接着用同一个**翻译器实例（半行缓冲在里面）。
  * 排队期间**不发任何可见文案**（只发一次 SSE 响应头 + 空 role 帧建立流，见
- *   `writeQueueHeaders`）—— 排队进度文案已按主人要求移除。
+ *   `writeQueueHeaders`）—— 排队进度文案不展示。
  * 每轮开头检查客户端断连：排队可能长达数分钟，客户端（60s 超时）走人后
  *   继续轮询上游纯属浪费（实测断连后空转 4 分钟、白打 22 次上游请求）。
  *
@@ -236,20 +359,13 @@ async function runQueueProbe(
   state: ProbeState,
   call: UpstreamCall,
 ): Promise<UpstreamCall> {
-  const { ctx, channel, cid, sendBody } = env;
+  const { ctx, channel, cid } = env;
   const { payload, logger, res } = ctx;
-  const startedAt = Date.now();
-  const progressId = `chatcmpl-queue-${startedAt.toString(36)}`;
-  const progressCreated = Math.floor(startedAt / 1000);
-  let queueRound = 0;
   // 客户端断连检测：客户端断开时 Node 触发 res 的 `close` 事件，但**不一定**置
   // `res.destroyed`（实测：要等一次写失败后才置位）—— 必须挂 close 监听，
-  // 否则探测会在客户端走后继续按预算空转（实测白打 4 分钟上游）。
+  // 否则探测会在客户端走后继续空转。
   let clientGone = res.destroyed || res.writableEnded;
-  const clientClosed = new Promise<void>((resolve) => {
-    if (clientGone) resolve();
-    else res.once("close", () => { clientGone = true; resolve(); });
-  });
+  if (!clientGone) res.once("close", () => { clientGone = true; });
   for (;;) {
     // 客户端已断开：探测再久也没有收件人，立即止损（释放上游流、结束应答）。
     if (clientGone || res.destroyed || res.writableEnded) {
@@ -263,8 +379,9 @@ async function runQueueProbe(
       };
       return call;
     }
-    // 每次探测用新翻译器（换流后旧缓冲作废）；成功那次的实例要传给转发层
-    const translator = channel.upstream.newTranslator(payload);
+    // 每次探测用新翻译器（换流后旧缓冲作废）；成功那次的实例要传给转发层。
+    // 翻译器构造读渠道上下文（部分渠道按 cid 决定分帧策略），必须包 `runInChannel`。
+    const translator = inChannel(channel, () => channel.upstream.newTranslator(payload));
     let probe: QueueProbe;
     try {
       probe = await inChannel(channel, () => consumeQueueProbe(call.body!, channel, cid, translator, payload));
@@ -287,7 +404,7 @@ async function runQueueProbe(
       state.error = {
         status: 502,
         code: timedOut ? "upstream_timeout" : "upstream_error",
-        message: "upstream request failed; see gateway logs",
+        message: `upstream stream failed during queue probe [${cid}]: ${snippetOf(String(err))}`,
       };
       return call;
     }
@@ -310,59 +427,24 @@ async function runQueueProbe(
       state.translator = probe.translator;
       break;
     }
-    const elapsed = Date.now() - startedAt;
-    const delayMs = Math.min(probe.delayMs ?? QUEUE_RETRY_MAX_DELAY_MS, QUEUE_RETRY_MAX_DELAY_MS);
-    if (elapsed + delayMs > queueBudgetMs()) {
-      logger(`queue wait budget exhausted (channel ${cid}, waited ${Math.round(elapsed / 1000)}s)`);
-      state.queuedOut = true;
-      // 不再干等：把「劝主人换渠道」的文案交给转发层作为正常应答返回
-      state.giveUpText = queueGiveUpText(cid, queueRound);
+    // 上游明确说「在排队」且尚未出内容 —— 直接放弃本候选，换下一个渠道。
+    //
+    // 行为约定：**排队请求一律不接受**，宁可换渠道也不等。排队的响应体已经
+    // 消费进 `probe.frames`，交给编排层的下一个候选即可；本流的 reader 在这里
+    // 释放（continue 前先 cancel），不留悬挂连接。
+    //
+    // 为什么放在预算判断**之前**：预算是「等多久」，而这里根本不该等 ——
+    // 先判排队就能连第一轮 delay 也省掉（qoder 实测首轮就要等 15s+）。
+    if (probe.queued && !probe.hasContent) {
+      await call.body?.cancel().catch(() => {});
+      state.switchChannel = true;
+      logger(`upstream queued (channel ${cid}) — switching to next candidate without waiting`);
       break;
     }
-    logger(`upstream queued (channel ${cid}), waiting ${Math.round(delayMs / 1000)}s before retry`);
-    // 排队期间**不向客户端输出任何文本**（会回灌进下一轮模型上下文，污染效果）：
-    // 流式只发一次 SSE 响应头 + 空 role 帧建立流，后续静默等待。
-    if (ctx.wantStream) {
-      queueRound += 1;
-      try {
-        writeQueueHeaders(res, payload, progressId, progressCreated);
-      } catch {
-        /* 客户端已断：交给循环顶部的断连检测 */
-      }
-    }
-    // 等待期与「客户端断开」竞速：断开就立刻醒，最多省一个轮次的空转。
-    await Promise.race([
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, delayMs);
-        timer.unref?.();
-      }),
-      clientClosed,
-    ]);
-    // 同 reopenForProbe：凭据真故障留痕并放弃本轮重开，不能让异常穿透
-    //（runQueueProbe 的调用点没有 try，抛出去就是网关 500 / SSE 截断）。
-    let credential: ReturnType<typeof loadCredentialSafe>;
-    try {
-      credential = loadCredentialSafe(channel);
-    } catch (err) {
-      logger(`queue retry aborted: credential read failed (channel ${cid}): ${String(err)}`);
-      state.queuedOut = true;
-      break;
-    }
-    if (!credential) {
-      logger(`queue retry aborted: no credential available (channel ${cid})`);
-      state.queuedOut = true;
-      break;
-    }
-    const next = await inChannel(channel, () => openStream(channel, credential, sendBody));
-    if (!next.ok) {
-      // 重开失败（连接/鉴权）→ 放弃排队等待，按原结果走后续错误处理
-      logger(`queue retry reopen failed (channel ${cid}): ${String(next.error?.message ?? "")}`);
-      state.queuedOut = true;
-      break;
-    }
-    // 旧流已消费完：释放 reader 锁并丢弃剩余数据，再换新流
-    await call.body?.cancel().catch(() => {});
-    call = next;
+    // 到此已穷尽：上面两个分支（`!probe.queued || probe.hasContent` 与
+    // `probe.queued && !probe.hasContent`）互补，必然命中其中之一并 break。
+    // 这里保留一句 break 作为不变量 —— 将来加分支时若漏了条件，不会静默死循环。
+    break;
   }
   return call;
 }
@@ -382,14 +464,23 @@ export async function attemptCandidate(
   const cid = candidate.cid;
   const { res, logger, payload } = ctx;
 
-  // 模型名解析：**渠道说了算**（目录里查不到 → 这个候选不可用，换下一家）。
-  let resolvedModel: string;
-  try {
-    resolvedModel = inChannel(channel, () => resolvePoolModel(channel, candidate.exposedId));
-  } catch (err) {
-    logger(`model name unresolved (channel ${cid}): ${String(err)}`);
+  // 账号维度落日志：访问日志带上「哪个账号承接的」—— 账号池要按账号汇总今日 tokens，
+  // 而账本只记 ok/fail/credits。这里能拿到渠道，账号取该渠道当前生效的那个
+  //（自动换号后重试会再走一次本函数，键自然更新）。
+  // 渠道也是**每次尝试**都写：跨渠道顺延时，日志里的 cid 要落在真正接管请求的那条渠道上
+  //（失败尝试也会留下自己那条，便于排查「刚才试了哪几家」）。
+  const reqLog = getRequestLog(res);
+  if (reqLog) {
+    reqLog.key = activeKeyOf(cid);
+    reqLog.cid = cid;
+  }
+
+  // 模型名解析：注册表里的**上游 id**（拿不到 = 这个候选不可用，换下一家）。
+  const resolvedModel = resolvePoolModel(channel, candidate.exposedId);
+  if (resolvedModel === null) {
+    logger(`model name unresolved (channel ${cid}): not in registry`);
     noteFailure(cid, activeKeyOf(cid));
-    // 模型目录问题与凭据无关，不计入账号连败
+    // 注册表缺映射属于配置问题，与凭据无关，不计入账号连败
     return {
       kind: "retry",
       error: {
@@ -406,6 +497,15 @@ export async function attemptCandidate(
   try {
     built = inChannel(channel, () => upstream.buildChatBody(payload, resolvedModel));
   } catch (err) {
+    // 「本渠道承载不了这类输入」（如 catpaw 按纯文本渲染、图片进不去）：换一家渠道
+    // 可能成功 → 判可重试。**不计连败**：渠道对纯文本请求是好的，冷却会误伤后续请求。
+    if (isUnsupportedInputError(err)) {
+      logger(`info: channel ${cid} cannot carry this input: ${String(err)}`);
+      return {
+        kind: "retry",
+        error: { status: 400, code: "unsupported_input", message: String(err) },
+      };
+    }
     // 渠道层抛的是**用户输入问题**（上下文超限、system 超长、缺必填字段…）——
     // 换一家渠道同样会失败，直接 400，不浪费尝试次数。
     logger(`request build failed: ${String(err)}`);
@@ -423,19 +523,33 @@ export async function attemptCandidate(
     try {
       await inChannel(channel, () => upstream.prepareChat!(body));
     } catch (err) {
-      logger(`upstream prepare failed (channel ${cid}): ${String(err)}`);
-      noteFailure(cid, activeKeyOf(cid));
-      // 请求体协议错是客户端问题（如 tool 消息序列），不计凭据连败
-      return {
-        kind: "retry",
-        error: {
-          status: 502,
-          code: "upstream_error",
-          // 渠道层的 prepare 错误文案本身不含敏感信息（如上游对请求体回 413），
-          // 透出真实原因比「see gateway logs」更利于客户端自行调整（上下文过大等）
-          message: `upstream prepare request failed: ${String(err)}`,
-        },
-      };
+      // 前置阶段就凭据失效：先刷新再重跑前置（见 `handlePrepareUnauthorized`）
+      if (isUpstreamUnauthorized(channel, err)) {
+        const handled = await handlePrepareUnauthorized(channel, cid, logger, body, err);
+        if (handled !== null) return handled;
+        // 已恢复：**留在这里继续往下走**建连流程（不能落到下面的通用失败分支）
+      } else if (isUnsupportedInputError(err)) {
+        // 「本渠道承载不了这类输入」：换一条候选可能成功，且**不计连败**
+        logger(`info: channel ${cid} cannot carry this input: ${String(err)}`);
+        return {
+          kind: "retry",
+          error: { status: 400, code: "unsupported_input", message: String(err) },
+        };
+      } else {
+        logger(`upstream prepare failed (channel ${cid}): ${String(err)}`);
+        noteFailure(cid, activeKeyOf(cid));
+        // 请求体协议错是客户端问题（如 tool 消息序列），不计凭据连败
+        return {
+          kind: "retry",
+          error: {
+            status: 502,
+            code: "upstream_error",
+            // 渠道层的 prepare 错误文案本身不含敏感信息（如上游对请求体回 413），
+            // 透出真实原因比「see gateway logs」更利于客户端自行调整（上下文过大等）
+            message: `upstream prepare request failed: ${String(err)}`,
+          },
+        };
+      }
     }
   }
 
@@ -463,7 +577,7 @@ export async function attemptCandidate(
     markActiveHealth("unauthorized", cid);
     return {
       kind: "retry",
-      error: { status: 503, code: "not_authenticated", message: `not logged in: ${outcome.error}` },
+      error: { status: 503, code: "not_authenticated", message: unavailableMessage(outcome.error) },
     };
   }
   if (outcome.kind === "auth_exhausted") {
@@ -502,7 +616,7 @@ export async function attemptCandidate(
     logThrottled(logger, `chat:not-logged-in:${cid}`, `channel ${cid} not logged in: ${outcome.error}`);
     return {
       kind: "retry",
-      error: { status: 503, code: "not_authenticated", message: `not logged in: ${outcome.error}` },
+      error: { status: 503, code: "not_authenticated", message: unavailableMessage(outcome.error) },
     };
   }
   let call = outcome.call;
@@ -512,17 +626,31 @@ export async function attemptCandidate(
   // 只在**响应头发出前**做：一旦开始向客户端写字节就不能再换请求。
   const state: ProbeState = {
     frames: [],
-    queuedOut: false,
-    giveUpText: null,
+    switchChannel: false,
     failed: false,
-    error: probeFallbackError(),
+    error: probeFallbackError(cid),
     translator: undefined,
     attempts: 0,
     host: null,
   };
-  if (isCustomWire(channel) && channel.upstream.isQueueError) {
+  // `call.ok` 前置判断不能省：非 200 时 `openStream()` 只读 `bodySnippet`，`body`
+  // 恒为 null，探测会对它取 `getReader()` 直接抛 TypeError —— 真实状态码被替换成
+  // 502，额度冷却路径也永远走不到（排队只可能发生在 HTTP 200 的流内）。
+  if (call.ok && isCustomWire(channel) && channel.upstream.isQueueError) {
     const env: ProbeEnv = { ctx, channel, cid, sendBody };
     const probedCall = await runQueueProbe(env, state, call);
+    if (state.switchChannel) {
+      // 上游在排队、一个内容都没出：换下一条候选，绝不接受排队请求。
+      // 流已在 `runQueueProbe` 里 cancel 过，这里只报错给编排层。
+      return {
+        kind: "retry",
+        error: {
+          status: 503,
+          code: "upstream_queued",
+          message: `upstream queued [${cid}]: switched to next candidate instead of waiting`,
+        },
+      };
+    }
     if (state.failed) {
       // 探测层异常：这条流已死，跳过转发层（call.ok 仍是 true，不能让它进转发层）
       await probedCall.body?.cancel().catch(() => {});
@@ -534,7 +662,7 @@ export async function attemptCandidate(
   }
 
   if (!call.ok) {
-    // 上游错误体只进本地日志，不回传客户端（可能含内部信息）
+    // 本地日志留完整原文；客户端拿截断透传（见下文 upstreamDetail）
     if (call.connectFailed) logger(`upstream request failed (channel ${cid}): ${String(call.error)}`);
     else {
       logThrottled(
@@ -548,7 +676,7 @@ export async function attemptCandidate(
     // 额度耗尽：不是瞬时故障，继续打同一个账号只会重复失败 → **冷却**它（不是标 error）。
     // 冷却截止由渠道从错误体里认（`upstream.quotaResetAt`），认不出就兜底次日本地 0 点。
     // 刻意**不计连败**（`noteFailure` 不调）：额度耗尽不是故障，计进去会让账号被
-    //   3 连败熔断打成「不可用」（workbuddyai 就是这样被误标过的）。
+    //   3 连败熔断打成「不可用」（就有渠道这样被误标过）。
     const bodySnippet = call.bodySnippet ?? "";
     // 额度信号 = 共享层**通用措辞** 或 渠道自己声明的业务码（`upstream.quotaSignal`）。
     // 渠道业务码属渠道知识，只能由渠道上报；共享层不硬编码任何厂商码（AGENTS.md 铁律）。
@@ -556,12 +684,40 @@ export async function attemptCandidate(
       inChannel(channel, () => channel.upstream.quotaSignal?.(call.status, bodySnippet)) ?? null;
     const quotaOut = isQuotaExhausted(bodySnippet) || channelSignal !== null;
     const usageLimit = isUsageLimit(bodySnippet) || channelSignal === "usage_limit";
+    // 频率/速率超限：**渠道级短冷却**（理由见 `stream.ts::coolAccountOnQuotaSignal`）——
+    // 账号级冷却挡不住它，同一个被限流的账号会被反复重试。
+    if (channelSignal === "rate_limit" && !freeModel) {
+      noteFailure(cid, activeKeyOf(cid), FAIL_COOLDOWN_MS);
+      logThrottled(
+        logger,
+        `chat:ratelimit:${cid}:${candidate.exposedId}`,
+        `upstream rate limit (channel ${cid}); cooling channel for ${FAIL_COOLDOWN_MS / 1000}s`,
+      );
+      return {
+        kind: "retry",
+        error: {
+          status: 429,
+          code: "upstream_rate_limited",
+          message: `upstream rate limit (${cid}): ${snippetOf(bodySnippet)}`,
+        },
+      };
+    }
     // 账户级用量限额对所有模型生效 → 一律冷却；
     // 余额类只冷却付费模型，免费模型继续打上游拿真实结论。
     if (quotaOut && (usageLimit || !freeModel)) {
+      // 渠道钩子必须包 `runInChannel`：`quotaResetAt` 会读渠道落点（缓存 / 状态文件），
+      // 裸调时上下文缺失，认出来的重置时刻可能落到别的渠道。
+      const quotaChannel = hasChannel(cid) ? getChannel(cid) : undefined;
       const resetAt =
-        (hasChannel(cid) ? getChannel(cid).upstream.quotaResetAt?.(bodySnippet) : null) ?? null;
-      const reason = usageLimit ? "上游用量限额（所有模型都受限）" : "上游返回额度耗尽（等额度窗口刷新）";
+        (quotaChannel ? inChannel(quotaChannel, () => quotaChannel.upstream.quotaResetAt?.(bodySnippet)) : null) ??
+        null;
+      // 冷却原因带上**上游原话**（截断）：只写「上游用量限额」时，用户看不到
+      // 「将在 20:46:45 重置」这类关键信息，只能来问。上游正文是数据而非渠道知识 ——
+      // 共享层只原样透传，不解析业务码（业务码归渠道的 `quotaSignal`）。
+      const upstreamSaid = snippetOf(bodySnippet);
+      const reason = `${usageLimit ? "上游用量限额（所有模型都受限）" : "上游返回额度耗尽（等额度窗口刷新）"}${
+        upstreamSaid === "" ? "" : `：${upstreamSaid}`
+      }`;
       const untilMs = noteAccountQuotaExhausted(cid, { until: resetAt, reason });
       logThrottled(
         logger,
@@ -592,21 +748,35 @@ export async function attemptCandidate(
         error: {
           status: 402,
           code: "upstream_insufficient_quota",
-          message: "upstream says insufficient quota for this model; see gateway logs",
+          message: `upstream says insufficient quota for this model: ${snippetOf(call.error?.message ?? bodySnippet ?? "")}`,
         },
       };
     }
 
-    noteFailure(cid, activeKeyOf(cid));
-    // 仅「上游不可用/网络」计账号连败；4xx 业务错（模型/参数/内容）属请求级，
-    // 计进去会把健康账号误标 error（tool 消息序列实测踩过）
-    if (call.status <= 0 || call.status >= 500) noteAccountFailure(cid);
+    // 渠道级失败只在**上游不可用**时才冷却渠道：4xx 业务错（模型名、参数、tool 消息序列）
+    // 是这一个请求的问题，把它算进渠道冷却会让整个池绕开一个健康渠道 60 秒 ——
+    // 一个客户端连发几个坏请求，全池就都「不可用」了（2026-11-08 评审指出）。
+    if (call.status <= 0 || call.status >= 500) {
+      noteFailure(cid, activeKeyOf(cid));
+      // 容量型过载（钩子命中）：换账号没用，不计账号连败 —— 否则上游排队高峰会把
+      // 健康账号整批误熔断。渠道业务码归 upstream.isCapacityError，共享层不硬编码。
+      const capacity =
+        hasChannel(cid) &&
+        inChannel(getChannel(cid), () =>
+          getChannel(cid)!.upstream.isCapacityError?.(call.status, bodySnippet ?? ""),
+        ) === true;
+      if (!capacity) noteAccountFailure(cid);
+    }
+    // 上游 4xx 业务错（上下文超限、参数不识别等）原样透传状态码：客户端（claude code /
+    // codex）对 4xx 不重试、对 502 会重试 —— 转成 502 会让客户端对着一个改不了参数的
+    // 请求反复撞墙。5xx/网络错误仍归一 502。
+    const status = call.status >= 400 && call.status < 500 ? call.status : 502;
     return {
       kind: "retry",
       error: {
-        status: 502,
+        status,
         code: call.timeout ? "upstream_timeout" : "upstream_error",
-        message: "upstream request failed; see gateway logs",
+        message: upstreamDetail(cid, call),
       },
     };
   }
@@ -632,15 +802,35 @@ export async function attemptCandidate(
       );
     }
   }
-  await relayUpstream(res, channel, cid, call, {
+  const forwarded = await relayUpstream(res, channel, cid, call, {
     wantStream: ctx.wantStream,
     logger,
     pendingFrames: state.frames,
-    queuedOut: state.queuedOut,
-    giveUpText: state.giveUpText,
     probeTranslator: state.translator,
     request: payload,
+    freeModel,
   });
+  if (forwarded.kind === "empty-stream") {
+    // 上游回了 200 却零产出、响应头也还没写（`forward.ts` 把写头挪到了首次写出）：
+    // 这条候选没接住请求，**换下一条** —— 客户端一个字节都没收到，换得干净。
+    // 补一笔失败：attempt 层在「上游收下请求」时已记过 `ok`，不补的话可靠性系数
+    // 会被这类空流反向抬高；`cooldownMs=0` 是不因一次空流冷却整个渠道。
+    logger(`upstream returned an empty stream (channel ${cid}) — switching to next candidate`);
+    noteRequestError(res, "upstream_stream_failed", forwarded.reason);
+    try {
+      noteFailure(cid, activeKeyOf(cid), 0);
+    } catch (err) {
+      logger(`ledger write failed (channel ${cid}): ${String(err)}`);
+    }
+    return {
+      kind: "retry",
+      error: {
+        status: 502,
+        code: "upstream_stream_failed",
+        message: `${forwarded.reason} [${cid}]`,
+      },
+    };
+  }
   return { kind: "done" };
 }
 
@@ -653,5 +843,5 @@ export async function attemptCandidate(
  */
 function isFreePoolModel(cid: string, exposedId: string): boolean {
   if (hasChannel(cid) && !channelCapabilities(getChannel(cid).config).billing) return true;
-  return getPoolModelMeta(`${cid}/${exposedId}`).multiplier === 0;
+  return getChannelModelMeta(cid, exposedId).multiplier === 0;
 }

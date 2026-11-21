@@ -100,14 +100,30 @@ check(
   (cliPkg.files ?? []).includes("dist/cli.bundle.js"),
   "packages/cli: files 必须包含 dist/cli.bundle.js（bin 指向它）",
 );
-const registered = [...read("packages/cli/src/channels.ts").matchAll(/import\s+"(@modelmux\/[a-z0-9-]+)"/g)].map((m) => m[1]);
+const channelsSrc = read("packages/cli/src/channels.ts");
+const registered = [...channelsSrc.matchAll(/import\s+"(@modelmux\/[a-z0-9-]+)"/g)].map((m) => m[1]);
 registeredImports = registered.length;
+// 下架声明：包保留作参考实现、但不再注册的渠道（如账号被上游封停的）。
+// 文本级解析与上面的 import 解析同风格；目录 == 注册 ∪ 下架 仍由本检查机械守住。
+const retiredMatch = /RETIRED_CIDS\s*=\s*\[([^\]]*)\]/.exec(channelsSrc);
+const retired = retiredMatch ? [...retiredMatch[1].matchAll(/["']([a-z0-9-]+)["']/g)].map((m) => m[1]) : [];
 for (const cid of channelDirs) {
-  check(registered.includes(`@modelmux/${cid}`), `packages/core/channels/${cid}: 未在 packages/cli/src/channels.ts 注册`);
+  check(
+    registered.includes(`@modelmux/${cid}`) || retired.includes(cid),
+    `packages/core/channels/${cid}: 未在 packages/cli/src/channels.ts 注册（要么加 import，要么登记进 RETIRED_CIDS）`,
+  );
 }
 check(
-  registered.length === channelDirs.length,
-  `注册清单（${registered.length}）与渠道目录数（${channelDirs.length}）不一致`,
+  retired.every((cid) => !registered.includes(`@modelmux/${cid}`)),
+  `RETIRED_CIDS 里的渠道不得同时注册：${retired.filter((cid) => registered.includes(`@modelmux/${cid}`)).join(", ")}`,
+);
+check(
+  retired.every((cid) => channelDirs.includes(cid)),
+  `RETIRED_CIDS 必须对应真实存在的渠道包：${retired.filter((cid) => !channelDirs.includes(cid)).join(", ")}`,
+);
+check(
+  registered.length === channelDirs.length - retired.length,
+  `注册清单（${registered.length}）+ 下架（${retired.length}）应等于渠道目录数（${channelDirs.length}）`,
 );
 
 // 工程引用对齐（`AGENTS.md` 的「命令」：根 tsconfig 是 solution 文件，references 列出全部包）。
@@ -180,10 +196,15 @@ function expandWorkspaces() {
 }
 
 const allPackages = expandWorkspaces();
-const pkgVersions = new Map();
 for (const pkgPath of allPackages) {
   const pkg = JSON.parse(read(`${pkgPath}/package.json`));
-  pkgVersions.set(pkgPath, pkg.version);
+  // **私有** workspace 包一律不得自带 version —— 全仓只有一个版本号（根 package.json）；
+  // 唯一例外是**可发布**的 cli 包（npm 清单必须有 version，由 `npm run version:sync` 派生，
+  // 断言见下方「版本号」段）。
+  check(
+    pkg.private !== true || pkg.version === undefined,
+    `${pkgPath}: 私有 workspace 包不得自带 version（唯一真相是根 package.json；删掉该字段）`,
+  );
   // 每个包都必须有 typecheck 脚本：`npm run typecheck`（不带 --if-present）会因此硬失败。
   // 新增包时漏写 → `npm test` 直接红，不会重演「UI 类型错误长期无人拦截」。
   check(
@@ -205,23 +226,31 @@ for (const pkgPath of allPackages) {
   }
 }
 
-// 版本号：**全仓一个版本线**（自用工具，走 0.1.x，不搞对外的版本语义）。
-// 同一事实只记一遍 —— package.json 的 version 是唯一真相，渠道的 ChannelConfig.version
-// 必须与它一致（那处版本会显示在 `mx --version <cid>` 与 `mx path` 的输出里）。
-// 靠人同步 22 处版本号必然漂移（此前 catpaw / workbuddyai 就漂到了 0.4.0），故机器守。
-const versionSet = new Set(pkgVersions.values());
-check(
-  versionSet.size === 1,
-  `工作区包版本不一致（应全仓同一版本线）：${[...pkgVersions]
-    .map(([p, v]) => `${p}=${v}`)
-    .join(", ")}`,
-);
-for (const cid of channelDirs) {
-  const declared = read(`packages/core/channels/${cid}/src/channel.ts`).match(/version:\s*"([^"]+)"/)?.[1];
-  const pkgVersion = pkgVersions.get(`packages/core/channels/${cid}`);
+// 版本号：**全仓一条版本线**（自用工具，走 0.1.x，不搞对外的版本语义）。
+// 唯一真相是根 package.json 的 version；gateway 的 VERSION 常量、可发布的 cli 清单、
+// desktop 清单与文档由 `npm run version:sync`（scripts/version.mjs）从根派生，
+// 私有 workspace 包一律不带 version。发版只改根一处 + 跑同步；机器在此守漂移
+// （此前 catpaw / workbuddyai 就漂到了 0.4.0）。
+const rootVersion = JSON.parse(read("package.json")).version;
+const versioned = [
+  ["packages/core/gateway/src/version.ts", read("packages/core/gateway/src/version.ts").match(/export const VERSION = "([^"]+)"/)?.[1]],
+  ["packages/cli/package.json", JSON.parse(read("packages/cli/package.json")).version],
+  ["desktop/package.json", JSON.parse(read("desktop/package.json")).version],
+  ["package-lock.json", JSON.parse(read("package-lock.json")).version],
+  ["desktop/package-lock.json", JSON.parse(read("desktop/package-lock.json")).version],
+  ["docs/PROGRESS.md", read("docs/PROGRESS.md").match(/\| 当前版本 \| v([^\s|]+) \|/)?.[1]],
+];
+for (const [where, v] of versioned) {
   check(
-    declared === pkgVersion,
-    `packages/core/channels/${cid}: channel.ts 声明的 version（${declared}）与 package.json（${pkgVersion}）不一致`,
+    v === rootVersion,
+    `${where}: 版本（${v}）与根 package.json（${rootVersion}）不一致 —— 跑 npm run version:sync`,
+  );
+}
+for (const cid of channelDirs) {
+  const src = read(`packages/core/channels/${cid}/src/channel.ts`);
+  check(
+    !/version:\s*"/.test(src) && /version:\s*VERSION\b/.test(src),
+    `packages/core/channels/${cid}: channel.ts 的 version 必须引用 VERSION 常量，不得写版本字面量`,
   );
 }
 for (const pkgPath of NO_EMIT_PACKAGES) {
@@ -239,19 +268,126 @@ for (const pkgPath of NO_EMIT_PACKAGES) {
 const gwDeps = Object.keys(JSON.parse(read("packages/core/gateway/package.json")).dependencies ?? {});
 check(gwDeps.length === 0, `packages/core/gateway: 共享包必须零运行依赖，当前 ${gwDeps.join(", ")}`);
 
-// 公共池模型动态化（全模型池）：不再断言固定 2 个 flash，改为检查动态收集函数存在
+// 对外模型池：网关只卖家族表里声明的模型，客户端用**裸模型名**请求（渠道由网关按额度挑）。
+// 家族名是**产品面**，允许且只允许在 `pool/model-family.ts` 里声明 —— 其余共享层文件
+// 仍不得硬编码厂商模型名（渠道知识只活在渠道包内，`AGENTS.md` 的「仓库结构」）。
 const poolTargets = read("packages/core/gateway/src/pool/pool-targets.ts");
-check(/export function poolModels\(\)/.test(poolTargets), "pool-targets.ts: 缺 poolModels()（全模型池动态收集）");
-check(/function asPoolModel\(/.test(poolTargets), "pool-targets.ts: 缺 asPoolModel()（动态匹配）");
-// 共享层代码不得硬编码厂商模型名（`AGENTS.md` 的「仓库结构」：共享层不许出现渠道知识）。
-// 剥离注释后再查 —— JSDoc 里的示例 id 是文档，不是共享层持有的模型知识。
-const poolCode = poolTargets
-  .replace(/\/\*[\s\S]*?\*\//g, "") // 块注释
-  .replace(/^\s*\/\/.*$/gm, ""); // 行注释
+check(/export function poolModels\(\)/.test(poolTargets), "pool-targets.ts: 缺 poolModels()（对外模型池收集）");
+check(/export function poolCandidates\(/.test(poolTargets), "pool-targets.ts: 缺 poolCandidates()（跨渠道候选收集）");
+
+const FAMILY_FILE = "packages/core/gateway/src/pool/model-family.ts";
+const modelFamily = read(FAMILY_FILE);
+check(/export const POOL_MODEL_IDS/.test(modelFamily), "model-family.ts: 缺 POOL_MODEL_IDS（对外模型家族）");
+check(/export function canonicalOf\(/.test(modelFamily), "model-family.ts: 缺 canonicalOf()（canonical / 别名归并）");
+
+// `/v1/models` 的 `owned_by` 来自 `MODEL_OWNER`：每个对外 canonical 都必须登记，
+// 否则 `ownerOf()` 会静默回落 `modelmux`，客户端拿到伪造的厂商标识。
+const exposedCanonicals = [...modelFamily.matchAll(/"([a-z0-9.-]+)":\s*"\1"/g)].map((m) => m[1]);
+const ownerBlock = /const MODEL_OWNER[^}]*}/.exec(modelFamily)?.[0] ?? "";
+for (const canonical of exposedCanonicals) {
+  check(
+    ownerBlock.includes(`"${canonical}"`),
+    `model-family.ts: MODEL_OWNER 缺 "${canonical}"（owned_by 会回落成 modelmux）`,
+  );
+}
+
+/** 剥掉注释后再查字面量（JSDoc 里的示例 id 是文档，不是代码持有的模型知识）。 */
+const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+// 只认**引号包起来的**模型名字面量：路由/家族表里出现它们才是持有模型知识。
+const VENDOR_MODEL_RE = /"(?:deepseek|glm|qwen|kimi|doubao)-[a-z0-9.-]+"/i;
+const gatewaySrc = join(repo, "packages", "core", "gateway", "src");
+const walkSrc = (dir) =>
+  readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) return walkSrc(full);
+    return full.endsWith(".ts") ? [full] : [];
+  });
+for (const file of walkSrc(gatewaySrc)) {
+  const rel = file.slice(repo.length + 1).split("\\").join("/");
+  if (rel === FAMILY_FILE) continue;
+  check(
+    !VENDOR_MODEL_RE.test(stripComments(readFileSync(file, "utf8"))),
+    `${rel}: 共享层不得硬编码厂商模型名（唯一落点是 pool/model-family.ts）`,
+  );
+}
+
+// ── 统一模型注册表：供给范围与上游 id 映射（产品面策略）────────────────────────
+//
+// 注册表（`packages/core/gateway/models.json`）是对外模型面的唯一声明：哪个渠道供哪个
+// 模型、各渠道上游叫什么、对外规格是多少。此前这些分散在 12 个渠道的 `models.json` +
+// `hidden` 标记里（2026-11-08 收敛为单文件，见 docs/MODEL-CATALOG.md）。
+//
+// 这里机械守住三件事：
+//   1. 注册表只声明家族表里的模型（家族外的一律 400，不该出现在供给声明里）；
+//   2. 每个模型至少一家渠道供给（否则这个模型对外永远无货）；
+//   3. 每个 cid 都是真实存在的渠道包（拼错会让该渠道静默不参与路由）。
+const REGISTRY_FILE = "packages/core/gateway/models.json";
+// `const CANONICAL[^=]*=` 容忍类型注解（`Readonly<Record<…>>`）；解析不出来会让下面的
+// 家族判定全部落空，所以先按条目数守卫 fail-loud —— 校验器自己不许静默失败。
+const canonicalBlock = /const CANONICAL[^=]*=\s*\{[^}]*\}/.exec(modelFamily)?.[0] ?? "";
+const CANONICAL_OF = {};
+for (const m of canonicalBlock.matchAll(/"([a-z0-9.-]+)":\s*"([a-z0-9.-]+)"/g)) CANONICAL_OF[m[1]] = m[2];
 check(
-  !/"(deepseek|glm|qwen|kimi|doubao)-[a-z0-9.-]+"/i.test(poolCode),
-  "pool-targets.ts: 共享层不得硬编码厂商模型名（模型只由各渠道 exposedIds() 提供）",
+  Object.keys(CANONICAL_OF).length >= 2,
+  "model-family.ts: CANONICAL 表解析失败，注册表的家族校验无法执行（正则与源码形态脱节）",
 );
+/** 行 id 到家族规范名；不在家族表内回 null。 */
+const familyOfRow = (id) => {
+  const normalized = id
+    .trim()
+    .toLowerCase()
+    .replace(/^(sn-|z-ai-|bytedance-)/, "")
+    .replace(/(\d)-(\d)/g, "$1.$2")
+    .replace(/-official$/, "")
+    .replace(/-\d{4}$/, "")
+    .replace(/-latest$/, "");
+  const canonical = CANONICAL_OF[normalized] ?? normalized;
+  return canonical in CANONICAL_OF ? canonical : null;
+};
+check(existsSync(join(repo, REGISTRY_FILE)), `${REGISTRY_FILE}: 缺统一模型注册表（模型面会是空的）`);
+if (existsSync(join(repo, REGISTRY_FILE))) {
+  let registry = null;
+  try {
+    registry = JSON.parse(read(REGISTRY_FILE));
+  } catch (err) {
+    check(false, `${REGISTRY_FILE}: 不是合法 JSON（${String(err)}）`);
+  }
+  if (registry) {
+    const models = registry.models ?? {};
+    check(Object.keys(models).length > 0, `${REGISTRY_FILE}: models 为空（对外模型面不能为空）`);
+    const knownCids = new Set(channelDirs);
+    for (const [id, row] of Object.entries(models)) {
+      check(familyOfRow(id) !== null, `${REGISTRY_FILE}: "${id}" 不在模型家族表里`);
+      check(
+        typeof row?.contextWindow === "number" && row.contextWindow > 0,
+        `${REGISTRY_FILE}: "${id}" 的 contextWindow 必须是正数`,
+      );
+      check(
+        typeof row?.maxOutput === "number" && row.maxOutput > 0,
+        `${REGISTRY_FILE}: "${id}" 的 maxOutput 必须是正数`,
+      );
+      const channels = row?.channels ?? {};
+      check(
+        Object.keys(channels).length > 0,
+        `${REGISTRY_FILE}: "${id}" 没有声明任何供给渠道（该模型对外必然无货）`,
+      );
+      for (const [cid, entry] of Object.entries(channels)) {
+        check(knownCids.has(cid), `${REGISTRY_FILE}: "${id}" 声明了不存在的渠道 "${cid}"`);
+        // 两种形态：纯 slug 字符串，或 { slug, contextWindow? }（渠道级窗口）
+        const slug = typeof entry === "string" ? entry : entry?.slug;
+        const ctx = typeof entry === "object" && entry !== null ? entry.contextWindow : undefined;
+        check(
+          typeof slug === "string" && slug.trim() !== "",
+          `${REGISTRY_FILE}: "${id}" 的渠道 "${cid}" 上游 id 为空（请求会带空 model 打上游）`,
+        );
+        check(
+          ctx === undefined || (typeof ctx === "number" && Number.isFinite(ctx) && ctx > 0),
+          `${REGISTRY_FILE}: "${id}" 的渠道 "${cid}" contextWindow 必须是正数`,
+        );
+      }
+    }
+  }
+}
 
 // ── 渠道**总数**不得写死在文档与注释里 ────────────────────────────────────────
 //
@@ -281,13 +417,14 @@ const DOC_FILES = [
   "docs/LOGGING.md",
   "docs/channels/README.md",
   "docs/MODULE-COMMENTS.md",
-  ".agents/skills/mx-cli/SKILL.md",
-  ".agents/skills/opencode-mx-test/SKILL.md",
+  ".agents/skills/dsh-mx-test/SKILL.md",
 ];
 const countHits = [];
+let docsRead = 0;
 for (const rel of DOC_FILES) {
   // `read()` 内部已拼 `repo`（见文件顶部），这里**不能**再 join 一次。
   if (!existsSync(join(repo, rel))) continue;
+  docsRead += 1;
   const lines = read(rel).split(/\r?\n/);
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -296,6 +433,13 @@ for (const rel of DOC_FILES) {
     countHits.push(`${rel}:${i + 1}: ${line.trim().slice(0, 100)}`);
   }
 }
+// 「零个文件被读到」也算通过的话，任何一次文档改名 / 搬家都会静默降低覆盖面，
+// 而输出照旧是「✓ 工程契约校验通过」。这条断言把覆盖率下降变成红灯。
+const missingDocs = DOC_FILES.filter((rel) => !existsSync(join(repo, rel)));
+check(
+  docsRead === DOC_FILES.length,
+  `DOC_FILES 有 ${missingDocs.length} 项没读到（文件被改名或删除？）：${missingDocs.join(", ")}`,
+);
 check(
   countHits.length === 0,
   `渠道总数不得写死在文档里（增删渠道时改文档必然漏）。命中 ${countHits.length} 处：\n      ${countHits.join("\n      ")}\n      改法：删掉数字，或改成「全部渠道」「各渠道」等不随数量变化的表述。`,

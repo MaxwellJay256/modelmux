@@ -201,6 +201,17 @@ Body: {"ClientID":"ono9krqynydwx5","RefreshToken":"<refreshToken>","ClientSecret
 
 同日两账号共用 device_id 会被「该设备已签到」拦截。
 
+**每日签到发放额 = 100 积分**（实测 2026-11-07）：领一次后 `signin.claim()` 回报
+`reward {amount:100, unit:"积分"}`，同刻账单 `remain` 2442.85 → 2542.85（+100），
+且 `size` 2500 → 2600（上游新开一个 100 的权益包）。上游**没有**每日额度查询字段，
+故 `billing.quotaPeriod()` 报这个实测常量；日界按本机自然日（跨天即恢复可签）。
+
+**签到按账号独立**（`signin.perAccount: true`）：签到设备 id 由账号 uid 派生，
+上游按「设备 + 账号」判当日是否已签 —— 池里每个账号都有自己的一份 100 积分。
+共享层逐个账号带凭据调用 `claim({ credential })`，台账按账号记账（控制台账号详情读账号级
+记录）；只对生效凭证领一次会让其余账号的当日额度白丢（2026-11-10 实测：4 个账号里只有
+生效账号有额度、其余 remain 为 0，而卡片仍显示「已签到 +100」）。
+
 ### 2.4 续期
 
 同 ExchangeToken 流程；只改 `access_token`/`refresh_token`/`expires_at`，设备指纹字段完全不动（`packages/core/channels/traecn/src/cred.ts`）。
@@ -377,7 +388,7 @@ event:done   | data:{"finish_reason":"stop"}
 |---|---|---|
 | `metadata` / `timing_cost` / `extra_info` | 未消费 | 出现即算「上游已开工」 |
 | `output` | `response`（正文**增量**）、`reasoning_content`（思考**增量**）、`tool_calls`（null 或数组） | 主要帧 |
-| `token_usage` | `prompt_tokens`、`completion_tokens`、`reasoning_tokens` | 用量 |
+| `token_usage` | `prompt_tokens`、`completion_tokens`、`reasoning_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`（各带 `_total` 变体）、`cluster` | 用量。缓存字段**实测恒为 0**（2026-11-09，4 个模型 × 3 次请求，含 9235 token 相同前缀连发），`_total` 变体同样恒 0 —— 判为未填充的占位字段，**不映射**（映射会把「上游没给」变成假的 0%） |
 | `notify_usage` | `billing_mode`、`cn_credits_remain_info.{ide_credits, work_credits}` | **通道余额**；不产出客户端帧，只落盘（见 §6.4） |
 | `done` | `finish_reason` | **流结束标志** |
 | `error` | `code`、`message` | 业务错误 |
@@ -396,11 +407,12 @@ event:done   | data:{"finish_reason":"stop"}
 | `1005` | Plan 权益不足 → 分类 `hard-plan` | 如实报错；**网关不自动换号**（换号由用户手动执行，见本节末注）；渠道层无冷却表，冷却由共享层 `noteFailure()` 统一给（默认 60s，见 §6.3） | `packages/core/channels/traecn/src/upstream.ts:275` |
 | `4008` | 配额耗尽 → 分类 `quota-exceeded`（**判定必须先于 4011**） | 如实报错；同上不自动换号 | `packages/core/channels/traecn/src/upstream.ts:276` |
 | `4011` | 频率超限 → 分类 `soft-rate` | 如实报错；同上不自动换号 | `packages/core/channels/traecn/src/upstream.ts:277` |
+| `3004` | 限流（文案「exceeded the rate limit」）→ 分类 `soft-rate`，并经 `quotaSignal` 上报 `rate_limit` | **渠道级短冷却**（60s），让请求先落到别家 | 包在 **HTTP 200** 的流内 `event:error` 帧里（无 HTTP 状态码，只能靠报文内容认）。账号级冷却挡不住它 —— 生效凭据照样被使用、其他账号额度又让渠道保持高优先级，同一账号被反复重试（实测 2026-11-09：连续 70 次失败后 `cooldown_until=0`、4 个账号全 `health=ok`），故走 `rate_limit` → 共享层做渠道级冷却（`http/chat/stream.ts::coolAccountOnQuotaSignal`、`http/chat/attempt.ts`） |
 | `4001` | 模型不可调用（`param is invalid`） | **不换号**，如实报错 | 本仓**没有** `4001` 专门分支：`classifyError` 里没有这一项，落点是 4xx 兜底的 `client`（`packages/core/channels/traecn/src/upstream.ts:283`）；版本准入见 `packages/core/channels/traecn/src/cred.ts:124`。除版本准入外，**空壳 assistant 消息**（无正文且无 tool_calls）也触发 4001 —— 已由消息序列归一化挡在网关侧（§3.2 第 10 条，实测见「使用与实测」2026-10-23） |
 | `4027` | tool 消息顺序错误 | 直接失败 | 本仓**没有** `4027` 专门分支：同样落点是 4xx 兜底的 `client`（`packages/core/channels/traecn/src/upstream.ts:283`） |
 | `4023` | `the model is unknown`（不可调用通道） | 通道白名单已挡 | `packages/core/channels/traecn/src/catalog.ts:43-59` |
 | `3003` | `model service is unavailable`（`inline_chat`） | 同上 | `packages/core/channels/traecn/src/catalog.ts:43-59` |
-| `9074` | 签到人数过多（设备级限流） | **轮换签到设备代次**（持久化到凭据的 `checkin_generation`）并抛 `CreditsError`；**渠道层没有 300s 冷却** | `packages/core/channels/traecn/src/billing.ts:190-199`（`handleDeviceRateLimit`）、`packages/core/channels/traecn/src/cred.ts:720-725`（`rotateCheckinGeneration`） |
+| `9074` | 签到人数过多（设备级限流） | **轮换签到设备代次**（有回写通道时持久化到凭据的 `checkin_generation`；按账号调度时池内凭据只读，故只报错不落盘）并抛 `CreditsError`；**渠道层没有 300s 冷却** | `packages/core/channels/traecn/src/billing.ts:184-205`（`handleDeviceRateLimit`）、`packages/core/channels/traecn/src/cred.ts:720-725`（`rotateCheckinGeneration`） |
 
 流内 `event:error` **只被转成一个 error 帧**（`code` 转字符串保真转发），
 共享层原样写给客户端（`packages/core/channels/traecn/src/upstream.ts:885-902`）。
@@ -427,15 +439,25 @@ Headers: 同对话头（buildHeaders）+ Origin/Referer: https://www.trae.cn/
 ```
 
 - 三个组：`solo_agent_remote`（最全）、`solo_work_remote`、`solo_design_remote`
-- 实测池内模型（2026-10-12，新登录账号）：`glm-5.3-flash`、`glm-5.3`、
+- 实测上游目录模型（2026-10-12，新登录账号）：`glm-5.3-flash`、`glm-5.3`、
   `glm-5.3-flashx`、`glm-5.2`、`deepseek-v4.1-flash`、`DeepSeek-V4-Flash-Official`、
   `DeepSeek-V4-Pro-Official`、`kimi-k3`、`kimi-k2.7-code`、`Doubao-Seed-*`、`mimo-v2.6-*`、`step-5-preview`
+  （现状：`glm-5.3-flash` 已被随包 `hidden` 行挡在对外池外，见「推荐模型」的暴露范围）
+- **deepseek-v4.1-flash 供给实测（2026-11-14）**：目录条目 `contextWindow: 1000000` /
+  倍率 x0.06；**最大输出上游不给**（`maxOutput: 0`，共享层兜底 65,536，见
+  [MODEL-CATALOG.md](../../MODEL-CATALOG.md) §6）。缓存：原始响应带
+  `cache_read_input_tokens` 等占位字段但恒为 0（判不映射），对话 usage 无缓存字段，
+  命中率显示 `—`（口径见 [CACHE-HIT-RATE.md](../../CACHE-HIT-RATE.md) §5.2）。
+
+- **glm-5.3-flash 供给实测（2026-11-14）**：目录条目 `contextWindow: 1000000` /
+  倍率 x0.08；最大输出上游同样不给（兜底 65,536）。同目录的 `glm-5.3-flashx`
+  （1M / x0.31）是同族另一型号，不进 glm-5.3-flash 池。
 - 模型名大小写混排（`deepseek-v4.1-flash` 与 `DeepSeek-V4-Flash-Official` 并存）；
   池白名单在共享层做 case-insensitive 匹配
 - **倍率在 `features`**（JSON 字符串，须二次 parse）：顶层 `consumption_rate`
   是**对象** `{enable:true, data:{rate:0.8}}`（不是裸数字），基础倍率取 `data.rate`；
   活动开启时（`activity_discount.enable`）优先取 `data.current.consumption_rate`
-  的折后值（实测 subsidy 活动 0.4→0.2）。共享层据此产出 `model_info.multiplier`
+  的折后值（实测 subsidy 活动 0.4→0.2）。共享层据此产出 `PoolModelMeta.multiplier`
   （实测 20/20 模型全有倍率）
 - **上下文窗口在 `context_window_tokens{dev,max}`**（实测三组都有该字段）：
   `dev` 是默认档（多在 200000 / 232768 / 256000），`max` 是 Max 档
@@ -572,7 +594,7 @@ explore_sub_agent_v13(hidden), explore_sub_agent_v2(hidden), summary(hidden)
 | `step-5-preview` | 1_048_576 | 65_536 | 公开规格 |
 
 数值落点为渠道包根的 `models.json`（与本文一致）；
-全局五级取值链见 [MODEL-CATALOG.md](../../MODEL-CATALOG.md)。
+对外规格以统一注册表为准，见 [MODEL-CATALOG.md](../../MODEL-CATALOG.md)。
 
 **留空（官方无公开规格 / 非公开型号）**：
 `doubao-seed-code`（**该型号官方无公开输出规格**，方舟模型列表与价格页均无
@@ -590,7 +612,7 @@ explore_sub_agent_v13(hidden), explore_sub_agent_v2(hidden), summary(hidden)
 
 全部走 `https://api.trae.cn`（**硬编码**，未用 `product.ugHost`）。
 
-### 6.1 签到头（约 20 个，`packages/core/channels/traecn/src/billing.ts:124-149`）
+### 6.1 签到头（约 20 个，`packages/core/channels/traecn/src/billing.ts:111-136`）
 
 ```
 Content-Type: application/json
@@ -644,7 +666,7 @@ POST /trae/api/v2/pay/ide_user_ent_usage      body {"require_usage": true, "req_
 **「权益包剩余」≠「SOLO 通道能对话的余额」** —— 不分维度就会出现
 「对话报 4008 配额耗尽、额度页却显示余额富余」。`[参考]`
 
-当前实现的处理（`packages/core/channels/traecn/src/billing.ts:289-399` 的 `fetchCredits()`）：`[代码]`
+当前实现的处理（`packages/core/channels/traecn/src/billing.ts:303-417` 的 `fetchCredits()`）：`[代码]`
 
 | 项 | 口径 |
 |---|---|
@@ -747,9 +769,14 @@ POST /trae/api/v2/pay/ide_user_ent_usage      body {"require_usage": true, "req_
 
 | 模型（池 id） | 结论 | 等级 |
 | --- | --- | --- |
-| `traecn/glm-5.3-flash` / `mimo-v2.6-flash` / `doubao-seed-code` | **本渠道倍率最低**（0.06），自动化测试首选 | `[实测]` |
-| `traecn/deepseek-v4.1-flash` | 2026-10-20 AppID 修复后实测可用（非流式 / 流式均 200） | `[实测]` |
+| `traecn/mimo-v2.6-flash` / `doubao-seed-code` | **本渠道倍率最低**（0.06）；家族外，网关不代理，仅渠道直连调试用 | `[实测]` |
+| `traecn/deepseek-v4.1-flash` | 2026-10-20 AppID 修复后实测可用（非流式 / 流式均 200）；本渠道现供的**对外家族模型**，自动化测试走网关时选它 | `[实测]` |
 | `traecn/kimi-k3` | 倍率 1.83 —— **禁用于自动化测试** | `[实测]` |
+
+**对外暴露范围**：本渠道只供 `deepseek-v4.1-flash`。`glm-5.3-flash`（2026-11-07 实测上游
+动态目录已下发）在随包 `models.json` 有预登记的 `hidden` 行，`exposedIds()` 按 id 与
+归一化规范名双口径过滤 —— 隐藏集合由共享层 `hiddenModelIds()` 并集读用户表与随包快照
+（读不到即抛错），条目级 `hidden` 字段拦不住远端条目（恒 false）。
 
 ### 已知限制
 
@@ -842,6 +869,18 @@ ZCode 会话（session `d2b4c141`，30 次请求）调 `traecn/deepseek-v4.1-fla
 ---
 
 ## 参考实现
+
+### 7.x 2026-11-20 生态对齐
+
+- **10101 客户端归属重试**：refresh token 与 client_id 归属由 OAuth client 强制（旧端点同样
+  生效）；`10101 not matched to the client` 时自动换 SOLO 线 `en1oxy7wnw8j9n` 重试一次
+  （dingminhua 四版本矩阵；401/403/2xx-无 token 三种形态都先读 body 再定）。
+- **风险登记（未改实现）**：续期契约已迁 `/trae/api/v3/oauth/ExchangeToken` + DeviceInfo +
+  DeviceProof（P-256 设备签名）；旧端点签出的 JWT 不带设备绑定、签到恒回 9074（magpie 引
+  yetone/magpie#808 并排实测）。本仓仍走旧端点，靠自造 15 位设备号过签到——上游一旦对
+  消费网关强制设备绑定，续期与签到同时失效，需按新契约重做真机验证。
+- PKCE 新登录（22 参数 + code_challenge）双轨并存，短期不影响；登记为风险。
+- UG 签到设备号口径：16 位被拒、15 位收（magpie #709 三账号实测）——维持本仓 15 位派生。
 
 clone 到 `reference/` 的学习材料（不入库）；结论进本文件。
 

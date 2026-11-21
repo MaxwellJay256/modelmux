@@ -71,6 +71,46 @@ worker 的 IPC 断开走既有 `shutdown()` 优雅停机（资源关闭 + `{"eve
 | `packages/core/gateway/src/runtime/paths.ts` | `workerPidPath` / `FILES.workerPid` |
 | `packages/core/gateway/src/app/cli/index.ts` | 隐藏内部命令 `supervise`（同 `serve` 待遇） |
 
+## 7. 外层守护：supervisor 自己被杀（`scripts/mx-watchdog.mjs`）
+
+§1–§4 那一层只能保证「worker 崩了有人拉回」，**管不了 supervisor 自己消失**（被
+`taskkill /F`、任务管理器、清理工具、误操作杀掉时，`stop` 事件都不会有，实测
+2026-10-22 与 2026-11-16 两次）。外层守护从**进程外**盯 `/health`，不在就 `mx start`：
+
+| 模式 | 用途 |
+| --- | --- |
+| `--once` | 单次探测，**不在就拉起**（自启计划任务每分钟跑一次这一条） |
+| 常驻（`--interval 60`） | 每 60s 探一次，连续 2 次失败才拉起（阈值防抖；手动调试用，不再作自启） |
+
+单实例锁在 `watchdog.pid`；日志 `logs/watchdog.log`；每轮探测结果落 `watchdog.state.json`
+（mtime 停更 = 守护最后存活时刻，`healthy`/`action` 字段区分「守护死了」与「守护活着但
+网关没起来」）。
+
+**暂停标记 `watchdog.pause`**：存在 = **只探测不拉起**。它是「用户明确要停」与「网关静默
+消失」之间的分界，由**显式动作**维护：
+
+| 动作 | 标记 |
+| --- | --- |
+| `mx stop` / 桌面壳托盘「退出 modelmux」 | 置（别再拉回来） |
+| `mx start` / `mx restart` / 壳启动 | 清（恢复保护） |
+
+没有这个标记，守护会把用户的「退出」当成故障拉回来（2026-11-16 讨论）。
+
+**守护自身的异常落盘**：`uncaughtException` 写日志后 `exit(1)`，`unhandledRejection` 只写
+日志不退出。计划任务没有控制台，异常栈默认流向 stderr 然后一起消失 —— 「静默消失查不出」
+正是这么来的，所以先落盘再退。
+
+**本机注册方式**（一次性动作，不是代码）：`scripts/install-watchdog-task.ps1` 注册计划任务
+`modelmux-gateway-watchdog`：登录触发（延迟 30s）+ **每 1 分钟跑一次 `--once`**、`IgnoreNew`
+防叠实例、允许电池供电、**S4U 非交互登录**；同时删除「启动」快捷方式与旧 `bin/watchdog-login.vbs`。
+S4U 是硬要求：Interactive 登录类型下 `node.exe`（控制台程序）每次触发都新建一个 conhost
+窗口一闪（实测 2026-11-18 桌面抓到）；守护与网关都是纯回环 HTTP / 文件操作，不需要交互桌面。
+为什么是「每分钟 `--once`」而不是常驻 + 失败重启：实测（2026-11-17）`taskkill` 强杀常驻守护
+**不触发** `RestartCount`（任务停在 `Ready`、result=0xFFFFFFFF）—— 常驻进程本身就是「可被杀的
+对象」；一次性探测无常驻可杀，最多漏 1 分钟即补。网关本体被杀同样由下一轮 `--once` 拉回
+（实测 61s 拉起，S4U 改造后复测拉回仍成立且全程无新窗口，2026-11-18；僵尸 `gateway.pid`
+由 `mx start` 幂等逻辑清理）。
+
 ## 日志布局与实例隔离
 
 - 运行日志的落点、格式、轮转与保留规则见 [LOGGING.md](./LOGGING.md)。

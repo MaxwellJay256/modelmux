@@ -5,7 +5,7 @@
  * 这套校验守的是**接上了没有**、**形态对不对** —— 现有 `verify-*.mjs` 只守
  * 「文件在哪、依赖朝哪、md 落哪」，协议语义一条都没查，于是近三轮反复出现同一类回归：
  *
- * - 渠道导出注入器却**没在装配处调用** → 请求体里恒是默认值（qodercn 目录元数据）
+ * - 渠道导出注入器却**没在装配处调用** → 请求体里恒是默认值（目录元数据注入器没接上）
  * - 错误帧的 `code` 传数字 → 客户端按字符串解析，整帧解码失败
  * - assistant 的工具调用被改写成单个对象 → 上游按「前序消息带 tool_calls」校验，直接拒收
  * - 一轮响应连吐多个信封，只按单信封解析 → 整段当文本透传
@@ -154,6 +154,11 @@ for (const cid of channelDirs) {
 
 const CHANNEL_ID_RE = new RegExp(`["'\`](${channelDirs.join("|")})["'\`]`);
 const MODEL_NAME_RE = /["'`](?:deepseek|glm|qwen|kimi|doubao|hunyuan|minimax|sensenova)-[a-z0-9.-]+["'`]/i;
+// 例外：`pool/model-family.ts` 是**对外模型家族**的唯一声明点 —— 家族名是产品面
+// （`AGENTS.md` 的「代码约定」）；其余共享层文件仍不得持有模型名。
+const FAMILY_FILE_REL = "packages/core/gateway/src/pool/model-family.ts";
+// 集成目标名（`integrate.ts` 里的 zcode / dsh）是产品面概念，不是渠道知识；
+// 它们与现有渠道 cid 不重叠，因此不需要白名单 —— 真出现同名渠道时命中会被如实报出。
 
 const gatewaySrc = join(repo, "packages", "core", "gateway", "src");
 function walk(dir, out = []) {
@@ -166,11 +171,18 @@ function walk(dir, out = []) {
 }
 for (const file of walk(gatewaySrc)) {
   const rel = file.slice(repo.length + 1).replace(/\\/g, "/");
+  // 家族表是**产品面策略的唯一落点**：模型名（家族/别名/偏好族）与收窄策略的渠道指定
+  // （SINGLE_CHANNEL_SUPPLY）都在这里声明 —— 模型名与渠道 id 两类校验都豁免它。
+  // 其余共享层文件照旧：模型名与渠道 id 一律不得硬编码。
+  if (rel === FAMILY_FILE_REL) continue;
   const code = stripComments(readFileSync(file, "utf8"));
-  const idHit = code.match(CHANNEL_ID_RE);
+  // **逐处命中**都要判：`String.match`（非 global）只返回第一处，先出现一个无害命中就会
+  // 让后面真正的渠道 id 溜过去（2026-11-08 评审复现）。用全局正则把所有命中都拿出来判。
+  const idHits = [...code.matchAll(new RegExp(CHANNEL_ID_RE.source, `${CHANNEL_ID_RE.flags}g`))];
+  const offendingId = idHits[0];
   check(
-    !idHit,
-    `${rel}: 共享层不得硬编码渠道 id（出现 "${idHit?.[0]}"）—— 渠道知识只允许出现在各渠道包内`,
+    offendingId === undefined,
+    `${rel}: 共享层不得硬编码渠道 id（出现 "${offendingId?.[0]}"）—— 渠道知识只允许出现在各渠道包内`,
   );
   const modelHit = code.match(MODEL_NAME_RE);
   check(

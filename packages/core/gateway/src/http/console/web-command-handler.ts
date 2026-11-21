@@ -9,13 +9,31 @@
  * 调用方（headless 的 bridge）负责提供实现。
  */
 
-import { channelCapabilities, channels, getChannel, hasChannel } from "../../runtime/channel.js";
+import { channelCapabilities, channels, getChannel, hasChannel, type Channel } from "../../runtime/channel.js";
 import { runInChannel } from "../../runtime/channel-context.js";
-import { POOL_MODELS, canonicalModelId, poolModelId, poolCandidates } from "../../pool/pool-targets.js";
-import { ledgerSnapshot, refreshBilling, scoreOf, sortChannelsByUsage } from "../../pool/pool-usage.js";
+import { poolCandidates, poolModels } from "../../pool/pool-targets.js";
+import { isPrefsModel, loadModelPrefs, setPreferredChannel } from "../../pool/model-prefs.js";
+import { ledgerSnapshot, refreshBilling, sortChannelsByUsage } from "../../pool/pool-usage.js";
 import { listAccounts, activateAccount, clearAccountState, removeAccount, syncPool } from "../../runtime/account-pool.js";
+import { disabledChannelSet, saveUserSettings, setChannelEnabled } from "../../runtime/user-settings.js";
+import {
+  API_KEY_NAME_MAX,
+  createApiKey,
+  deleteApiKey,
+  listApiKeys,
+  regenerateApiKey,
+  revealApiKeyPlain,
+  updateApiKey,
+} from "../../runtime/api-key-store.js";
+import { signinTodaySnapshot, type ClaimToday } from "../../auth/signin-ledger.js";
 import { renderChannelPool } from "./web-types.js";
-import type { WebCommandBody, WebCommandResult, WebChannelStatus } from "./web-types.js";
+import type {
+  WebChannelSignin,
+  WebCommandBody,
+  WebCommandResult,
+  WebChannelStatus,
+  WebSigninView,
+} from "./web-types.js";
 
 /**
  * 命令分发的外部依赖（由调用方注入）。
@@ -41,15 +59,72 @@ export interface WebCommandDeps {
   submitInput?: (value: string) => void;
   /** 用户关掉了登录弹窗：不再等两步登录的输入（见 `ControlBridge.cancelInput`）。 */
   cancelInput?: () => void;
+  /**
+   * 一键接入：把本机 harness 的模型配置改写成网关的对外模型名。
+   *
+   * 实现由 app 层注入（写的是 `~/.zcode` / `~/.dsh`，不是网关运行时），
+   * 控制台只校验 target 并转交。省略时该动作返回「未就绪」。
+   */
+  integrate?: (target: "zcode" | "dsh") => {
+    ok: boolean;
+    error?: string;
+    /** 变更说明（人读，控制台作展示）。 */
+    notes?: string[];
+    /** 需要用户处置的警告（备份清单读不出 / 备份未登记 等）；不透出会被当噪音忽略。 */
+    warnings?: string[];
+  };
+  /** 一键还原：把目标恢复成接入前状态（取该目标最新一次备份，可重复使用）。 */
+  restore?: (target: "zcode" | "dsh") => {
+    ok: boolean;
+    error?: string;
+    restored: string[];
+    removed: string[];
+    /** 跳过条目 / 备份缺失等需要让用户知道的说明（不透出会伪装成「已还原」）。 */
+    notes: string[];
+  };
 }
 
 export type WebCommandHandler = (body: WebCommandBody) => Promise<WebCommandResult>;
+
+/**
+ * 命令分权限类：**正向白名单**。
+ *
+ * 只有列在 `PUBLIC_ACTIONS` 里的命令允许任意来源调用；其余一律要求本机直连
+ * （路由层按 socket 远端地址判定后把 `admin` 放进 body）。
+ * 为什么正向：`ADMIN_ACTIONS` 反向名单在新增命令时默认放行 —— 加一个改全局状态的
+ * action 忘了登记就是漏洞；正向名单忘登记只会「新命令暂时只允许本机」，
+ * 报错可见、不会静默泄露。
+ *
+ * 公共面 = 只读查询 + 与单次请求/单渠道登录交互相关的动作；凡是能改全局配置、
+ * 账号池、API key、渠道开关的，都不在此列。
+ */
+const PUBLIC_ACTIONS = new Set([
+  // 只读视图
+  "status",
+  "billing",
+  "accounts",
+  "modelChannels",
+  "checkUpdate",
+  "apiKeys",
+  // 交互式登录流（本机浏览器授权 / 粘贴回调 / 验证码 / 取消）
+  "login",
+  "pasteCallback",
+  "submitInput",
+  "cancelInput",
+  // 一键接入与还原（写本机客户端配置，动作由用户在控制台显式触发）
+  "integrate",
+  "restore",
+]);
 
 /** /api/commands 的统一入口。 */
 export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHandler {
   return async (body) => {
     const { action, cid, args = {} } = body;
     try {
+      // 非公共命令（= 改全局配置 / 账号池 / API key / 渠道开关）只允许本机直连
+      if (!PUBLIC_ACTIONS.has(action) && body.admin !== true) {
+        return err("该命令仅允许本机直连调用");
+      }
       switch (action) {
         case "login": {
           if (cid === undefined || !hasChannel(cid)) {
@@ -73,31 +148,6 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         });
         return ok({ channels: rows });
       }
-      case "models": {
-        const wanted = cid !== undefined && hasChannel(cid) ? [getChannel(cid)] : channels();
-        const rows = wanted.map((channel) => {
-          const cidInner = channel.config.cid;
-          const catalogIds = runInChannel(cidInner, () => {
-            try {
-              return channel.catalog.exposedIds();
-            } catch {
-              return [] as string[];
-            }
-          });
-          // 渠道内先按规范名去重：同一渠道的不同原始写法收敛为同一个对外 id
-          const pool = [
-            ...new Map(catalogIds.map((id) => [canonicalModelId(id), id])).values(),
-          ].map((id) => poolModelId(cidInner, id));
-          return {
-            cid: cidInner,
-            display: channel.upstream.DISPLAY_NAME,
-            catalog: catalogIds,
-            pool,
-            out_of_pool: 0,
-          };
-        });
-        return ok({ channels: rows });
-      }
       case "billing": {
         // args.refresh = true 时先重查一遍各渠道账单（前端「刷新」按钮用），
         // 失败不阻塞快照返回 —— 快照里带 billing_at/billing_ok 供前端标注新鲜度。
@@ -110,55 +160,170 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         const wanted = cid !== undefined && hasChannel(cid) ? [getChannel(cid)] : channels();
         const wantedSet = new Set(wanted.map((channel) => channel.config.cid));
         const ledger = ledgerSnapshot();
-        const rows = POOL_MODELS.filter((model) => {
-          const prefix = model.split("/")[0] ?? "";
-          return wantedSet.has(prefix);
-        }).map((model) => ({
-          model,
-          candidates: poolCandidates(model).map((candidate) => {
-            const entry = ledger.channels[candidate.cid];
-            return {
-              cid: candidate.cid,
-              display: candidate.channel.upstream.DISPLAY_NAME,
-              exposed_id: candidate.exposedId,
-              score: scoreOf(candidate.cid, now),
-              used: entry?.used ?? 0,
-              unit: entry?.unit ?? "",
-              cooling: (entry?.cooldown_until ?? 0) > now,
-              billing_at: entry?.billing_at ?? null,
-              billing_ok: entry?.billing_ok ?? false,
-              unsupported: !channelCapabilities(candidate.channel.config).billing,
-              // 额度周期（渠道声明；没声明就 null，前端回落到通用说明）
-              quota: candidate.channel.billing.quotaPeriod?.() ?? null,
-              ok: entry?.ok ?? 0,
-              fail: entry?.fail ?? 0,
-              // 渠道 × 账号拆分：每个账号的 ok / fail 计数与额度快照
-              accounts: Object.entries(entry?.accounts ?? {}).map(([key, count]) => ({
-                key,
-                ok: count.ok,
-                fail: count.fail,
-                credits: count.credits ?? null,
-                billing_at: count.billing_at ?? null,
-                billing_ok: count.billing_ok ?? false,
-                // 当日基线（当天首个 bill 的 remain）：前端拿它当 100% 分母
-                baseline: count.baseline ?? null,
-              })),
-            };
-          }),
-        }));
-        return ok({ rows, models: POOL_MODELS });
+        const rows = poolModels()
+          .map((model) => ({
+            model,
+            candidates: poolCandidates(model)
+              .filter((candidate) => wantedSet.has(candidate.cid))
+              .map((candidate) => {
+                const entry = ledger.channels[candidate.cid];
+                return {
+                  cid: candidate.cid,
+                  display: candidate.channel.upstream.DISPLAY_NAME,
+                  exposed_id: candidate.exposedId,
+                  used: entry?.used ?? 0,
+                  unit: entry?.unit ?? "",
+                  cooling: (entry?.cooldown_until ?? 0) > now,
+                  billing_at: entry?.billing_at ?? null,
+                  billing_ok: entry?.billing_ok ?? false,
+                  unsupported: !channelCapabilities(candidate.channel.config).billing,
+                  // 额度周期（渠道声明；没声明就 null，前端回落到通用说明）
+                  quota: candidate.channel.billing.quotaPeriod?.() ?? null,
+                  ok: entry?.ok ?? 0,
+                  fail: entry?.fail ?? 0,
+                  // 渠道 × 账号拆分：每个账号的 ok / fail 计数与额度快照
+                  accounts: Object.entries(entry?.accounts ?? {}).map(([key, count]) => ({
+                    key,
+                    ok: count.ok,
+                    fail: count.fail,
+                    credits: count.credits ?? null,
+                    billing_at: count.billing_at ?? null,
+                    billing_ok: count.billing_ok ?? false,
+                    // 当日基线（当天首个 bill 的 remain）：前端拿它当 100% 分母
+                    baseline: count.baseline ?? null,
+                  })),
+                };
+              }),
+          }))
+          .filter((row) => row.candidates.length > 0);
+        // 不在模型池里的渠道也要有账单行：上游目录没有家族模型的渠道
+        // （进不了统一池），但它的额度照样要出现在账号池页 —— 账单行以**渠道**为主维度，
+        // 池内有没有模型是另一件事。（此前缺这段：这类渠道恒无 candidates → 前端额度恒 0。）
+        const seen = new Set(rows.flatMap((row) => row.candidates.map((c) => c.cid)));
+        for (const channel of wanted) {
+          const chanCid = channel.config.cid;
+          if (seen.has(chanCid) || !channelCapabilities(channel.config).billing) continue;
+          const entry = ledger.channels[chanCid];
+          if (!entry) continue;
+          rows.push({
+            model: "",
+            candidates: [
+              {
+                cid: chanCid,
+                display: channel.upstream.DISPLAY_NAME,
+                exposed_id: "",
+                used: entry.used,
+                unit: entry.unit,
+                cooling: (entry.cooldown_until ?? 0) > now,
+                billing_at: entry.billing_at ?? null,
+                billing_ok: entry.billing_ok ?? false,
+                unsupported: false,
+                quota: channel.billing.quotaPeriod?.() ?? null,
+                ok: entry.ok,
+                fail: entry.fail,
+                accounts: Object.entries(entry.accounts ?? {}).map(([key, count]) => ({
+                  key,
+                  ok: count.ok,
+                  fail: count.fail,
+                  credits: count.credits ?? null,
+                  billing_at: count.billing_at ?? null,
+                  billing_ok: count.billing_ok ?? false,
+                  baseline: count.baseline ?? null,
+                })),
+              },
+            ],
+          });
+        }
+        return ok({ rows, models: poolModels() });
       }
       case "accounts": {
-        const targets = cid !== undefined && hasChannel(cid) ? [getChannel(cid)] : channels();
+        // 显式指定 cid 时照常返回（诊断入口）；列表模式只列启用的渠道 ——
+        // 设置弹窗关闭的渠道在这里消失，账号池卡片随之隐藏。
+        // 关闭集合循环外取一次：逐渠道 isChannelEnabled 是逐渠道同步读盘
+        const disabled = disabledChannelSet();
+        const targets =
+          cid !== undefined && hasChannel(cid)
+            ? [getChannel(cid)]
+            : channels().filter((channel) => !disabled.has(channel.config.cid));
         if (targets.length === 0) return err("没有渠道被注册");
         const pools = targets.map((channel) => {
           const poolCid = channel.config.cid;
           runInChannel(poolCid, () => syncPool(poolCid));
           const index = runInChannel(poolCid, () => listAccounts(poolCid));
-          return renderChannelPool(channel.config.cid, channel.upstream.DISPLAY_NAME, index);
+          return renderChannelPool(
+            channel.config.cid,
+            channel.upstream.DISPLAY_NAME,
+            index,
+            signinViewOf(poolCid, channel),
+          );
         });
         // 展示顺序：用得多在前，同频按 cid（UI 只渲染这个顺序，不自己排）
         return ok({ channels: sortChannelsByUsage(pools as Array<{ cid: string }>) });
+      }
+      // —— API key 管理（新建/删除/改白名单与限流/重建明文）——
+      case "apiKeys": {
+        // 哈希与密文都不外发：列表只给 id / 名称 / 前缀 / 白名单 / 限流 / 时间。
+        // 完整明文走需显式调用的 `revealApiKey`（行内复制按钮），不做批量下发。
+        return ok({
+          keys: listApiKeys().map(({ keyHash: _hash, secretSealed: _sealed, ...rest }) => rest),
+        });
+      }
+      case "revealApiKey": {
+        const id = typeof args["id"] === "string" ? args["id"] : "";
+        if (id === "") return err("参数 id 必填");
+        const plain = revealApiKeyPlain(id);
+        if (plain === null) return err("该 key 的明文不可用，请重建后再试");
+        return ok({ id, plain });
+      }
+      case "regenerateApiKey": {
+        const id = typeof args["id"] === "string" ? args["id"] : "";
+        if (id === "") return err("参数 id 必填");
+        const rebuilt = regenerateApiKey(id);
+        if (rebuilt === null) return err("key 不存在");
+        const { keyHash: _hash, secretSealed: _sealed, ...shown } = rebuilt.record;
+        return ok({ key: shown, plain: rebuilt.plain });
+      }
+      case "createApiKey": {
+        const name = typeof args["name"] === "string" ? args["name"] : "";
+        if (name.trim() === "") return err("参数 name 必填");
+        if (name.trim().length > API_KEY_NAME_MAX) return err(`参数 name 最长 ${API_KEY_NAME_MAX} 字`);
+        const allowed = Array.isArray(args["allowedModels"])
+          ? (args["allowedModels"] as unknown[]).filter((m): m is string => typeof m === "string")
+          : [];
+        const rpm = typeof args["rpmLimit"] === "number" ? args["rpmLimit"] : 0;
+        const { record, plain } = createApiKey({ name, allowedModels: allowed, rpmLimit: rpm });
+        const { keyHash: _hash, secretSealed: _sealed, ...shown } = record;
+        // plain 只在这里出现一次，前端必须当场展示并提示保存
+        return ok({ key: shown, plain });
+      }
+      case "updateApiKey": {
+        const id = typeof args["id"] === "string" ? args["id"] : "";
+        if (id === "") return err("参数 id 必填");
+        const patch: { name?: string; allowedModels?: string[]; rpmLimit?: number } = {};
+        if (typeof args["name"] === "string") {
+          if (args["name"].trim().length > API_KEY_NAME_MAX) return err(`参数 name 最长 ${API_KEY_NAME_MAX} 字`);
+          patch.name = args["name"];
+        }
+        if (Array.isArray(args["allowedModels"])) {
+          patch.allowedModels = (args["allowedModels"] as unknown[]).filter((m): m is string => typeof m === "string");
+        }
+        if (typeof args["rpmLimit"] === "number") patch.rpmLimit = args["rpmLimit"];
+        const rec = updateApiKey(id, patch);
+        if (rec === null) return err("key 不存在");
+        const { keyHash: _hash, secretSealed: _sealed, ...shown } = rec;
+        return ok({ key: shown });
+      }
+      case "deleteApiKey": {
+        const id = typeof args["id"] === "string" ? args["id"] : "";
+        if (id === "") return err("参数 id 必填");
+        return deleteApiKey(id) ? ok({ id }) : err("key 不存在");
+      }
+      case "setChannelEnabled": {
+        if (cid === undefined || !hasChannel(cid)) return err("参数 cid 必须是已注册渠道");
+        const enabled = args["enabled"];
+        if (typeof enabled !== "boolean") return err("参数 enabled 必须是布尔值");
+        setChannelEnabled(cid, enabled);
+        return ok({ cid, enabled });
       }
       case "activateAccount": {
         if (cid === undefined || !hasChannel(cid)) return err("参数 cid 必须是已注册渠道");
@@ -193,6 +358,30 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         runInChannel(cid, () => syncPool(cid));
         return ok({});
       }
+      case "modelChannels": {
+        // 每个对外模型的候选渠道 + 当前偏好（下拉的选项与选中项都来自这里）。
+        // 只渲染 deepseek 族：glm / qwen 供给已收窄到唯一渠道，无偏好语义。
+        return ok({
+          models: poolModels()
+            .filter((model) => isPrefsModel(model))
+            .map((model) => ({
+              model,
+              channels: poolCandidates(model).map((candidate) => candidate.cid),
+              preferred: loadModelPrefs()[model] ?? null,
+            })),
+        });
+      }
+      case "setModelChannel": {
+        const model = typeof args["model"] === "string" ? args["model"] : "";
+        const preferred = typeof args["cid"] === "string" && args["cid"] !== "" ? args["cid"] : null;
+        if (model === "") return err("参数 model 必填");
+        try {
+          setPreferredChannel(model, preferred);
+        } catch (e) {
+          return err(String(e));
+        }
+        return ok({ model, preferred });
+      }
       case "pasteCallback": {
         // 兜底路径：回调页线上是 404，code 只在用户浏览器地址栏里。
         // 长轮询拿不到时，由用户把那条链接粘回来完成登录。
@@ -223,6 +412,70 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         deps.cancelInput();
         return ok({ cancelled: true, message: "已取消登录输入" });
       }
+      case "integrate": {
+        // 一键接入：把本机 harness 的模型配置改成网关的对外模型名。
+        const target = args["target"];
+        const INTEGRATION_TARGETS = ["zcode", "dsh"] as const;
+        if (typeof target !== "string" || !(INTEGRATION_TARGETS as readonly string[]).includes(target)) {
+          return err(`参数 target 只能是 ${INTEGRATION_TARGETS.join(" / ")}`);
+        }
+        if (!deps.integrate) {
+          return err("当前运行形态不支持一键接入（未注入 integrate）");
+        }
+        const result = deps.integrate(target as "zcode" | "dsh");
+        if (!result.ok) {
+          // 失败也带上警告：只报 error 会把「备份没登记上」这类线索丢掉
+          const detail = (result.warnings ?? []).join("；");
+          const message = [result.error ?? "接入失败", detail].filter((part) => part !== "").join("；");
+          return err(message);
+        }
+        return ok({
+          target,
+          notes: result.notes ?? [],
+          warnings: result.warnings ?? [],
+          message: result.notes?.[0] ?? "已接入",
+        });
+      }
+      case "checkUpdate": {
+        // 手动检查更新（设置页按钮）：忽略每日节流，失败如实上报
+        const [{ VERSION }, { forceCheckForUpdate }] = await Promise.all([
+          import("../../version.js"),
+          import("../../runtime/update-check.js"),
+        ]);
+        const result = await forceCheckForUpdate(VERSION, () => {});
+        if (!result.ok) return err(result.error ?? "检查更新失败");
+        return ok({
+          available: result.available,
+          version: result.version,
+          url: result.url,
+          checkedAt: result.checkedAt,
+        });
+      }
+      case "restore": {
+        // 一键还原：把该目标恢复成接入前的样子（取最新一次备份）。
+        const target = args["target"];
+        const INTEGRATION_TARGETS = ["zcode", "dsh"] as const;
+        if (typeof target !== "string" || !(INTEGRATION_TARGETS as readonly string[]).includes(target)) {
+          return err(`参数 target 只能是 ${INTEGRATION_TARGETS.join(" / ")}`);
+        }
+        if (!deps.restore) {
+          return err("当前运行形态不支持一键还原（未注入 restore）");
+        }
+        const result = deps.restore(target as "zcode" | "dsh");
+        if (!result.ok) return err(result.error ?? "还原失败");
+        const parts: string[] = [];
+        if (result.restored.length > 0) parts.push(`还原 ${result.restored.length} 个文件`);
+        if (result.removed.length > 0) parts.push(`删除 ${result.removed.length} 个接入新建的文件`);
+        // notes 必须透出：条目被跳过 / 备份文件缺失时，「已还原」会是假象
+        // （界面只报 ok 会让人以为配置真的回到接入前了）
+        return ok({
+          target,
+          restored: result.restored,
+          removed: result.removed,
+          notes: result.notes,
+          message: parts.length > 0 ? parts.join("、") : "已还原（无需改动）",
+        });
+      }
       default:
         return err(`未知 action: ${String(action)}`);
     }
@@ -230,6 +483,54 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
     const message = e instanceof Error ? e.message : String(e);
     return { ok: false, error: message };
   }
+  };
+}
+
+/**
+ * 渠道的签到视图（渠道能力 + 本地台账）。
+ *
+ * **只读本地台账**（`<root>/channels/<cid>/state/signin.json`，旧布局回落 `<root>/<cid>/`），
+ * 不查上游：账号池页是 15 秒一轮的高频页面，让它去打各渠道的上游签到端点既慢又会留下
+ * 无谓的上游痕迹 —— 与 `mx status` 同一取舍（见 daemon.ts 的签到段）。上游的权威答案
+ * 仍归渠道 billing（`mx <cid> checkin`）。
+ *
+ * `per_account` 由渠道声明（`signin.perAccount`）：为 true 时账号行读账号级记录，
+ * 否则整条渠道共用一个「今天领过」—— 这类渠道的 `claim()` 只作用于生效凭证。
+ *
+ * 「今天」的口径收敛在 `signin-ledger.signinTodaySnapshot`（与 `claimedTodayPerLedger` /
+ * `claimedTodayForAccount` 同一个日切入口）—— 控制台与自动签到各自算一遍的话，
+ * 机器换过时区后界面会说「已签到」而调度器认为「未签」并再领一次。
+ */
+function signinViewOf(cid: string, channel: Channel): WebSigninView {
+  // 契约要求每个渠道都给 `signin`。真缺了（契约违例 / 测试桩）时按**能力不可用**处理：
+  // 报 supported=true 会让前端永久显示「未签到（渠道）」，把「没有这项能力」说成「今天没签」
+  const module = channel.billing.signin as { perAccount?: boolean } | undefined;
+  const supported = channelCapabilities(channel.config).signin && module !== undefined;
+  const perAccount = supported && module.perAccount === true;
+  const snapshot = signinTodaySnapshot(cid);
+  const viewOf = (entry: ClaimToday): Omit<WebChannelSignin, "supported" | "per_account"> => ({
+    claimed_today: entry.claimed,
+    at: entry.at,
+    reward: entry.reward,
+    reward_source: entry.source,
+    probe: entry.probe === null ? null : {
+      claimable: entry.probe.claimable,
+      claimed_today: entry.probe.claimed_today,
+      summary: entry.probe.summary,
+      at: entry.probe.at,
+    },
+  });
+  const accounts: WebSigninView["accounts"] = {};
+  if (perAccount) {
+    for (const [key, entry] of Object.entries(snapshot.accounts)) accounts[key] = viewOf(entry);
+  }
+  return {
+    channel: {
+      supported,
+      per_account: perAccount,
+      ...viewOf(snapshot.channel),
+    },
+    accounts,
   };
 }
 

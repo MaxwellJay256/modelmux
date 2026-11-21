@@ -117,7 +117,7 @@ export function GeetestCaptcha({
    * **必须这样**：父组件传的是内联箭头函数，每次渲染都是新身份。
    * 若把它们放进 `useCallback` / `useEffect` 的依赖，effect 会**每渲染重跑一次**
    * → 上一次的实例被 `destroy()` → GeeTest 立刻回调 `onError`，
-   * 表现为「安全验证异常，请重试」（实测踩过：
+   * 表现为「安全验证异常，请重试」（实测出现过：
    * 手动在页面里 initGeetest 是好的，`onReady` 正常触发、`verify()` 正常调用）。
    */
   const onSolvedRef = useRef(onSolved);
@@ -130,9 +130,6 @@ export function GeetestCaptcha({
   const run = useCallback(async () => {
     setBusy(true);
     setStatus("正在加载安全验证组件…");
-    // 必须在 initGeetest **之前**挂上：面板是 SDK 异步创建的，
-    // 晚一步就会有一瞬间点不动。
-    const stopObserver = enablePanelPointerEvents();
     try {
       await loadGeetestSdk();
       const api = (window as unknown as GeeTestWindow).initGeetest;
@@ -202,9 +199,17 @@ export function GeetestCaptcha({
       onFailedRef.current(message);
     } finally {
       setBusy(false);
-      stopObserver();
     }
   }, [gt, challenge, success]);
+
+  useEffect(() => {
+    // 面板由 SDK **异步**插入 `document.body`，观察器要活到组件卸载为止：
+    // 挂在 `run()` 的 finally 里时，超时 / 报错退出会把它提前断开，
+    // 之后 SDK 才挂上来的面板就再没人补 `pointer-events:auto` —— 在 Radix Dialog
+    // 的模态 `pointer-events:none` 下，滑块点不动也拖不动（正是本观察器要修的症状）。
+    const stopObserver = enablePanelPointerEvents();
+    return stopObserver;
+  }, []);
 
   useEffect(() => {
     // 组件挂载即自动开始（官方客户端也是用户点一下才弹，但自动更省事）
@@ -233,7 +238,7 @@ export function GeetestCaptcha({
         type="button"
         onClick={() => void run()}
         disabled={busy}
-        className="rounded-full bg-overlay px-4 py-1.5 text-[13px] text-ink-soft transition-colors hover:bg-overlay/70 hover:text-ink disabled:opacity-50"
+        className="rounded-lg bg-overlay px-4 py-1.5 text-[13px] text-ink-soft transition-colors hover:bg-overlay/70 hover:text-ink disabled:opacity-50"
       >
         重新验证
       </button>

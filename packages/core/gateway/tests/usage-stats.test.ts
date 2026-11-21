@@ -52,7 +52,12 @@ function writeDay(
 }
 
 let seq = 0;
-/** 一条模型请求；`usage` 传 null 表示上游没给用量。 */
+/**
+ * 一条模型请求；`usage` 传 null 表示上游没给用量。
+ *
+ * `model` 参数是 `<cid>/<模型>` 复合串：拆成日志里的两列（`cid` 与**纯模型名**）——
+ * 聚合键仍由两者合成，测试断言的 id 形态与真实日志一致。
+ */
 function modelEntry(
   date: string,
   model: string,
@@ -60,13 +65,14 @@ function modelEntry(
   over: Record<string, unknown> = {},
 ): Record<string, unknown> {
   seq += 1;
+  const slash = model.indexOf("/");
   return {
     id: `req_test${String(seq).padStart(4, "0")}`,
     ts: `${date}T02:00:00.000Z`,
     method: "POST",
     path: "/v1/chat/completions",
-    cid: model.split("/")[0],
-    model,
+    cid: slash < 0 ? "" : model.slice(0, slash),
+    model: slash < 0 ? model : model.slice(slash + 1),
     messageCount: 2,
     durationMs: 1000,
     outcome: "success",
@@ -105,6 +111,18 @@ describe("computeUsageStats", () => {
     const stats = computeUsageStats("7d");
     assert.equal(stats.totals.requests, 1, "只有 1 条模型请求");
     assert.equal(stats.totals.tokens, 150);
+  });
+
+  it("旧日志的模型名自带渠道前缀时，聚合键不会变成 cid/cid/模型", () => {
+    resetUsageCache();
+    const today = dateOffset(0);
+    // 池 id 时代：cid=loomy，日志的 model 自己也写成 loomy/deepseek-v4.1-flash
+    writeDay(today, [modelEntry(today, "loomy/loomy/deepseek-v4.1-flash", { prompt: 100, completion: 50 })]);
+    const stats = computeUsageStats("7d");
+    const row = stats.models[0]!;
+    assert.equal(row.id, "loomy/deepseek-v4.1-flash");
+    assert.equal(row.model, "deepseek-v4.1-flash");
+    assert.equal(row.cid, "loomy");
   });
 
   it("累计 / 输入输出 / 模型占比 / 图例排序", () => {
@@ -158,6 +176,40 @@ describe("computeUsageStats", () => {
     assert.equal(stats.totals.tokens, 100, "第 8 天在区间外");
   });
 
+  it("all 窗口覆盖保留期内全部日期（20 天都在 daily 里，7d 只裁 7 天）", () => {
+    resetUsageCache();
+    // 20 天每天都有请求（今天 + 往前 19 天）
+    for (let daysAgo = 0; daysAgo < 20; daysAgo += 1) {
+      const date = dateOffset(daysAgo);
+      writeDay(date, [modelEntry(date, "a/b", { prompt: 10, completion: 0 })]);
+    }
+    const all = computeUsageStats("all");
+    assert.equal(all.range, "all");
+    assert.equal(all.daily.length, 20, "all 必须覆盖全部 20 天，不做窗口裁剪");
+    assert.deepEqual(
+      all.daily.map((d) => d.date),
+      [...all.daily.map((d) => d.date)].sort(),
+      "daily 必须按日期升序",
+    );
+    assert.equal(all.totals.tokens, 200, "20 天 × 10 tokens 全计入");
+    const seven = computeUsageStats("7d");
+    assert.equal(seven.daily.length, 7, "同数据下 7d 只裁 7 天");
+  });
+
+  it("读失败（partial）的日期不进缓存：文件恢复后重算立即可见", () => {
+    resetUsageCache();
+    const date = dateOffset(1);
+    // success.log 是个目录：readFileSync 抛 EISDIR → 该文件被跳过 → 聚合残缺
+    mkdirSync(join(paths.logsDir(), "access", date, "success.log"), { recursive: true });
+    let stats = computeUsageStats("all");
+    assert.equal(stats.totals.tokens, 0, "唯一文件读失败，聚合为空");
+    // 修好文件：若残缺结果被缓存过，这里将永远读到 0
+    rmSync(join(paths.logsDir(), "access", date, "success.log"), { recursive: true, force: true });
+    writeDay(date, [modelEntry(date, "a/b", { prompt: 100, completion: 0 })]);
+    stats = computeUsageStats("all");
+    assert.equal(stats.totals.tokens, 100, "partial 结果不得进缓存，修复后必须重算");
+  });
+
   it("缓存命中率：无缓存字段的请求不进分母（全无字段时为 null）", () => {
     resetUsageCache();
     const today = dateOffset(0);
@@ -188,6 +240,32 @@ describe("computeUsageStats", () => {
    *   2. 平均 TPS 只算**成功且算得出速率**的样本：算不出的（生成窗口低于下限）不进分母；
    *   3. `noUsage` 按 `tokens === null` 数，与日志页同一判据。
    */
+  it("账号维度：今日 tokens 按访问日志的 key 归集（账本没有 tokens，只能从日志来）", () => {
+    resetUsageCache();
+    const today = dateOffset(0);
+    writeDay(today, [
+      modelEntry(today, "loomy/a", { prompt: 100, completion: 50 }, { key: "acc-1" }),
+      modelEntry(today, "loomy/a", { prompt: 200, completion: 100 }, { key: "acc-1" }),
+      modelEntry(today, "workbuddy/b", { prompt: 10, completion: 5 }, { key: "acc-2" }),
+      // 没有 key 的请求（登录前 / 健康检查）不进账号汇总
+      modelEntry(today, "loomy/a", { prompt: 999, completion: 999 }),
+    ]);
+    const stats = computeUsageStats("7d");
+    assert.deepEqual(
+      stats.accounts.map((a) => [a.key, a.tokens, a.requests]).sort(),
+      [
+        ["acc-1", 450, 2],
+        ["acc-2", 15, 1],
+      ],
+    );
+  });
+
+  it("当天没有请求时账号维度是空数组（没消耗就是没消耗）", () => {
+    resetUsageCache();
+    const stats = computeUsageStats("7d");
+    assert.deepEqual(stats.accounts, []);
+  });
+
   it("逐模型健康度：成功 / 失败分桶、排队计数、平均 TPS 只取可信样本", () => {
     resetUsageCache();
     const today = dateOffset(0);
@@ -210,7 +288,8 @@ describe("computeUsageStats", () => {
           ts: `${today}T03:00:00.000Z`,
           method: "POST",
           path: "/v1/chat/completions",
-          model: "loomy/b",
+          cid: "loomy",
+          model: "b",
           status: 502,
           durationMs: 300,
         },
@@ -230,6 +309,7 @@ describe("computeUsageStats", () => {
     assert.equal(b?.ok, 0);
     assert.equal(b?.fail, 1, "全失败的模型也要出现在 models 里");
     assert.equal(b?.avgTps, null, "没有成功样本就没有速率");
+    assert.equal(Math.round(stats.totals.avgTps ?? 0), 77, "区间总均值与逐模型同一批样本");
     assert.equal(stats.totals.noUsage, 1, "失败那条没有 usage");
   });
 });

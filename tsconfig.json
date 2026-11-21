@@ -2,22 +2,16 @@
   "files": [],
   "references": [
     {
-      "path": "packages/core/channels/astudio"
-    },
-    {
       "path": "packages/core/channels/catpaw"
     },
     {
-      "path": "packages/core/channels/lobsterai"
+      "path": "packages/core/channels/codebuddycn"
     },
     {
       "path": "packages/core/channels/loomy"
     },
     {
-      "path": "packages/core/channels/qoder"
-    },
-    {
-      "path": "packages/core/channels/qodercn"
+      "path": "packages/core/channels/qwenworkcn"
     },
     {
       "path": "packages/core/channels/raccoon"
@@ -27,9 +21,6 @@
     },
     {
       "path": "packages/core/channels/workbuddy"
-    },
-    {
-      "path": "packages/core/channels/workbuddyai"
     },
     {
       "path": "packages/cli"

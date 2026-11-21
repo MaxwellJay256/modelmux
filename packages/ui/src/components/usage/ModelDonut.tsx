@@ -4,9 +4,9 @@
  * 分片规则（ZCode 的 `Xt()` 同逻辑）：**最多 6 个扇形**；模型数 > 6 时取
  * **前 5 个 + 「其他模型」**（剩余的 tokens 累加成一片）。
  *
- * 交互是 **hover**（主人明确要求对齐 ZCode）：悬停的扇形高亮、其余淡出，浮层显示
- * 色点 + 模型名 + tokens + 占比；**点击不触发任何逻辑**。图例列表常驻显示全部数值
- * （正文信息不依赖 hover）。
+ * 交互是 **hover**：浮层显示色点 + 模型名 + tokens + 占比，悬停的**图例行**高亮；
+ * 扇形**颜色不变** —— 在右侧图例上划过时左侧整片忽明忽暗，比「有反馈」更像故障。
+ * **点击不触发任何逻辑**。图例列表常驻显示全部数值（正文信息不依赖 hover）。
  *
  * 环形用 `stroke-dasharray` 画（每段一个 `<circle>`），不引图表库。
  */
@@ -15,8 +15,8 @@ import { useState, type ReactElement } from "react";
 
 import { formatTokens } from "../../lib/log-format";
 import type { UsageModelRow } from "../../lib/types";
+import { seriesClassOf } from "../../lib/trend-series";
 import { ChartTooltip } from "./ChartTooltip";
-import { seriesClassOf } from "./TrendChart";
 
 const R = 60;
 const CIRC = 2 * Math.PI * R;
@@ -96,7 +96,9 @@ export function ModelDonut({ models }: { models: UsageModelRow[] }): ReactElemen
               fill="none"
               strokeWidth={22}
               stroke="currentColor"
-              className={`cursor-default ${seriesClassOf(a.index)} ${hoverId !== null && hoverId !== a.id ? "opacity-30" : ""}`}
+              /* 悬停**不改环的颜色**：在右侧图例上划过时，左侧圆环整片忽明忽暗地
+                 闪一下，比「有反馈」更像故障。图例行自己会亮，那已经够了。 */
+              className={`cursor-default ${seriesClassOf(a.index)}`}
               strokeDasharray={`${(a.frac * CIRC).toFixed(2)} ${CIRC.toFixed(2)}`}
               strokeDashoffset={(-a.offset * CIRC).toFixed(2)}
               transform="rotate(-90)"

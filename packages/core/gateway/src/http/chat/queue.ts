@@ -2,13 +2,12 @@
  * 排队探测：响应头发出前的排队帧探测，以及探测/排队的重试预算常量。
  *
  * 关键约束：
- *   - `consumeQueueProbe` 只消费上游流、**本身不向客户端写任何字节**；
- *     排队期间的进度文案由调用方（`attempt.ts` 的 `runQueueProbe`）在等待间隙发
+ *   - `consumeQueueProbe` 只消费上游流、**本身不向客户端写任何字节**
  *   - 探测消费掉的帧**一个都不能丢**：按原序交回转发层
  *   - 探测与转发必须复用**同一个翻译器实例**（行缓冲里可能还剩半行）
  *
- * 铁律：只在响应头发出前调用本模块的探测入口；进度文案只在「已决定继续排队
- * 重试」之后发（那一刻起已承诺 200 + SSE，写出不会破坏重试语义）。
+ * 铁律：只在响应头发出前调用本模块的探测入口 —— 一旦响应头写出（排队探测成功后
+ * 会写 200 + SSE），换候选重试就不可能了。
  */
 
 import { type Channel, type Credential, type StreamTranslator } from "../../runtime/channel.js";
@@ -16,41 +15,25 @@ import { inChannel } from "./channel.js";
 import { asBuffer } from "./stream.js";
 
 /**
- * 排队重试：单帧退避上限（上游给的 retryAfterSeconds 超过它就按这个等）。
+ * 探测层瞬时失败（上游 200 后零字节 / 流被上游掐断）的**同渠道重试**次数与退避基数。
  *
- * 取 12s：进度文案按轮次下发，间隔太密会让客户端把多条文案挤进同一屏
- * （实测 10s 间隔下 ZCode 每轮都弹同一条「正在加载」提示）。
- */
-export const QUEUE_RETRY_MAX_DELAY_MS = 12_000;
-
-/**
- * 排队重试：整个请求的总时长上限（含首次尝试与所有等待），毫秒。
+ * 默认 **0 次**：一次失败立即把控制权交回编排层，由它换账号（同渠道另一账号）
+ * 或换渠道（同模型另一家）。池里通常有多个渠道与多份账号，在同一条候选上干等
+ * 45 秒（15s + 30s 两轮）比换一家更慢 —— 2026-11-08 实测用户能看到请求失败后
+ * 网关仍在原地重试。
  *
- * 超过就不再干等，直接把「劝主人换渠道」的文案作为**正常应答**返回 ——
- * 实测（2026-10-25）qoder 排队能拖到 290s，而客户端 60s 就超时走人了，
- * 等下去只是白耗；上游改排队机制后需重测。
- * 取 120 秒：比客户端超时宽裕，又不会让一次请求挂太久。
- * 可用 `MODELMUX_QUEUE_BUDGET_MS` 覆盖（测试与运维调参用）。
- *
- * 做成函数而不是常量：测试要能在运行时改这个上限，常量在模块加载时就定死了。
- */
-export function queueBudgetMs(): number {
-  const raw = process.env["MODELMUX_QUEUE_BUDGET_MS"];
-  if (!raw) return 120_000;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
-}
-
-/**
- * 探测层瞬时失败（上游 200 后零字节 / 流被上游掐断）的**同渠道快速重试**次数与退避基数。
- *
- * 上游对「已收下又立刻断流」的请求是**瞬时态**（同形态请求时而秒级出字、时而断流），
- * 重试通常即恢复（实测：同 body 重放 0s/3s/10s/20s 全部成功）。退避取 15s 是
- * 与实测成功样本对齐的保守值 —— 太短（<3s）时上游仍会掐断连接。
+ * 退避基数保留：`MODELMUX_PROBE_RETRY_MAX` 显式调大时才用到（上游普遍恶劣、
+ * 池里只剩一家的部署可以调回 2）。
  * 空闲超时不重试：那已经等满渠道声明的静默上限，客户端早已等不及，重试只会拖长失败。
  */
-export const PROBE_RETRY_MAX = 2;
 export const PROBE_RETRY_BASE_MS = 15_000;
+
+/** 同渠道重试上限：默认 0；`MODELMUX_PROBE_RETRY_MAX` 可调回旧行为（最多 2 次）。 */
+export const PROBE_RETRY_MAX = ((): number => {
+  const raw = process.env["MODELMUX_PROBE_RETRY_MAX"];
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+})();
 
 /**
  * `cred.load()` 的安全包装：**未登录**返回 null（排队重开上游时用）。
@@ -77,8 +60,6 @@ export type ProbeFrames = Buffer[];
 export interface QueueProbe {
   /** 流内是否出现排队帧（渠道 isQueueError 判定）。 */
   queued: boolean;
-  /** 上游建议的等待秒数（从排队帧解析；没有就不给）。 */
-  delayMs?: number;
   /**
    * 探测消费掉、必须交回调用方**按原序**转发的帧（内容帧 + 非排队错误帧）。
    * 一个都不能丢 —— 吞掉就是流中缺段、非流式空响应（见本文件「排队探测」注释）。
@@ -87,7 +68,6 @@ export interface QueueProbe {
   /** 是否已见到内容帧（见到 = 响应是真实的，排队重试必须停）。 */
   hasContent: boolean;
   /** 排队帧里解析到的 retryAfterSeconds 原文（日志用）。 */
-  rawDelaySec?: number;
   /**
    * 探测用的翻译器实例。**必须与转发层用的是同一个实例**：
    * 它的行缓冲里可能还剩**半行**（跨 TCP 块的帧前缀），
@@ -150,12 +130,7 @@ export async function consumeQueueProbe(
     if (channel.upstream.isQueueError?.(payload)) {
       probe.queued = true;
       const errObj = payload["error"] as { code?: unknown; message?: unknown } | undefined;
-      const m = /retryAfterSeconds\D+(\d+)/i.exec(String(errObj?.message ?? ""));
-      if (m) {
-        const sec = Number.parseInt(m[1]!, 10);
-        probe.rawDelaySec = sec;
-        probe.delayMs = Math.max(1_000, sec * 1000);
-      }
+      void errObj; // 排队帧的错误体不再解析：retryAfterSeconds 只在日志原文里可见
       // 排队帧**就是这条流的最后一帧**（实测：发出排队帧后连接保持但彻底静默，
       // 上游期望客户端按 retryAfterSeconds 等待后重开新请求）。继续读 = 死锁到空闲
       // abort（undici 报 terminated）；立即返回，交调用方的「等待 → 重开」重试循环接管。

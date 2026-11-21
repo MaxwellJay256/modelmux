@@ -2,9 +2,8 @@
  * 账号池页：各渠道凭据、账号列表与额度，支持添加账号（登录弹窗）与账号切换。
  */
 
-import { type ReactElement, useEffect, useRef, useState } from "react";
+import { type ReactElement, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { RotateCw } from "lucide-react";
 import { api } from "../lib/api";
 import {
   AccountCard,
@@ -13,9 +12,15 @@ import {
   type ChannelBilling,
   type AccountStatus,
 } from "../components/AccountCard";
+import type { QuotaPeriod } from "../lib/account-status";
 import { LoginModal } from "../components/LoginModal";
+import { buildModelRows, ModelRows } from "../components/ModelListCard";
 import { PageHeader } from "../components/PageHeader";
+import { useRefreshInterval } from "../lib/refresh-interval";
+import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
+import { columnCount, distributeByColumns } from "../lib/card-columns";
+import { errorText } from "../lib/log-format";
 import { Skeleton } from "./Dashboard";
 
 interface StatusRow {
@@ -36,6 +41,8 @@ interface BillingRow {
     unsupported?: boolean;
     ok?: number;
     fail?: number;
+    /** 额度周期（渠道声明）：`size` 是窗口发放量，判断基线是否错过窗口起点用。 */
+    quota?: QuotaPeriod | null;
     accounts?: Array<{
       key: string;
       ok: number;
@@ -80,13 +87,18 @@ export function Accounts(): ReactElement {
   /** 本轮弹窗的成功是否已处理，避免重复刷新。 */
   const handledSuccessRef = useRef(false);
 
+  /** 账号池主数据的自动刷新节奏（设置页可调，最小 10s）。 */
+  const { interval: accountsInterval } = useRefreshInterval("accounts");
   const pools = useQuery({
     queryKey: ["accounts"],
     queryFn: async () => {
       const res = (await api.commands.accounts()) as { channels?: AccountPool[] };
       return res.channels ?? [];
     },
-    refetchInterval: 15_000,
+    refetchInterval: accountsInterval,
+    staleTime: accountsInterval,
+    // 再进页面先出上一次的数据（轮询间隔内数据没变的话，等一轮没有意义）
+    placeholderData: (prev) => prev,
   });
   const logins = useQuery({
     queryKey: ["logins"],
@@ -94,7 +106,9 @@ export function Accounts(): ReactElement {
       const res = (await api.commands.status()) as { channels?: StatusRow[] };
       return res.channels ?? [];
     },
-    refetchInterval: 10_000,
+    refetchInterval: accountsInterval,
+    staleTime: accountsInterval,
+    placeholderData: (prev) => prev,
   });
   const billing = useQuery({
     queryKey: ["billing"],
@@ -110,6 +124,8 @@ export function Accounts(): ReactElement {
       return res.rows ?? [];
     },
     refetchInterval: 60_000,
+    staleTime: 60_000,
+    placeholderData: (prev) => prev,
   });
   /**
    * 账单的加载 / 失败态：卡片据此渲染**骨架**而不是「未查到」。
@@ -120,6 +136,21 @@ export function Accounts(): ReactElement {
    */
   const billingLoading = billing.isPending;
   const billingError = billing.isError;
+  /**
+   * 账号维度用量（今日 tokens）：`usage?range=7d` 的 `accounts[]` 只含**今天**，
+   * 与账号行的「今日消耗」同口径。60 秒一轮（日志逐日聚合，历史日有缓存）。
+   */
+  const usageQuery = useQuery({
+    queryKey: ["usage", "7d"],
+    queryFn: () => api.usage("7d"),
+    refetchInterval: 60_000,
+    staleTime: 60_000,
+    placeholderData: (prev) => prev,
+  });
+  const tokensByKey = useMemo(
+    () => new Map((usageQuery.data?.accounts ?? []).map((row) => [row.key, row.tokens])),
+    [usageQuery.data],
+  );
   /** 全局时钟：新鲜度文案要随时间走（否则数据不变时秒数永远停在第一次渲染）。 */
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -144,7 +175,7 @@ export function Accounts(): ReactElement {
   const startLogin = useMutation({
     // 添加账号 = 强制新授权（已有凭据/被标记 error 时也要拿到新的授权链接）
     mutationFn: async (cid: string) => await api.commands.login(cid, true),
-    onError: (err) => toast.error(String(err)),
+    onError: (err) => toast.error(errorText(err)),
     // 立刻拉一次 state：后端的 triggerLogin 已同步清空旧状态，早拉早让弹窗
     // 看到干净的「准备中」，而不是等下一个 3 秒轮询周期。
     onSuccess: () => {
@@ -157,7 +188,7 @@ export function Accounts(): ReactElement {
       return await api.commands.activateAccount(cid, key);
     },
     onSuccess: () => invalidateAll(),
-    onError: (err) => toast.error(String(err)),
+    onError: (err) => toast.error(errorText(err)),
     onSettled: () => setBusyKey(null),
   });
   const remove = useMutation({
@@ -166,8 +197,27 @@ export function Accounts(): ReactElement {
       return await api.commands.removeAccount(cid, key);
     },
     onSuccess: () => invalidateAll(),
-    onError: (err) => toast.error(String(err)),
+    onError: (err) => toast.error(errorText(err)),
     onSettled: () => setBusyKey(null),
+  });
+  /**
+   * 模型级渠道偏好。
+   *
+   * 存的是用户意图（`<root>/model-prefs.json`），不是运行时状态 —— 改完立刻让
+   * 账号池与额度一起失效：卡片上的排序与「优先走哪家」会在下一轮反映新偏好。
+   */
+  const setPref = useMutation({
+    mutationFn: async ({ model, cid }: { model: string; cid: string }) =>
+      await api.commands.setModelChannel(model, cid),
+    onSuccess: () => {
+      // 必须一并失效**快照**：账号池/额度各自有独立的轮询，而快照只在登录弹窗
+      // 打开时才轮询（`enabled: loginChannel !== null`）—— 不失效的话用户选完
+      // 下拉，按钮还停在旧值（实测：后端已写入 traecn，界面仍显示 raccoon）。
+      void qc.invalidateQueries({ queryKey: ["state"] });
+      void qc.invalidateQueries({ queryKey: ["accounts"] });
+      void qc.invalidateQueries({ queryKey: ["billing"] });
+    },
+    onError: (err) => toast.error(errorText(err)),
   });
   /**
    * 两步登录的输入（如 loomy 的短信验证码）。
@@ -177,7 +227,7 @@ export function Accounts(): ReactElement {
    */
   const submitInput = useMutation({
     mutationFn: async (value: string) => await api.commands.submitInput(value),
-    onError: (err) => toast.error(String(err)),
+    onError: (err) => toast.error(errorText(err)),
   });
   /** 弹窗关闭：让后端别再等输入（否则渠道挂到超时）。 */
   const cancelInput = (): void => {
@@ -193,10 +243,14 @@ export function Accounts(): ReactElement {
       handledSuccessRef.current = false;
       return;
     }
-    const uiState = state.data?.ui_state;
-    if (!uiState) return;
-    // done 之前必须先见到别的状态 —— 否则那是上一次登录留下的结果
-    if (uiState !== "done") {
+    const snapshot = state.data;
+    if (!snapshot) return;
+    // 登录结果读 `login_result`（`ui_state` 只表示网关状态，已不承载 done/error）。
+    // 回落分支兼容还没升级的后端。
+    const result =
+      snapshot.login_result ?? (snapshot.ui_state === "done" ? "done" : snapshot.ui_state === "error" ? "error" : "idle");
+    // 先见到中间态（不是 done/error）才算「本轮真的在跑」—— 否则那是上一次登录留下的结果
+    if (result !== "done") {
       sawProgressRef.current = true;
       return;
     }
@@ -205,7 +259,7 @@ export function Accounts(): ReactElement {
     setLoginChannel(null);
     toast.success("登录成功，账号已入池。");
     invalidateAll();
-  }, [loginChannel, state.data?.ui_state]);
+  }, [loginChannel, state.data?.login_result, state.data?.ui_state]);
 
   // 合并三路数据：账号池 + 登录状态 + 渠道账本（都按 cid 对齐）
   const statusMap = new Map((logins.data ?? []).map((r) => [r.cid, Boolean(r.present)]));
@@ -227,6 +281,8 @@ export function Accounts(): ReactElement {
         unsupported: Boolean(c.unsupported),
         accounts: c.accounts ?? [],
         billing_at: null,
+        // 窗口发放量随行带下来：额度详情要用它判断基线是否错过了窗口起点
+        quota: c.quota ?? null,
       });
     }
   }
@@ -254,31 +310,57 @@ export function Accounts(): ReactElement {
 
   const loginChannels = logins.data ?? [];
   const snapshot = state.data;
+  /** 模型级渠道偏好（下拉的选项与选中项都来自快照，后端 5 秒一轮）。 */
+  const modelPrefs = snapshot?.model_prefs ?? [];
+  // 对外模型清单：与仪表盘原「模型列表」卡同口径（state 快照的 meta + 7 日 usage 的 TPS）
+  const modelRows = useMemo(
+    () => buildModelRows(snapshot?.models, usageQuery.data?.models),
+    [snapshot, usageQuery.data],
+  );
+
+  /**
+   * 卡片列数（容器实测宽 → `columnCount`）；`ResizeObserver` 跟随窗口/侧栏变化。
+   * 初值 1：首帧按 1 列渲染不会溢出，下一帧量到真实宽度就切到 N 列。
+   */
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const [columnTotal, setColumnTotal] = useState(1);
+  useEffect(() => {
+    const el = gridRef.current;
+    if (!el) return;
+    const measure = (): void => {
+      // `clientWidth` 已扣掉内边距与滚动条，正是可分配给列的内容宽
+      setColumnTotal(columnCount(el.clientWidth));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [list.length]);
+  /** 按列分发后的卡片（列内自上而下、列间从左到右）。 */
+  const columns = distributeByColumns(list, columnTotal);
 
   return (
     <div className="space-y-5 pb-10">
-      <PageHeader
-        title="账号池"
-        description="各渠道的凭据、账号池与额度"
-        actions={
+      <PageHeader title="账号池" description="各渠道的凭据与额度" />
+
+      {/*
+        三态分开渲染：加载中 / **查询失败** / 确实没有账号池。
+        此前只有「loading 或 空串」，于是命令失败（HTTP 400，`post()` 抛错）与
+        「真的没有池」渲染成同一句「先添加账号」—— 良性空态把排查入口整个盖掉了
+        （同文件的 `billing` 查询专门为这个理由加了 `isError` 守卫，这里漏了）。
+      */}
+      {pools.isError && list.length === 0 ? (
+        <div className="rounded-xl border border-line p-5 text-sm">
+          <p className="text-danger">账号池查询失败：{errorText(pools.error)}</p>
           <button
             type="button"
-            onClick={() => {
-              // 四路查询一起失效：卡片 / 登录态 / 额度 / 弹窗快照本来就是同一批事实
-              void qc.invalidateQueries({ queryKey: ["accounts"] });
-              void qc.invalidateQueries({ queryKey: ["logins"] });
-              void qc.invalidateQueries({ queryKey: ["billing"] });
-              void qc.invalidateQueries({ queryKey: ["state"] });
-            }}
-            className="tap flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink-soft transition-colors hover:border-line-strong hover:text-ink"
+            onClick={() => void pools.refetch()}
+            className="tap mt-3 rounded-lg border border-line-strong bg-overlay px-3 py-1.5 text-xs text-ink transition-colors hover:border-brand/50"
           >
-            <RotateCw className="h-3.5 w-3.5" />
-            刷新
+            重试
           </button>
-        }
-      />
-
-      {list.length === 0 ? (
+        </div>
+      ) : list.length === 0 ? (
         <div className="rounded-xl border border-line p-5 text-sm text-ink-faint">
           {pools.isLoading ? <Skeleton /> : "（无渠道账号池；先添加账号）"}
         </div>
@@ -307,31 +389,96 @@ export function Accounts(): ReactElement {
           </div>
 
           {/*
-            渠道卡网格：**各卡按自身内容取高**（`items-start`，不再同行拉伸）。
+            模型级渠道偏好：只渲染**多渠道供给**的模型（覆盖范围由服务端家族表的
+            `PREFS_CANONICALS` 决定；收窄到唯一渠道的模型没有偏好语义，UI 不显示、
+            选路默认走它）。
+            被偏好的渠道在选路里**置顶**，其余仍按剩余额度顺延 —— 被偏好的渠道
+            冷却 / 额度耗尽时自然落到别家，不需要额外开关（口径见
+            docs/POOL-ARCHITECTURE.md §2.4）。
 
-            不等高的理由：账号数差异大时（1 个 vs 5 个），
-            同行拉伸会让只有 1 个账号的卡被撑到与 5 个账号一样高，卡内出现大片空白，
-            整页看起来「布局坏了」。改为自然高度后，每张卡都是紧凑的，代价是行尾参差
-            —— 对「账号数本来就不齐」的列表，这个代价明显更小。
-
-            自适应列数：卡片最小宽 340px，空间够就自然多列，不写死断点。
-            `min(340px, 100%)` 是必要的收口：视口比 340px + 内边距还窄时（实测 360 视口），
-            写死 340px 的轨道会把 `main` 顶出 6px 横向滚动。
+            段落**恒渲染**：模型清单由服务端从家族表派生（不再依赖 `/v1/models`
+            的轮询结果），刚起进程 / 上游抖动时也不会整段消失，用户始终有处设置。
           */}
-          <div className="grid items-start gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(min(340px, 100%), 1fr))" }}>
-            {list.map(({ pool, billing: bill }) => (
-              <AccountCard
-                key={pool.cid}
-                pool={pool}
-                billing={bill}
-                billingLoading={billingLoading}
-                billingError={billingError}
-                now={now}
-                onActivate={(cid, key) => activate.mutate({ cid, key })}
-                onRemove={(cid, key) => remove.mutate({ cid, key })}
-                onAdd={(cid) => setLoginChannel(cid)}
-                busyKey={busyKey}
-              />
+          {/* 渠道偏好（左）+ 对外模型清单（右）一排两卡：偏好管「走哪家」，清单管「对外有什么」。
+              `lg` 起两卡**等宽 + 等高**（grid 默认 stretch）：清单只有两行内容，
+              吃掉剩余宽度时行内右侧空一大片；偏好卡被压到 264px 时模型名与下拉挤在一起。
+              等宽后两卡都不空旷，上下边缘也对齐。 */}
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <section className="panel p-3 min-w-0">
+            <h2 className="mb-2 text-xs font-medium text-ink-soft">渠道偏好</h2>
+            <div className="flex flex-col gap-2">
+              {modelPrefs.map((pref) => (
+                // 一个模型一行：「模型 → 偏好渠道」横着读，flex 两端对齐。
+                // 为什么不再分桌面/窄屏两套排布：此前桌面 176px 定列居中、窄屏两列网格
+                // 左对齐，模型名与下拉的对齐靠分支逻辑撑着，每加一档断点就错位一次
+                // （2026-11-14 实拍）；单行两端全档位同构，多模型按行自动扩展。
+                <div key={pref.model} className="flex items-center gap-3">
+                  <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{pref.model}</span>
+                  {/* 下拉定宽靠右（fixedWidth 按最长渠道名量宽）：切换选项时按钮不位移，
+                      名称截断让位；nowrap 防文字折行把高度顶高 */}
+                  <div className="flex-none [&_button]:whitespace-nowrap">
+                    <Select
+                      value={pref.preferred ?? ""}
+                      onChange={(cid) => setPref.mutate({ model: pref.model, cid })}
+                      label={`模型 ${pref.model} 优先渠道`}
+                      fixedWidth
+                      options={[
+                        { value: "", label: "自动" },
+                        ...pref.channels.map((cid) => ({ value: cid, label: cid })),
+                      ]}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            {modelPrefs.every((pref) => pref.channels.length === 0) && (
+              <p className="mt-2 text-xs text-ink-faint">
+                池里暂无可路由的模型：先添加账号，或检查渠道是否已登录。
+              </p>
+            )}
+          </section>
+            <section className="panel p-3 min-w-0">
+              <h2 className="mb-2 text-xs font-medium text-ink-soft">模型清单</h2>
+              <ModelRows rows={modelRows} />
+            </section>
+          </div>
+
+          {/*
+          {/*
+            渠道卡按**列**分发（瀑布流），不用 CSS Grid 的自动多列。
+
+            为什么换：网格的行轨道高度 = 行内最高那张卡，一张卡展开就在同行另两张下方
+            顶出一大片空白（实测展开 loomy 后该行 275px、另两张 140px，留 135px 白带）。
+            `items-start` 只阻止卡片被拉伸，治不了行高。改成「算列数 → 轮询分发」后，
+            每列是独立纵向流，任何一张卡长高只把**同一列**下面的卡往下推，没有白带。
+
+            列数按容器实测宽算（`columnCount`，单卡最小 340px）：不写死断点，
+            `< 340px + 内边距` 时收敛成 1 列（360 视口不会被顶出横向滚动）。
+          */}
+          <div ref={gridRef} className="flex items-start gap-3">
+            {columns.map((column, columnIndex) => (
+              <div key={columnIndex} className="flex min-w-0 flex-1 flex-col gap-3">
+                {column.map(({ pool, billing: bill }) => (
+                  <AccountCard
+                    key={pool.cid}
+                    pool={pool}
+                    billing={bill}
+                    billingLoading={billingLoading}
+                    billingError={billingError}
+                    now={now}
+                    tokensOf={(key) => {
+                      // 数据还没到时返回 undefined（不渲染，避免把「没取到」显示成 0）；
+                      // 取到之后没有记录 = 今天确实没消耗，如实显示 0
+                      if (usageQuery.data === undefined) return undefined;
+                      return tokensByKey.get(key) ?? 0;
+                    }}
+                    onActivate={(cid, key) => activate.mutate({ cid, key })}
+                    onRemove={(cid, key) => remove.mutate({ cid, key })}
+                    onAdd={(cid) => setLoginChannel(cid)}
+                    busyKey={busyKey}
+                  />
+                ))}
+              </div>
             ))}
           </div>
         </>

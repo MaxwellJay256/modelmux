@@ -1,0 +1,58 @@
+{
+  "name": "modelmux-desktop",
+  "version": "0.1.5",
+  "private": true,
+  "description": "modelmux Windows 桌面壳（Electron）：自启网关 + 内嵌 Web 控制台",
+  "author": "bluechonk",
+  "main": "main.cjs",
+  "scripts": {
+    "pack": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "43.8.7",
+    "electron-builder": "25.1.8",
+    "rcedit": "^5.0.2"
+  },
+  "build": {
+    "appId": "com.bluechonk.modelmux",
+    "productName": "modelmux",
+    "afterPack": "./after-pack.cjs",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "app/**/*",
+      "assets/**/*"
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "modelmux",
+      "artifactName": "modelmux-setup-${version}.${ext}",
+      "uninstallDisplayName": "modelmux",
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": null
+  }
+}

@@ -13,15 +13,15 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { channelCount, channelFor, channels, getChannel, type Channel, type Credential, type StreamTranslator, type UpstreamConfig } from "../runtime/channel.js";
-import { runInChannel } from "../runtime/channel-context.js";
-import { poolCandidates } from "../pool/pool-targets.js";
+import { channelCount, channelFor, channels, type UpstreamConfig } from "../runtime/channel.js";
 import { ensureCatalog } from "../pool/catalog-snapshot.js";
+import { POOL_EXPOSED_IDS, ownerOf } from "../pool/model-family.js";
+import { loadModelRegistry } from "../pool/model-registry.js";
 import { inChannel } from "./chat/channel.js";
 import { baseUrlOf, bindFreeServer, displayBase } from "./portfree.js";
-import { handleChat } from "./chat/relay.js";
+import { handleChat, handleCountTokens, handleMessages, handleResponses } from "./chat/relay.js";
 import { writeJson, writeJsonError } from "./chat/errors.js";
-import { attachRequestLog, noteRequestError } from "../runtime/log-store.js";
+import { attachRequestLog, noteRequestDetail, noteRequestUa } from "../runtime/log-store.js";
 
 /**
  * 服务标识：出现在 `/health` 应答里。
@@ -71,19 +71,48 @@ export interface GatewayOptions {
 
 
 function handleModels(res: ServerResponse): void {
-  // 数据源是统一快照（docs/MODEL-CATALOG.md）：读文件而非每次实时聚合；
-  // 快照缺失时 ensureCatalog() 生成一次并落盘。
-  const catalog = ensureCatalog();
+  // 数据源是**统一模型注册表**（`<root>/models.json`）：读文件即返回，不再聚合渠道目录。
+  // 规格是产品声明（见 docs/CONTRACT-TS.md §4.1）；每请求读一次盘（几 KB）换「改完立即生效」。
+  const { registry, source, error } = loadModelRegistry();
+  const generatedAt = new Date().toISOString();
+  const entries = POOL_EXPOSED_IDS.filter((id) => registry.models[id] !== undefined).map((id) => {
+    const row = registry.models[id]!;
+    return {
+      id,
+      name: id,
+      object: "model",
+      // Anthropic 形态补充：Claude Code 的模型发现按它解析，缺了选择器只剩「默认模型」
+      type: "model",
+      owned_by: ownerOf(id),
+      display_name: id,
+      created_at: generatedAt,
+      context_window: row.contextWindow,
+      max_output_tokens: row.maxOutput,
+      input_modalities: row.inputModalities,
+      output_modalities: ["text"],
+      effort: null,
+      multiplier: null,
+      marketing: "",
+      // `registry` = 来自 `models.json` 的声明值（不再是上游实时探测值）
+      meta_sources: {
+        context_window: "registry",
+        max_output_tokens: "registry",
+        effort: "default",
+      },
+    };
+  });
   writeJson(res, {
     object: "list",
     // 扩展字段：客户端据此判断目录新鲜度（官方 GET /models 没有）
-    generated_at: catalog.generated_at,
-    // 字段结构对齐 DeepSeek 官方 `GET /models`：
-    // 没有 `created`，`name` 与 `id` 一致（同为 `<cid>/<模型>` 池形态），
-    // 并带上上下文 / 最大输出 / 模态 / 思考档位。
-    // `effort` 可为 null：渠道目录没声明思考档位。
-    // `meta_sources` 是扩展字段：逐项说明真值来自上游 / 规格文件 / 联网搜索 / 跨渠道 / 占位值。
-    data: Object.values(catalog.models).map((entry) => ({ ...entry, object: "model" })),
+    generated_at: generatedAt,
+    // 注册表读不到时如实告知，但仍返回内置默认表的内容（不让客户端看到空列表）
+    registry_source: source,
+    ...(error === undefined ? {} : { registry_error: error }),
+    data: entries,
+    // Anthropic 分页信封：单页全量，恒 has_more=false
+    has_more: false,
+    first_id: entries[0]?.id ?? null,
+    last_id: entries.at(-1)?.id ?? null,
   });
 }
 
@@ -129,10 +158,17 @@ function handleHealth(res: ServerResponse): void {
 }
 
 
-export const ENDPOINTS = ["/v1/chat/completions", "/v1/models", "/health"];
+export const ENDPOINTS = [
+  "/v1/chat/completions",
+  "/v1/messages",
+  "/v1/messages/count_tokens",
+  "/v1/responses",
+  "/v1/models",
+  "/health",
+];
 
 
-function handleRoot(res: ServerResponse, path: string): void {
+function handleRoot(req: IncomingMessage, res: ServerResponse, path: string): void {
   if (path === "/") {
     const list = channels();
     writeJson(res, {
@@ -143,6 +179,8 @@ function handleRoot(res: ServerResponse, path: string): void {
     });
     return;
   }
+  // 未知路径：把 UA 记下来，下一次幽灵探针（`HEAD /api/hello` 之类）就能认领来源
+  noteRequestUa(res, req.headers["user-agent"]);
   writeJsonError(res, 404, "not_found", `unknown path ${path}`);
 }
 
@@ -157,7 +195,20 @@ export function createHandler(opts: GatewayOptions = {}) {
   };
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    // 畸形 request-target（如 `GET //[`）会让 `new URL()` 抛 `ERR_INVALID_URL`。
+    // 这个解析必须在 try 之外完成（日志与路由都要用 path），所以它自己兜住并回 400 ——
+    // 否则异常会变成 unhandled rejection，Node 直接**终止进程**（实测：整个网关掉线，
+    // 该请求连一个字节的响应都没有）。
+    let path: string;
+    try {
+      path = new URL(req.url ?? "/", "http://localhost").pathname;
+    } catch {
+      if (!res.headersSent) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid request target" }));
+      }
+      return;
+    }
     // 控制台静态资源不记访问日志（噪音大）；API / 健康检查 / 根路径都记
     const consolePath = opts.console !== undefined &&
       (path === options.consolePrefix || path.startsWith(`${options.consolePrefix}/`));
@@ -181,6 +232,20 @@ export function createHandler(opts: GatewayOptions = {}) {
         await handleChat(req, res, options);
         return;
       }
+      // 协议入站：Anthropic Messages（Claude Code）与 OpenAI Responses（Codex）——
+      // 请求翻译成内部 chat 形态后复用同一条转发管线，回程按协议编码
+      if (path === "/v1/messages") {
+        await handleMessages(req, res, options);
+        return;
+      }
+      if (path === "/v1/messages/count_tokens") {
+        await handleCountTokens(req, res);
+        return;
+      }
+      if (path === "/v1/responses") {
+        await handleResponses(req, res, options);
+        return;
+      }
       if (path === "/v1/models") {
         if (req.method !== "GET") {
           writeJsonError(res, 405, "method_not_allowed", "use GET");
@@ -193,9 +258,10 @@ export function createHandler(opts: GatewayOptions = {}) {
         handleHealth(res);
         return;
       }
-      handleRoot(res, path);
+      handleRoot(req, res, path);
     } catch (err) {
-      noteRequestError(res, "internal_error", String(err));
+      // 异常详情走 detail 字段（`message` 随后会被 writeJsonError 写成给客户端的通用文案）
+      noteRequestDetail(res, String(err));
       options.logger(`request handler error: ${String(err)}`);
       if (!res.headersSent) {
         writeJsonError(res, 500, "internal_error", "gateway internal error; see logs");
@@ -218,7 +284,18 @@ export interface RunningGateway {
 export function makeApp(opts: GatewayOptions = {}): Server {
   const handler = createHandler(opts);
   return createServer((req, res) => {
-    void handler(req, res);
+    // handler 是 async：`void` 丢弃返回的 Promise，一旦它内部抛出未被 try 覆盖的异常，
+    // 就成了 unhandled rejection 并终止进程。handler 的第一段（URL 解析）已自带兜底，
+    // 这里再补一层，保证任何遗漏都只影响这一个请求。
+    void handler(req, res).catch((err: unknown) => {
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "gateway internal error" }));
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+      opts.logger?.(`request handler threw outside try: ${String(err)}`);
+    });
   });
 }
 
@@ -232,7 +309,16 @@ export async function start(addr: string, opts: GatewayOptions = {}): Promise<Ru
   const server = await bindFreeServer(host, port, logger);
   const handler = createHandler({ ...opts, logger });
   server.on("request", (req, res) => {
-    void handler(req, res);
+    // 与 makeApp 同口径：handler 抛到 try 之外的异常不能变成进程级的 unhandled rejection
+    void handler(req, res).catch((err: unknown) => {
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "gateway internal error" }));
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+      logger(`request handler threw outside try: ${String(err)}`);
+    });
   });
 
   const actualPort = (server.address() as { port: number } | null)?.port ?? port;

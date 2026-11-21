@@ -18,6 +18,7 @@ import { after, before, describe, it } from "node:test";
 
 import { readIndex, noteAccountQuotaExhausted, activateAccount, accountKey } from "../dist/runtime/account-pool.js";
 import { clearChannels, setChannel, type Channel, type ChannelConfig } from "../dist/runtime/channel.js";
+import { registerChannelSupply } from "./registry-seed.ts";
 import * as gateway from "../dist/http/server.js";
 import * as paths from "../dist/runtime/paths.js";
 import * as poolUsage from "../dist/pool/pool-usage.js";
@@ -95,11 +96,10 @@ function makeChannel(cid: string, upstreamUrl: string): Channel {
       newTranslator: () => ({ feed: (c: Buffer) => [c], finish: () => [] }),
     },
     catalog: {
-      // 付费模型：倍率不是 0 → 冷却期必须被挡住（免费模型才豁免冷却）
-      exposedIds: () => ["paid-model"],
+      // 付费模型：目录里查不到倍率（null）→ 按付费处理 → 冷却期必须被挡住
+      // （免费模型才豁免冷却）
+      exposedIds: () => ["deepseek-v4.1-flash"],
       resolveModel: (n: string) => n,
-      // 倍率查表：非 0 = 付费
-      rateOf: () => 0.5,
     },
     billing: {
       fetchCredits: async () => ({ ok: true, total: {}, packages: [] }),
@@ -138,13 +138,13 @@ function seedCoolingPool(): void {
   );
 }
 
-/** 发一次对话请求（池 id 带渠道前缀）。 */
+/** 发一次对话请求（对外模型是 deepseek 裸名）。 */
 async function chat(addr: string): Promise<{ status: number; text: string }> {
   const resp = await fetch(`http://${addr}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: `${CID}/paid-model`,
+      model: "deepseek-v4.1-flash",
       messages: [{ role: "user", content: "hi" }],
       stream: true,
     }),
@@ -162,6 +162,8 @@ describe("账号额度冷却：短路不计连败（2026-10-24 workbuddy 事故�
     savedRoot = process.env["MODELMUX_HOME"];
     root = mkdtempSync(join(tmpdir(), "modelmux-cooling-accounting-"));
     process.env["MODELMUX_HOME"] = root;
+  registerChannelSupply("synthcool", ["deepseek-v4.1-flash"]);
+
 
     upstream = await fakeUpstream();
     clearChannels();

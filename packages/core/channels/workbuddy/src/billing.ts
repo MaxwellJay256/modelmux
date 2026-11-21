@@ -291,28 +291,34 @@ async function dailyCheckin(): Promise<CheckinResult> {
   if (resp.status === 401 || resp.status === 403) {
     throw new cred.NotLoggedInError("daily checkin rejected the access token (401/403)");
   }
-  if (resp.status !== 200) throw new CreditsError(`daily checkin returned HTTP ${resp.status}`);
 
+  // 先解响应体、再看 HTTP 状态码：幂等的「今天已签到」上游走 **HTTP 400 + 业务码 10001**
+  // （PROTOCOL 实测）。按状态码先判会把这句拒绝当失败 —— 当日连败 3 次触发熔断，
+  // 台账也记不上「今天已签」，面板一直显示未签到（2026-11-15 实测）。
   let env: Record<string, unknown>;
   try {
     env = (await resp.json()) as Record<string, unknown>;
   } catch (err) {
-    throw new CreditsError(`daily checkin response is not valid JSON: ${String(err)}`);
+    throw new CreditsError(
+      `daily checkin response is not valid JSON (HTTP ${resp.status}): ${String(err)}`,
+    );
   }
   const code = env["code"];
   const msg = String(env["msg"] ?? "");
   if (code === 0) {
     return { checkedIn: true, already: false, message: "签到成功" };
   }
-  if (/already|已签|repeat|duplicate/i.test(msg)) {
+  // 10001 = 今天已签到（上游幂等拒绝，按成功回报）；文案串兜底防上游改措辞
+  if (code === 10001 || /already|已签|repeat|duplicate/i.test(msg)) {
     return { checkedIn: true, already: true, message: msg || "今天已签到" };
   }
+  if (resp.status !== 200) throw new CreditsError(`daily checkin returned HTTP ${resp.status}`);
   throw new CreditsError(describeBillingError(resp.status, env, resp.headers));
 }
 
 // ── 签到 / 领取能力（共享层 CLI 的 `<cid> checkin` 用；契约要求**每个渠道都提供**）──────
 
-import type { SigninModule } from "@modelmux/gateway";
+import type { QuotaPeriod, SigninModule } from "@modelmux/gateway";
 /**
  * 签到 / 领取能力（`<cid> checkin`）。
  *
@@ -324,11 +330,51 @@ export const signin: SigninModule = {
   async status() {
     return {
       claimable: true,
+      // 每日发放额是实测常量（见下方 DAILY_CHECKIN_CREDITS）：报出来让台账与界面直接用，
+      // 不再退到「跨窗口对比」那种最弱口径（界面会把它标成「估算」）
+      dailyReward: { amount: DAILY_CHECKIN_CREDITS, unit: "credits" },
       summary: "存在每日签到端点（/v2/billing/meter/daily-checkin，POST 空 body）",
     };
   },
   async claim() {
     const r = await dailyCheckin();
-    return { ok: true, summary: r.message };
+    return {
+      ok: true,
+      summary: r.message,
+      reward: { amount: DAILY_CHECKIN_CREDITS, unit: "credits" },
+    };
   },
 };
+
+// ── 额度周期（`BillingModule.quotaPeriod`，供共享层展示与冷却截止时间）────────
+
+/**
+ * 每日签到发放额（credits）。
+ *
+ * 依据（实测旁证，2026-11-07）：账单里 21 个「CodeBuddy个人版国内运营裂变包」**每个
+ * size 都是 100 credits**，即每日发放单位；当天已签（上游 `code=10001 今天已签到`）
+ * 量不到增量。上游**没有**「每日额度」查询字段，故用这个常量。
+ */
+const DAILY_CHECKIN_CREDITS = 100;
+
+/** 下一次**本机时区**的 0 点（epoch ms）。 */
+function nextLocalMidnight(now = Date.now()): number {
+  const d = new Date(now);
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
+}
+
+/**
+ * 额度周期：**每天签到送 100 credits**。
+ *
+ * `size` 报的是**每日发放额**，不是账户总额（后者是很多个权益包之和，
+ * 与「今天能领多少」无关）。
+ */
+export function quotaPeriod(): QuotaPeriod {
+  return {
+    label: "每天签到送 100 credits",
+    size: DAILY_CHECKIN_CREDITS,
+    unit: "credits",
+    resets_at: nextLocalMidnight(),
+  };
+}

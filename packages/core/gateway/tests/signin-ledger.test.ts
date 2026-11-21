@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -19,9 +19,14 @@ import {
   claimedTodayPerLedger,
   currentTimezone,
   dateInTimezone,
+  lastClaimOf,
   ledgerExists,
   readLedger,
   recordClaim,
+  recordProbe,
+  signinTodaySnapshot,
+  updateClaimReward,
+  updateClaimWindow,
   HISTORY_LIMIT,
 } from "../dist/auth/signin-ledger.js";
 
@@ -154,6 +159,7 @@ describe("4. 损坏容忍", () => {
   }));
 });
 
+
 describe("5. 按账号记录（签到按账号调度的门禁）", () => {
   it("账号级记录互不影响，渠道级视图同步更新", withRoot(() => {
     recordClaim(CID, { via: "auto", accountKey: "acct-1" });
@@ -197,5 +203,158 @@ describe("5. 按账号记录（签到按账号调度的门禁）", () => {
     const after = readLedger(CID);
     assert.equal(after.history.length, 2, "历史保留（新记录 + 旧记录）");
     assert.equal(claimedTodayForAccount(CID, "acct-x"), true);
+  }));
+});
+
+describe("6. signinTodaySnapshot：控制台的「今日签到」视图", () => {
+  it("渠道级 + 账号级一起给出，且与 claimedToday* 同一口径", withRoot(() => {
+    recordClaim(CID, { via: "auto", accountKey: "acct-1" });
+    const snap = signinTodaySnapshot(CID);
+    assert.equal(snap.today, dateInTimezone(new Date(), currentTimezone()));
+    assert.equal(snap.channel.claimed, true, "渠道级 last_claim 记着今天");
+    assert.equal(snap.accounts["acct-1"]?.claimed, true);
+    assert.equal(snap.accounts["acct-2"], undefined, "台账里没有的账号不出现（前端按账号对齐）");
+    assert.match(snap.accounts["acct-1"]?.at ?? "", /^\d{4}-\d{2}-\d{2}T/, "要有可显示的领取时刻");
+  }));
+
+  it("隔天的记录不算今天（旧记录不显示成已签到，也不带额度）", withRoot(() => {
+    const yesterday = new Date(Date.now() - 86_400_000);
+    recordClaim(CID, { via: "auto", accountKey: "acct-1", now: yesterday, reward: { amount: 500, unit: "积分" } });
+    const snap = signinTodaySnapshot(CID);
+    assert.equal(snap.channel.claimed, false, "渠道级不带明天的记录（这里昨天也没记渠道级）");
+    assert.equal(snap.accounts["acct-1"]?.claimed, false);
+    assert.equal(snap.accounts["acct-1"]?.reward, null, "旧记录的额度不能当成今天的");
+  }));
+
+  it("额度与探测结论一起透出；探测结论只保留当天", withRoot(() => {
+    recordClaim(CID, { via: "auto", accountKey: "acct-1", reward: { amount: 1200, unit: "积分" } });
+    recordProbe(CID, { claimable: false, claimed_today: null, summary: "上游今天没有可领的奖励" }, { accountKey: "acct-1" });
+    const snap = signinTodaySnapshot(CID);
+    assert.deepEqual(snap.accounts["acct-1"]?.reward, { amount: 1200, unit: "积分" });
+    assert.equal(snap.accounts["acct-1"]?.probe?.summary, "上游今天没有可领的奖励");
+    // 跨天：探测结论作废（活动按日刷新），但记录本身还在
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    assert.equal(signinTodaySnapshot(CID, tomorrow).accounts["acct-1"]?.probe, null);
+  }));
+
+  it("空台账：两个视图都不签，today 仍有值", withRoot(() => {
+    const snap = signinTodaySnapshot(CID);
+    assert.equal(snap.channel.claimed, false);
+    assert.deepEqual(snap.accounts, {});
+    assert.match(snap.today, /^\d{4}-\d{2}-\d{2}$/);
+  }));
+});
+
+describe("7. 额度数值的审计字段（balance / source / tries / windowEndsAt）", () => {
+  it("recordClaim 写入前后余额、来源与窗口，读回一致", withRoot(() => {
+    recordClaim(CID, {
+      via: "auto",
+      reward: { amount: 50, unit: "积分" },
+      rewardSource: "delta",
+      balance: { before: 100, after: 150, unit: "积分" },
+      windowEndsAt: 1_800_000_000_000,
+    });
+    const record = lastClaimOf(CID);
+    assert.deepEqual(record?.balance, { before: 100, after: 150, unit: "积分" });
+    assert.equal(record?.rewardSource, "delta");
+    assert.equal(record?.windowEndsAt, 1_800_000_000_000);
+  }));
+
+  it("渠道不声明窗口 → windowEndsAt 记 null（与「旧记录没这个字段」区分）", withRoot(() => {
+    recordClaim(CID, { via: "auto", windowEndsAt: null });
+    assert.equal(lastClaimOf(CID)?.windowEndsAt, null);
+
+    // 旧版本写的记录没有这些字段：一律读成「还没判定 / 没测」，不是 0
+    writeFileSync(
+      join(paths.stateDir(CID), "signin.json"),
+      JSON.stringify({
+        version: 1,
+        timezone: currentTimezone(),
+        last_claim: { date: dateInTimezone(new Date(), currentTimezone()), at: new Date().toISOString(), via: "auto" },
+        history: [],
+      }),
+      "utf8",
+    );
+    const legacy = lastClaimOf(CID);
+    assert.equal(legacy?.windowEndsAt, undefined, "缺字段 = 还没判定");
+    assert.equal(legacy?.reward, undefined, "缺字段 = 还没测");
+    assert.equal(legacy?.balance, undefined);
+  }));
+
+  it("updateClaimReward 只补数字与来源，不改领取时刻", withRoot(() => {
+    recordClaim(CID, { via: "auto" });
+    const before = lastClaimOf(CID);
+    updateClaimReward(CID, { amount: 300, unit: "积分" }, { source: "channel", tries: 2 });
+    const after = lastClaimOf(CID);
+    assert.equal(after?.at, before?.at, "领取时刻不动（否则变成「刚刚才领」）");
+    assert.deepEqual(after?.reward, { amount: 300, unit: "积分" });
+    assert.equal(after?.rewardSource, "channel");
+    assert.equal(after?.rewardTries, 2);
+  }));
+
+  it("updateClaimWindow 写回窗口判定（null = 渠道不声明）", withRoot(() => {
+    recordClaim(CID, { via: "auto" });
+    updateClaimWindow(CID, null);
+    assert.equal(lastClaimOf(CID)?.windowEndsAt, null);
+    updateClaimWindow(CID, 1_800_000_000_000);
+    assert.equal(lastClaimOf(CID)?.windowEndsAt, 1_800_000_000_000);
+  }));
+
+  it("畸形字段一律读成「无」（来源非法 / 次数为负 / 窗口为 0）", withRoot(() => {
+    mkdirSync(paths.stateDir(CID), { recursive: true });
+    writeFileSync(
+      join(paths.stateDir(CID), "signin.json"),
+      JSON.stringify({
+        version: 1,
+        timezone: currentTimezone(),
+        last_claim: {
+          date: dateInTimezone(new Date(), currentTimezone()),
+          at: new Date().toISOString(),
+          via: "auto",
+          rewardSource: "bogus",
+          rewardTries: -3,
+          windowEndsAt: 0,
+        },
+        history: [],
+      }),
+      "utf8",
+    );
+    const record = lastClaimOf(CID);
+    assert.equal(record?.rewardSource, undefined, "非法来源丢弃");
+    assert.equal(record?.rewardTries, undefined, "非正次数视为没试过了");
+    // 显式 0 = 「有这个字段但值无效」→ 读成 null（渠道不声明窗口），与缺字段（还没判定）区分
+    assert.equal(record?.windowEndsAt, null);
+  }));
+
+  it("旧实现写的显式 reward:null 与「缺字段」区分开", withRoot(() => {
+    mkdirSync(paths.stateDir(CID), { recursive: true });
+    writeFileSync(
+      join(paths.stateDir(CID), "signin.json"),
+      JSON.stringify({
+        version: 1,
+        timezone: currentTimezone(),
+        last_claim: {
+          date: dateInTimezone(new Date(), currentTimezone()),
+          at: new Date().toISOString(),
+          via: "auto",
+          reward: null,
+        },
+        history: [],
+      }),
+      "utf8",
+    );
+    const record = lastClaimOf(CID);
+    assert.equal(record?.reward, null, "问过了但报不出");
+    assert.equal(record?.rewardTries, undefined, "旧记录没有重试信息");
+    assert.equal(record?.windowEndsAt, undefined);
+  }));
+
+  it("updateClaimReward 写 null 时清掉来源；history 里同一条同步", withRoot(() => {
+    recordClaim(CID, { via: "auto", reward: { amount: 300, unit: "积分" }, rewardSource: "channel" });
+    assert.equal(readLedger(CID).history[0]?.rewardSource, "channel");
+    updateClaimReward(CID, null, { tries: 1 });
+    assert.equal(lastClaimOf(CID)?.rewardSource, undefined, "数值没了来源也不能留");
+    assert.equal(readLedger(CID).history[0]?.reward, null, "history 同步");
+    assert.equal(readLedger(CID).history[0]?.rewardSource, undefined);
   }));
 });

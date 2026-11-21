@@ -12,6 +12,7 @@ import { request } from "node:http";
 import { after, before, describe, it } from "node:test";
 
 import { start, emptySnapshot, type ControlBridge } from "../../core/gateway/dist/http/console/console.js";
+import { registerChannelSupply } from "../../core/gateway/tests/registry-seed.ts";
 import { localDate } from "../../core/gateway/dist/runtime/log-store.js";
 import { channels, clearChannels, setChannel, type Channel, type ChannelConfig } from "../../core/gateway/dist/runtime/channel.js";
 import { runInChannel } from "../../core/gateway/dist/runtime/channel-context.js";
@@ -26,6 +27,8 @@ function makeChannel(
   cid: string,
   opts: { capabilities?: { billing?: boolean; signin?: boolean }; models?: string[] } = {},
 ): Channel {
+  // 候选渠道由统一注册表声明（与线上同口径）
+  if (opts.models && opts.models.length > 0) registerChannelSupply(cid, opts.models);
   const config: ChannelConfig = {
     cid,
     display: `Synth ${cid}`,
@@ -90,7 +93,7 @@ let server: Awaited<ReturnType<typeof start>>;
 before(async () => {
   setChannel(makeChannel("webchan"));
   // 无额度能力的合成渠道：billing 命令必须标记 unsupported
-  setChannel(makeChannel("nobill", { capabilities: { billing: false }, models: ["test-model"] }));
+  setChannel(makeChannel("nobill", { capabilities: { billing: false }, models: ["deepseek-v4.1-flash"] }));
   server = await start(0, bridge, "127.0.0.1");
 });
 
@@ -174,7 +177,7 @@ describe("console 静态托管与命令 API", () => {
   });
 });
 
-describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
+describe("日志接口（/api/logs）", () => {
   const DATE = localDate();
   const ACCESS_DIR = join(HOME, "logs", "access", DATE);
   const PAYLOAD_DIR = join(HOME, "logs", "payload", DATE);
@@ -185,7 +188,7 @@ describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
       method: "POST",
       path: "/v1/chat/completions",
       cid: "webchan",
-      model: "webchan/test-model",
+      model: "deepseek-v4.1-flash",
       stream: true,
       status: 200,
       outcome: "success",
@@ -215,8 +218,11 @@ describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
         ts: "2026-10-28T05:00:00.000Z",
         status: 502,
         outcome: "failure",
-        stream: false,
+        // 慢的归因口径（首字延迟 + 生成速率，见 docs/LOGGING.md §3.5）：
+        // 失败请求没有 usage（速率测不出），打慢标靠「90s 才来首字」
+        stream: true,
         durationMs: 90_000,
+        ttfbMs: 90_000,
         usage: undefined,
         error: "upstream_error",
       }),
@@ -232,7 +238,7 @@ describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
         phase: "upstream",
         attempt: 0,
         cid: "webchan",
-        model: "test-model",
+        model: "deepseek-v4.1-flash",
         stream: true,
         bytes: 24,
         truncated: false,
@@ -250,8 +256,9 @@ describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
       date: string;
       total: number;
       truncated: boolean;
-      stats: { requests: number; success: number; failure: number; slow: number; tokens: { total: number }; noUsage: number };
-      entries: Array<{ id: string; outcome: string; slow: boolean; tokens: { total: number } | null; cid?: string }>;
+      slowThresholds: { ttfbMs: number; tps: number };
+      stats: { requests: number; success: number; failure: number; slow: number; slowTtfb: number; slowTps: number; tokens: { total: number }; noUsage: number };
+      entries: Array<{ id: string; outcome: string; slow: boolean; slowTtfb: boolean; slowTps: boolean; tokens: { total: number } | null; cid?: string }>;
       cids: string[];
     };
     assert.equal(page.ok, true);
@@ -260,7 +267,10 @@ describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
     assert.equal(page.stats.requests, 2);
     assert.equal(page.stats.success, 1);
     assert.equal(page.stats.failure, 1);
-    assert.equal(page.stats.slow, 1, "90s 的失败请求要按慢阈值打标");
+    assert.equal(page.stats.slow, 1, "90s 才来首字的失败请求要按「首字慢」打标");
+    assert.equal(page.stats.slowTtfb, 1);
+    assert.equal(page.stats.slowTps, 0, "失败请求没有 usage，速率维度不参与");
+    assert.ok(page.slowThresholds.ttfbMs > 0 && page.slowThresholds.tps > 0);
     assert.equal(page.stats.noUsage, 1, "失败请求没有 usage，必须如实计数");
     assert.equal(page.stats.tokens.total, 12);
     assert.deepEqual(page.cids, ["webchan"]);
@@ -337,13 +347,4 @@ describe("日志接口（/api/logs 与 /api/logs/payload）", () => {
     assert.equal(res.status, 403);
   });
 
-  it("正文抓取恒开启：读回落盘的记录；查不到的 id 给空数组", async () => {
-    const hit = await fetch(`${server.url}api/logs/payload?id=req_e2e_ok`);
-    assert.equal(hit.status, 200);
-    const found = (await hit.json()) as { records: unknown[] };
-    assert.equal(found.records.length, 1, "恒开启：夹具记录必然可读回");
-    const miss = await fetch(`${server.url}api/logs/payload?id=req_absent&date=${DATE}`);
-    const empty = (await miss.json()) as { records: unknown[] };
-    assert.deepEqual(empty.records, []);
-  });
 });

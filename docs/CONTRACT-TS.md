@@ -21,8 +21,7 @@ modelmux/                     ← 仓库根 = 工作区根
 │       │              credential-shape（凭据形状归一）/ snapshot（随包快照落点）/
 │       │              logger（日志节流）/ log-store（分层落盘）/ model-specs（模型规格）
 │       ├── pool/      模型池与账本：pool-targets（id 与匹配）/ pool-usage（账本）/
-│       │              model-pool（渠道内解析）/ model-policy（全模型池策略常量）/
-│       │              account-rotate（额度耗尽换号决策）
+│       │              model-pool（渠道内解析）/ account-rotate（额度耗尽换号决策）
 │       ├── auth/      登录链路：login / login-flow / auth-flow / auto-signin / signin-ledger /
 │       │              paste-detect（粘贴文本启发式）
 │       ├── http/      网关与转发（19 个源文件）：server（网关入口）/ portfree（端口自愈）/
@@ -31,6 +30,8 @@ modelmux/                     ← 仓库根 = 工作区根
 │       │              queue（排队探测）/ auth（鉴权链路）/ upstream（建连与空闲守卫）/
 │       │              candidates / errors / channel
 │       │              wire/（协议线）：sse-stream（SSE 规范化）/ openai-normalize（通用 OpenAI 归一化）
+│       │              protocol/（入站协议）：anthropic / responses / count-tokens / types（翻译与回程编码，
+│       │              复用 chat/ 转发管线，见 CLIENT-INTEGRATION.md）
 │       │              console/（控制台）：console / web-command-handler / web-types（控制台类型）
 │       ├── app/       顶层门面与进程编排，两个子目录分工明确：
 │       │              cli/（CLI 门面：index 命令入口 / model 模型组 / channel 渠道动词 /
@@ -47,7 +48,7 @@ modelmux/                     ← 仓库根 = 工作区根
 ├── docs/                         ← **全部文档**：契约与规范 + 渠道文档（docs/channels/<cid>/）
 └── scripts/                        ← 仓库级脚本与校验器（verify-contract / verify-storage / verify-docs /
                                     verify-commits / verify-comments / verify-layering / verify-topology /
-                                    verify-wiring / copy-ui / mx-watchdog）
+                                    verify-references / verify-wiring / copy-ui / mx-watchdog）
 ```
 
 `packages/core/channels/<cid>/` 内部（= 一个**池子**）：
@@ -66,10 +67,10 @@ packages/core/channels/<cid>/
 
 > **渠道包只放实现**（`src/` 的 7 个文件 + 包配置）；渠道文档统一在
 > [`docs/channels/<cid>/`](./channels/README.md)（`PROTOCOL.md` 协议规格 + 使用与实测 +
-> 参考实现清单，另有可选的 `FINDINGS.md` / `FLOW.md`）。
+> 参考实现清单，另有可选的 `FINDINGS.md` 逆向结论层；**每渠道至多两份 md**）。
 
-> **一个渠道 = 一个池子**：渠道 `catalog` 提供模型，共享层的**公共模型池**把它们以
-> `<cid>/<模型>` 池 id 对外暴露（见 §4 与 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md)）。
+> **一个渠道 = 一个池子**：渠道 `catalog` 提供模型，共享层的**公共模型池**只把
+> **对外模型家族**以**裸模型名**对外暴露（见 §4 与 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md)）。
 > 账号池见同文档 §3。
 
 **每个 `packages/core/channels/<cid>/` 的 `src/` 只有 7 个文件。** 任何不在上表里的 `src/*.ts`
@@ -129,8 +130,8 @@ packages/core/channels/<cid>/
 
 | 约定 | 原因 |
 | --- | --- |
-| **版本线统一走 `0.1.x`** | 本项目是**自用工具**，不对外承诺版本语义 —— 不搞 1.0 里程碑、不做 semver 承诺。全仓（cli + ui + gateway + **全部渠道包**）**版本号一律相同**，`scripts/verify-contract.mjs` 强制：漂一个就是红 |
-| **版本号只记一遍** | `package.json` 的 `version` 是唯一真相；渠道 `src/channel.ts` 的 `ChannelConfig.version` 必须与之一致（那处会显示在 `mx --version <cid>` 与 `mx path` 的输出里）。同一事实记两遍必然漂移 |
+| **版本线统一走 `0.1.x`** | 本项目是**自用工具**，不对外承诺版本语义 —— 不搞 1.0 里程碑、不做 semver 承诺。全仓（cli + ui + gateway + **全部渠道**）共用**根 `package.json` 的 `version`**，`scripts/verify-contract.mjs` 强制：漂一个就是红 |
+| **版本号只记一遍** | 唯一真相是**根 `package.json` 的 `version`**。私有 workspace 包（ui / gateway / 各渠道）一律**不带 `version` 字段**；渠道 `src/channel.ts` 不再写版本字面量，改为引用 gateway 导出的 `VERSION` 常量（`packages/core/gateway/src/version.ts`，显示在 `mx --version` 与 `mx path`）。`VERSION` 常量、**可发布**的 cli 清单（npm 要求有 `version`）、desktop 清单与根 lock、`docs/PROGRESS.md` 由 `npm run version:sync`（`scripts/version.mjs`）从根派生 —— **发版只改根一处再跑同步**，`verify-contract` 守漂移 |
 | **`bin` 路径不带 `./` 前缀**（`"mx": "dist/cli.bundle.js"`） | npm 11 的发布归一化（`@npmcli/package-json` 的 `secureAndUnixifyPath`）会把 `./x.js` 判为无效并**整条删除** —— 发布出去的包就没有 `mx` / `modelmux` 命令，而 npm 只打一句含糊的 `was invalid and removed`。实测：带 `./` → 条目被删；不带 → 保留。`scripts/verify-contract.mjs` 已把这条钉住（可发布包的 bin 一律不得以 `./` 开头） |
 | **`prepack` 复制仓库根的 LICENSE 到包根** | npm 只自动收录**包根目录**的 LICENSE，不往父目录找；不复制则 tarball 里没有许可证文本。仓库根是许可证的唯一副本（渠道包不再各带一份），复制件是构建产物（已 gitignore） |
 | **`prepublishOnly` 先跑 `npm run build`** | 发布出去的 `dist/` 必须与当前源码一致；没有它，`npm publish` 会把上一次的构建产物（甚至空目录）发出去 |
@@ -141,7 +142,7 @@ packages/core/channels/<cid>/
 ### 2.2 渠道**总数**不得写死在文档与注释里
 
 渠道数是 `readdirSync(packages/core/channels)` 的**派生量**。写死它的后果不是「不好看」，而是
-**增删渠道时必然漏改**：2026-10-26 加 `astudio` 后，`README.md` / `CONTRACT-TS.md` /
+**增删渠道时必然漏改**：曾有一次增删渠道后，`README.md` / `CONTRACT-TS.md` /
 `POOL-ARCHITECTURE.md` 三处仍写着旧数字，测试里的贡献渠道下界（`>= 8`）也随渠道数漂移。
 
 | 该写 | 不该写 |
@@ -177,17 +178,21 @@ hasChannel(): boolean;        // 供测试/工具探测，不抛错
 interface ChannelConfig {
  cid: string;                 // 渠道 id，如 "catpaw"（日志前缀、服务名、CLI 名、**存储分层名**）
  display: string;             // 展示名，如 "CatPaw"
- version: string;             // CLI 版本号
+ version: string;             // 仓库版本号（引用 VERSION 常量；发布约定见本节表格）
  defaultAddr: string;         // **单渠道独立运行**的网关默认地址，如 "127.0.0.1:8803"
  uiPort: number;              // **单渠道独立运行**的控制台端口（仓库级路由用 REPO_DEFAULT_*）
  debugDumpEnv: string;        // 抓包落盘目录的环境变量名（值 "1" 表示用渠道内 debug/）
- capabilities?: Partial<ChannelCapabilities>; // 能力声明：billing / signin，缺省 true
+ capabilities?: Partial<ChannelCapabilities>; // 能力声明：billing / signin / queue
 }
 ```
 
 **能力声明**：`capabilities.billing` / `capabilities.signin` 为 `false` 表示该渠道没有额度 /
 签到概念。共享层据此直接显示 `-`，不调用对应模块；缺省视为支持，兼容所有现有渠道。
 无对应能力的渠道在 `channel.ts` 显式声明，不靠抛错或空台账让上层猜。
+
+`capabilities.queue: true` 表示**上游可能排队**（请求被收下但长时间不出字）：网关的排队探测
+立即放弃本候选、换下一条（不等待）；模型偏好的自动排序也把它往后放（同档位内不排队的渠道优先）。
+省略 = `false`。
 
 **落点不由渠道决定**：存储根、`<cid>` 分层、目录内文件名全部由共享层
 `paths.ts` 推导；渠道只给 `cid`，没有任何历史名清单。
@@ -211,16 +216,46 @@ interface Channel {
 
 ## 4. 模型池策略
 
-### 4.1 对外 id：动态模型池（`pool-targets.ts`）
+### 4.1 对外 id：模型家族裸模型名（`model-family.ts` + `model-registry.ts`）
 
-网关对外是**动态模型池**，id 形态为 `<cid>/<规范模型名>`（如 `loomy/kimi-k2.6`）——
-渠道由请求方通过前缀**显式指定**；模型段是各渠道 `catalog` 归一化后的结果，
-**渠道内去重、跨渠道不合并**。匹配是「归一化 + **精确相等**」；裸模型名（无 `/`）
-与未注册渠道前缀一律 `400 unknown_model`。
-完整规则、账本落点与刷新节奏见 [`POOL-ARCHITECTURE.md` §2](./POOL-ARCHITECTURE.md)。
+网关对外只做**家族表里声明的模型**，id 形态是**裸模型名**（表见
+[POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2）。客户端只认对外名单里的名字：
+渠道侧等价写法（如 `deepseek-flash`）不在名单里，写了就是 400。
+家族表（对外 id、canonical 归并、`owned_by`）声明在
+`packages/core/gateway/src/pool/model-family.ts` —— 共享层**唯一**允许出现模型名的地方
+（由 `scripts/verify-contract.mjs` 强制）。
 
->  请求名按**第一个 `/`** 切出渠道段，模型段走归一化路径（剥厂商路径段）——
-> 渠道归属已由前缀声明，模型段再剥不会串渠道。
+- **规格与上游 id 由统一注册表声明**（`<root>/models.json`，实现
+  `pool/model-registry.ts`）：`contextWindow` / `maxOutput` 是对外报值，`channels` 段是
+  **上游 id 映射的兜底**，条目为纯 slug 字符串或 `{ slug, contextWindow? }`（渠道级窗口，
+  缺省回落模型级）—— 选路时输入估算超过渠道级窗口的候选被跳过（见
+  [POOL-ARCHITECTURE.md §2.4](./POOL-ARCHITECTURE.md)）。`/v1/models` 直接读它返回，
+  不再聚合各渠道目录。文件契约见 [MODEL-CATALOG.md](./MODEL-CATALOG.md)；
+  整份表要么全用、要么全弃（回落随包默认表）。
+- **渠道由网关挑**：候选 = 渠道目录 `exposedIds()` 现算 ∪ 注册表 `channels` 声明兜底，
+  且当前已注册；经 `capabilities.queue`、`priorityTier`（硬档位）与剩余额度排序（见
+  [POOL-ARCHITECTURE.md §2.4](./POOL-ARCHITECTURE.md)）；客户端请求里不带渠道前缀。
+- **匹配**：请求名走别名与大小写归一后**精确相等**；别名组内互相命中。
+- **拒绝**：家族外的名字、家族内但没有任何渠道供给的 → `400 unknown_model`；
+  候选渠道全都没登录 → `503 not_authenticated`。
+
+> 渠道不再由请求方指定 —— 「哪家出」是网关的调度决策（档位 → 剩余额度 → 冷却 → 顺延）。
+
+#### 4.1.1 Claude Desktop 角色名（`DESKTOP_ROLE_MODELS`）
+
+Claude Desktop 直连网关时只会发 `claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`
+这类**真实 Anthropic 模型名**：它的 `inferenceModels[].name` 必须过校验器，自造名、
+斜杠与点号都会被整组拒收；`labelOverride` 只改菜单显示名、**不进请求体**。
+`model-family.ts` 的 `DESKTOP_ROLE_MODELS` 声明这三者到池模型的固定映射，
+入站解析（`resolveInboundModel`）读这份表。
+
+- 映射是**固定表**，不按槽位下标取 `models[n]` —— 后者让实际模型随 `/v1/models` 的
+  展示顺序漂移，菜单里看到的与日志里跑的随时可能不一致。
+- 角色名**不是**家族名的通配：`claude-opus-9-9`、`claude-sonnet-4-5-20260101` 仍返回 400，
+  不引入「任何 `claude-*` 都放行」的口子。
+- 协议入站（`/v1/messages`、`/v1/responses`）**不得**把家族外名字静默改写成「有货的
+  第一个池模型」—— 那会让跑错模型的请求看起来成功（事故记录见 `relay.ts` 的
+  `poolModelOrNull` 注释）。
 
 ---
 
@@ -276,12 +311,12 @@ interface Channel {
 ##### `force`：`relogin` 与 `login` 的分界
 
 `login()` 的语义是**幂等**的（已有凭据就复用），`relogin` 要的是**重新走一遍**。
-两者必须区分：astudio 这种「凭据来自外部会话文件」的渠道，若不区分，
+两者必须区分：「凭据来自外部会话文件」的渠道，若不区分，
 `mx relogin` 在凭据还在时会是**空操作**。
 
 - 共享层 `ensureLogin({force})` → `cred.login(baseUrl, {force: true})`；
 - 渠道**必须先试 `force`**：为真时跳过复用短路，重新读自己的凭据来源
-  （astudio 重读会话文件；其它渠道重走授权）。
+  （重读会话文件的渠道；其它渠道重走授权）。
 
 `pasteCode` 的来路：共享层把 `LoginUi.takePastedCallback`
 （`packages/core/gateway/src/runtime/channel.ts`）包成 `pasteCode()` 传给渠道 ——
@@ -298,10 +333,11 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 `LoginUi.requestInput?`（`packages/core/gateway/src/runtime/channel.ts:102-113`）向用户
 要一段输入，返回用户填的内容；**取消 / 无人应答 → `undefined`**。
 
-- **无界面实现不要实现它**（CLI 的 `StdoutLoginUi` 就不实现，见
-  `packages/core/gateway/src/app/lifecycle/headless.ts:152-157`）；渠道**必须先试
-  `requestInput`，拿到 `undefined` 再回落到自己的输入来源**（环境变量 / 文件），
-  否则终端用户会卡在等一个永远不来的输入框（`mx login loomy` 的既有用法全靠环境变量）。
+- **渠道必须先试 `requestInput`，拿到 `undefined` 再回落到自己的输入来源**（环境变量 / 文件），
+  否则终端用户会卡在等一个永远不来的输入框（脚本化用法全靠环境变量）。
+  CLI 的 `StdoutLoginUi` **已实现**它：提示写 stderr、从 stdin 读一行，TTY 与管道都支持
+  （`packages/core/gateway/src/app/lifecycle/headless.ts` 的 `StdinPasteReader`）；
+  长驻模式（`serve`）不开粘贴通道，直接返回 `undefined`，回落路径不变。
 - 控制台侧：`ServiceState.requestInput` 登记请求 → 快照的 `login_input`
   下发到界面（`packages/core/gateway/src/http/console/console.ts` 的 `UiSnapshot`）→
   用户提交经 `submitInput` 动作回来；界面关闭走 `cancelInput`。
@@ -314,8 +350,8 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 
 | 形态 | 本机回环服务器 | 粘贴内容怎么用 | 渠道 |
 |---|---|---|---|
-| **A. 回环转交型** | 有 | 转交**同一个回调处理器**：回环请求打到自己的回调地址，或直接调同一个 exchange 入口 | lobsterai、raccoon |
-| **B. 无回环信号型** | 无 | 由**同一个轮询处理器**消费：含授权码 → 解析出来交给同一条换码路径；不含 → 只作「浏览器那一步已完成」的信号，立即再轮询一次 | qodercn、workbuddyai、qoder、workbuddy |
+| **A. 回环转交型** | 有 | 转交**同一个回调处理器**：回环请求打到自己的回调地址，或直接调同一个 exchange 入口 | raccoon |
+| **B. 无回环信号型** | 无 | 由**同一个轮询处理器**消费：含授权码 → 解析出来交给同一条换码路径；不含 → 只作「浏览器那一步已完成」的信号，立即再轮询一次 | qwenworkcn、workbuddy |
 
 不消费 `pasteCode` 的渠道：loomy（手机验证码两步）、catpaw、traecn。
 
@@ -331,14 +367,25 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 
 **可选钩子的语义**（路由相关的两项见 `POOL-ARCHITECTURE.md` §2.4）：
 
-- `buildChatHeaders?(credential, cfg)`：对话请求的**专用头族**（上游按整组头判定
+- `buildChatHeaders?(credential, cfg, body?)`：对话请求的**专用头族**（上游按整组头判定
   「是否官方客户端」时需要）。缺省时网关回退 `buildHeaders`
   （`packages/core/gateway/src/http/chat/upstream.ts:137-140`）；普通 OpenAI 兼容渠道无需声明。
+  第三参 `body` 是**网关已序列化的请求体**：**签名类渠道**要用它把 payload 哈希计进签名
+  （如华为云 `SDK-HMAC-SHA256` 的 `Authorization`）—— 签名覆盖 body 时必须在建头阶段
+  算好，而网关的 `fetch` 只认这组网。不签名的渠道忽略该参数即可（向后兼容）。
 - `prepareChat?(body)`：发上游请求**之前**要完成的异步前置动作，网关会 `await` 它
   （`packages/core/gateway/src/http/chat/attempt.ts:301-319`）。参数是**网关已经建好的
   body**（不是 `req`）：渠道必须基于同一个 body 做前置，否则再调一次 `buildChatBody`
   会生成新的会话 id，前置与对话指向两个会话。返回字符串形态请求体的渠道不走这个钩子
   （`packages/core/gateway/src/runtime/channel.ts:223`）。
+- `openChatStream?(body)`：**内容不在主 POST 响应体上**的上游（侧信道 SSE / WS）用。声明后
+  网关在建连 `chatUrl` **之前**调它（`packages/core/gateway/src/http/chat/upstream.ts:255-260`），
+  把返回的流当作上游响应体交给翻译器 —— `buildHeaders` / `chatUrlForModel` 不再被调用。
+  返回 `null` 回落默认 POST 路径；入参与 `prepareChat` 同源（网关已经建好的 body），真正的
+  请求现场可放在渠道自己的请求槽里由两个钩子共用。返回流之前抛 `UpstreamUnauthorized`
+  归一成 401 + `authRejected`（走刷新重试链）；其余错误**不**自动重开 —— 这个钩子有上游
+  副作用（真发了一轮对话），重开会让同一提问跑两遍。声明处见
+  `packages/core/gateway/src/runtime/channel.ts:340`。
 - `refreshIfExpired?(credential)`：建头**之前**的异步凭据保鲜，网关在 `buildHeaders` 前
   `await` 它（`packages/core/gateway/src/http/chat/upstream.ts:139`）。
   为什么需要：`buildHeaders` 是同步的，无法「先续期再发」；而渠道的预续期若是惰性的
@@ -359,6 +406,10 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 - `quotaResetAt(bodySnippet)`（**可选**）：从上游**错误体**里认出「额度耗尽 + 下次刷新时刻」
   （epoch ms；认不出返回 `null`）。共享层命中额度信号后用它定冷却截止，`null` 回落次日本地 0 点。
   **不要编造时间**：编错会让账号冷却到错误的时刻。语义与判定见 POOL-ARCHITECTURE.md §2.4。
+- `isCapacityError(status, body)`（**可选**）：判定一个**非 200** 响应是否是**上游容量型过载**
+  （推理集群无空闲实例一类）。命中时网关仍记渠道级冷却（候选让给别家），但**不计账号连败** ——
+  这类错误换账号没用，计入连败会把健康账号误熔断（上游排队高峰整批 5xx 的场景）。
+  渠道业务码由渠道声明，共享层不硬编码渠道知识（守卫与 `quotaSignal` 同思路）。
 - `quotaSignal(status, body)`（**可选**）：声明本渠道的**额度信号** —— 共享层只认通用措辞，
   渠道业务码与专有措辞**必须**经本钩子上报（共享层不许硬编码渠道知识）。
   - 返回 `usage_limit` = 账户级用量限额（对所有模型生效，含倍率 0 的）→ 一律冷却；
@@ -366,15 +417,13 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
   - 认不出返回 `null`。
   - 守卫：`tests/quota-signal.test.ts` 会扫共享层**可执行代码**里有没有渠道业务码，有就红。
   - 两类信号的判定与作用范围见 POOL-ARCHITECTURE.md §2.4。
-- `isQueueError(frame)`：只在**响应头发出前**对翻译器产出的错误帧调用；返回 true 时网关
-  按帧里的 `retryAfterSeconds`（封顶 12s）退避后重开上游重试，总时长上限 120 秒
-  （`MODELMUX_QUEUE_BUDGET_MS` 可覆盖）。已吐过内容帧则不重试（避免重复内容）。
+- `isQueueError(frame)`：只在**响应头发出前**对翻译器产出的错误帧调用；返回 true 表示
+  「这条上游在排队」。网关的策略是**一出现排队就放弃本候选、换下一条**（`switchChannel`）：
+  不等待、不重开同一条流、不向客户端写任何排队相关字节。已吐过内容帧时不换（避免重复内容）。
   未声明的渠道照旧把错误帧透传给客户端。
-  排队等待期间网关向**流式**客户端按轮次分批发进度文案（**`reasoning_content` delta**，
-  每条以空行收尾）；刻意不走 `content`：客户端按 chunk 到达顺序建行，提醒若走
-  `content` 会先建出正文行，模型的思考就落到正文后面了（2026-10-24 实测）；
-  **排队解除后补一条正文**「排队成功，开始生成…」作为分界。
-  超预算仍无内容时**直接回正常应答**劝主人换渠道（文案带真实渠道 id），不再回错误帧。
+  换候选后若无下一条可用，整条请求以 503 `upstream_queued` 收尾 —— 排队请求永不被接受
+  （2026-11-08 行为，早先那套「按 `retryAfterSeconds` 退避重试 + 进度文案 + 超预算劝换渠道」
+  已全部删除，相关预算常量与文案一并移除）。
   客户端断开（res `close` 事件，比 `res.destroyed` 可靠）后探测立即止损，
   不再打上游 —— 只查 `res.destroyed` 不够：客户端 60s 超时走人后仍会多打一次上游
   并滞留一个等待轮次（2026-10-24 实测），故探测以 `close` 事件为准。
@@ -385,8 +434,7 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 
 - `chatHostCandidates()` / `setChatHostOverride(host)` / `currentChatHost()` / `rememberChatHost()`：
   多主机上游里个别主机对「200 后零字节 / 断流」是坏的，网关在探测层重试前换下一候选，
-  成功后回写记忆。仅 custom 线型且签名不覆盖 host 的渠道适用（如 Qoder，见
-  `docs/channels/qoder/PROTOCOL.md` §7.5）；标准 OpenAI 兼容渠道没有这个概念。
+  成功后回写记忆。仅 custom 线型且签名不覆盖 host 的渠道适用；标准 OpenAI 兼容渠道没有这个概念。
   `rememberChatHost` 的**实现是零参**（渠道自己取当前主机）；声明写成
   `rememberChatHost?(host?: string)` 是为了兼容「零参实现」与「共享层带 host 传参」两种形态。
 
@@ -456,8 +504,8 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 
 **兜底表是必需的**：未登录或上游目录失败时用户仍应看到模型（否则渠道在选择器里
 凭空消失，用户以为插件坏了）。
-`catalog.exposedIds()` 只需给出该渠道**真实可用**的归一化 id；共享层不做家族过滤
-（全模型池，见 §4.1）。
+`catalog.exposedIds()` 只需给出该渠道**真实可用**的归一化 id；共享层再按**对外模型家族**
+过滤（见 §4.1，家族表是唯一口径）。
 但**不要列出实测用不了的模型** —— 用户选中后拿到空回答，而错误指向「模型」
 而非真实原因，比不列更糟。
 
@@ -485,7 +533,9 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 思考档位、倍率、隐藏标记一律写在渠道包的 `models.json`。`catalog.ts` 只保留三类逻辑：
 
 1. **怎么取** —— 读缓存 / 拉远端 / 浇种用户表 / 按 cid 解析落点；
-2. **怎么归一化** —— 字段清洗、去重、过滤非对话模型、`hidden` 过滤；
+2. **怎么归一化** —— 字段清洗、去重、过滤非对话模型、`hidden` 过滤
+   （隐藏集合由共享层 `hiddenModelIds()` 从用户表与随包快照**并集**收集，
+   随包快照读不到即抛错；各渠道 `exposedIds()` 只做过滤）；
 3. **id ↔ upstreamId 映射** —— 别名表（`LEGACY_ALIASES` / `POOL_KEY_MAP` 等）留在代码。
 
 判据是机械可查的：`catalog.ts` 里出现模型名或四位以上的规格数字即违规。
@@ -586,8 +636,7 @@ upstream.setModelMetaLookup((key) => catalog.metaOfKey(key));
 ```
 
 目录知识仍归 `catalog` 管，两个模块保持单向依赖。参考实现见
-`packages/core/channels/qoder/src/channel.ts:25-30`、
-`packages/core/channels/qoder/src/upstream.ts:487-502`。
+。
 
 ### 5.4 `billing.ts`
 
@@ -602,6 +651,17 @@ upstream.setModelMetaLookup((key) => catalog.metaOfKey(key));
 直接调用时使用。各渠道叫法不同（`check-in` / `signin` / 活动 `claim` / 上游自动发），统一收敛成
 `status()` + `claim()` 两个动作；`claim()` 必须是幂等的或至少可安全重复调用。
 
+**额度数字（「今天签到领到多少」）**：`claim()` / `status()` 可回 `reward: {amount, unit}`
+（渠道自报的发放额）；`status().dailyReward`（可选）是**每日发放额度**的公布值，
+适用于「签到动作本身就是当日额度发放」的渠道（loomy 每天 5000，上游不回报入账额）。
+`status()` **不接受 credential**（拿的是当前生效账号）：`perAccount` 渠道只能用它取
+与账号无关的字段（如 `dailyReward`），不要把账号相关的数字写进别的账号的台账。
+两者都没有时共享层用**领取前后各查一次额度的差值**补；仍拿不到才用**跨额度窗口对比**
+（最弱口径，界面标「估算」）。`status().resetAt` / `windowStartsAt`（可选）声明当前签到窗口的
+结束与开始时刻（epoch ms）—— 日界不是本地 0 点的渠道（qoder 系上游是 10:00 UTC+8）必须给，
+否则当天活动永远领不到。
+口径与有界重试规则见 [`POOL-ARCHITECTURE.md`](./POOL-ARCHITECTURE.md) §3.6。
+
 **「查不到」不能显示成 0**：有额度能力但查询失败时抛 `CreditsError`，而不是返回 `remain: 0`。
 未登录时抛 `cred.NotLoggedInError`。
 **没有额度概念的渠道**在 `ChannelConfig.capabilities` 声明 `billing: false`：共享层不调用
@@ -610,9 +670,15 @@ upstream.setModelMetaLookup((key) => catalog.metaOfKey(key));
 `fetchCredits()` 可保留抛错作为防御性兜底。
 
 **按账号查询**：`fetchCredits(options?: { refreshOn401?: boolean; credential?: unknown })`。
-不传 `credential` = 当前生效账号；传入时用它代替 `cred.load()`，并配合
-`refreshOn401: false`（避免刷新 / 回写生效账号的凭证文件）。账号池刷新账单时按账号调用，
+不传 `credential` = 当前生效账号；传入时用它代替 `cred.load()`。账号池刷新账单时按账号调用，
 结果写入账本 `accounts[key].credits`（见 [`POOL-ARCHITECTURE.md`](./POOL-ARCHITECTURE.md) §3.4）。
+
+**传入 `credential` 且允许续期（`refreshOn401: true`）时，调用方必须先套
+`accounts.runForAccountCredential(cid, key, …)`**。渠道的 `cred.refresh()` 会落盘到
+`credentialsPath()`，而落点上下文让这次落盘写进**该账号自己的文件**
+（`accounts/<key>.json`，见 [`STORAGE-CONVENTION.md`](./STORAGE-CONVENTION.md)）——
+不限定落点时它会写进 live 文件，把生效账号的凭据顶掉（`syncPool` 据此把生效账号切走）。
+渠道侧无需改动：`save()` / `load()` 照旧只认 `credentialsPath()`。
 
 **额度周期（`quotaPeriod?()`，可选）**：返回
 `{ label, size, unit, resets_at }` —— 周期的人读文案（如「每天 5000 积分，0 点刷新」）、
@@ -622,6 +688,12 @@ upstream.setModelMetaLookup((key) => catalog.metaOfKey(key));
 
 - **不认识自己的周期就别实现**：共享层有兜底（次日本地 0 点），编一个假的比不实现更糟。
 - `size` 拿不到就给 `null`（不编数字）；`resets_at` 拿不到也给 `null`。
+- **日界必须按上游的真实窗口**，不是一律本地 0 点：qoder 系上游的活动按 **10:00（UTC+8）**
+  滚动，raccoon 的自然日按**北京时间**切 —— 硬写本地 0 点会让海外或非 UTC+8 部署
+  把刷新时刻算错一整个窗口。
+- **数额的证据等级要如实**：上游有字段（`reward_points` / `benefit.amount`）就取字段；
+  只有参考实现或文案时，`label` 里写「约」并在渠道 `PROTOCOL.md` 标注 `[参考]` ——
+  把参考级数字写成承诺，会让用户以为每天必然到账。
 
 ---
 
@@ -636,9 +708,9 @@ Ctrl+点击 / 复制），用户自行在浏览器打开，再轮询/回调拿�
 
 | 类型 | 用法 | 渠道 |
 |---|---|---|
-| **A. 本地回调服务器** | 起 `http://127.0.0.1:<port>` 回调服务 → 拼授权 URL（含 PKCE/DPoP 等）→ 等浏览器重定向回填 | traecn、lobsterai、raccoon |
-| **B. flow 轮询** | 拼授权 URL → 交给用户打开 → 轮询拿 token | workbuddyai、workbuddy、catpaw |
-| **C. 设备码 / 扫码轮询** | 申请 device code 或二维码 URL → 轮询 token | qoder、qodercn |
+| **A. 本地回调服务器** | 起 `http://127.0.0.1:<port>` 回调服务 → 拼授权 URL（含 PKCE/DPoP 等）→ 等浏览器重定向回填 | traecn、raccoon |
+| **B. flow 轮询** | 拼授权 URL → 交给用户打开 → 轮询拿 token | workbuddy、catpaw |
+| **C. 设备码 / 扫码轮询** | 申请 device code 或二维码 URL → 轮询 token | qwenworkcn |
 | **D. 手机验证码两步** | 发码（返回 `msgid`）→ 带 `msgid` + 验证码换 token | loomy |
 
 各渠道的端点、请求头与字段是**渠道知识**，写在 `docs/channels/<cid>/PROTOCOL.md`，
@@ -764,7 +836,7 @@ mx <命令组> <子命令> [参数...]           # mx model list / mx model usag
 - 心智对齐 `git` / `docker` / `gh` / `kubectl` / `npm`：清一色 `<动词> [<对象>]`。
 - **TAB 补全**：`mx login <TAB>` 直接列出已注册渠道 —— 补全器只需对位置 2 补「渠道」一个维度，
  不必先猜位置 1 是动词还是渠道名。
-- **生命周期动词不接受 cid**：`start` / `stop` / `restart` 操作的是服务全部渠道的那个网关；
+- **生命周期动词不接受 cid**：`start` / `stop` / `restart` / `rebuild` 操作的是服务全部渠道的那个网关；
  `status` / `log` 则**可选** cid（不给 = 仓库级聚合，给 = 该渠道）——两条语义靠**是否带 operand** 区分。
 - **不采用 `mx <cid> <动词>`**：渠道名与动词共享位置 1 会二义（渠道动词 `model`
 既用于仓库级 `model list`/`model usage`，也用于 `mx model <cid>` 列某渠道模型），
@@ -785,13 +857,13 @@ mx <命令组> <子命令> [参数...]           # mx model list / mx model usag
 
 | 命令 | 回答的问题 | 输出形态 |
 | --- | --- | --- |
-| `mx model list` | **有哪些模型可用** | 按渠道分组：每渠道一行（模型数 + 账本状态）+ 该渠道的模型 id 列表 |
+| `mx model list` | **有哪些模型可用** | 按模型分组：每个 deepseek 模型一行（渠道数）+ 逐渠道的剩余额度 / 账本状态 / 目录原始写法 |
 | `mx model usage [--refresh]` | **各渠道用得怎么样** | 每渠道一行（已用量 / 单位 / ok / fail / 冷却）；`--refresh` 立刻重查各渠道账单 |
-| `mx model <cid> [--refresh]` | **某个渠道的目录** | 该渠道对外暴露的模型 + 倍率 + 目录来源（缓存 / 远端 / 内置） |
-| `mx model spec <模型名>` | **某个模型的规格** | 窗口 / 输出上限 / 思考档位 / 倍率 / 输入模态（见 [MODEL-SPECS.md](./MODEL-SPECS.md)） |
+| `mx model <cid> [--refresh]` | **某个渠道能供哪些对外模型** | 该渠道贡献的 deepseek 模型 + 倍率 + 目录原始写法 + 目录来源（缓存 / 远端 / 内置） |
+| `mx model spec <模型名>` | **某个模型的规格** | 聚合规格（跨渠道取最小/交集）+ 逐渠道倍率与上游目录值（见 [MODEL-SPECS.md](./MODEL-SPECS.md)） |
 
-`model list` 与 `model usage` 是**两个不同视图**：前者按渠道分组列模型，后者只按渠道列账本。
-账本数字**不决定路由**（渠道由池 id 前缀指定），两处都只作健康度观察。
+`model list` 与 `model usage` 是**两个不同视图**：前者按**模型**分组回答「从哪几家出」，
+后者按**渠道**列账本。账本的「剩余额度之和」是**选路主键**（其余数字只作健康度观察）。
 
 实现落点：`packages/core/gateway/src/app/cli/index.ts` 的分发（动词表在前、cid 作 operand）；
 `packages/core/gateway/src/app/cli/channel.ts` 的 `CHANNEL_VERBS`（`{ name, usage, summary, group }` 对象表）与
@@ -799,6 +871,177 @@ mx <命令组> <子命令> [参数...]           # mx model list / mx model usag
 `spec` 三个子命令各自渲染）。
 
 ---
+
+### 9.2. 语法铁律
+
+```text
+mx <动词> [<cid>] [参数]        # 渠道动词
+mx <组名> <子命令> [参数]        # 命令组
+```
+
+- 渠道动词永远在第一位，渠道 id 在第二位：`mx login catpaw`、`mx status catpaw`。
+- 不要写 `mx catpaw status`：渠道名与动词共享位置会产生二义，补全器也无法工作。
+- 仓库级动词（`start` / `stop` / `restart` / `serve` / `web`）不带 cid；
+  `status` / `model` / `bill` / `acct` / `path` / `login` / `relogin` 都可以带 cid ——
+  `mx status <cid>` 才是「某渠道的状态」。
+- 命令组是「组名在前、子命令在后」：`mx model list` / `mx model usage`。
+  这与「渠道动词在前」不冲突，是两类不同形态。
+- `log` 也可以带 cid，但只有配 `--kind channel` 才有区别：
+  `mx log catpaw --kind channel`（`--kind channel` 必须给 cid，否则报「日志不存在」）。
+- 不确定时先 `mx --help`；脚本里加 `--json`。
+
+
+### 9.3. 命令速查
+
+**动作命令的唯一事实源就是本表。** 规则 / 契约 / 事实**不在此表**（那些在 `docs/`）；
+本表只回答「要做这件事，敲什么」。别处（README / docs / AGENTS.md）只指向本文件，不复述命令。
+
+| 要做的事 | 命令 |
+| --- | --- |
+| 起网关（幂等） | `mx start`（启动失败恒非零退出；`--force` 已在跑也重启，`--wait <s>` 健康等待秒数） |
+| 停 / 重启网关 | `mx stop` / `mx restart` |
+| 前台调试运行 | `mx serve`（无监督直跑，不落 PID） |
+| 看网关与全部渠道状态 | `mx status` |
+| 看某渠道状态 | `mx status <cid>` |
+| **确认没有陈旧构建** | `mx status --json` → `stale_build` 必须为 `false` |
+| 看池里有哪些模型 | `mx model list` |
+| 看各渠道用得怎么样 | `mx model usage` / `mx model usage --refresh` |
+| 看某渠道的模型与倍率 | `mx model <cid>` / `mx model <cid> --refresh` |
+| 看某模型的规格 | `mx model spec <模型名>`（窗口 / 输出 / 档位 / 倍率 / 模态） |
+| 看额度 / 账单 | `mx bill [<cid>]`（**直连上游**，不经网关）；`--accounts` 逐账号列（池内 ≥2 个账号时默认列出） |
+| 登录 | `mx login <cid>`（已有凭据时幂等）；`mx login list` 看可登录渠道 |
+| 强制重新授权 | `mx relogin <cid>`（清主凭据后重走授权，**不是**刷新） |
+| 登出（销毁本地凭据 + 清空账号池） | `mx logout <cid>` |
+| 看账号池 | `mx acct <cid>` / `mx acct <cid> list` |
+| 切生效账号 | `mx acct <cid> use <key>` |
+| 加 / 删账号 | `mx acct <cid> add`（必须给 cid） / `mx acct <cid> remove <key>` |
+| 看存储落点 | `mx path [<cid>]` / `mx path --all` |
+| 打开 Web 控制台 | `mx web`（确保网关在跑并打印 `/web/`，**不自动开浏览器**） |
+| **发版（tag + Release）** | 改全部版本号落点（各 `package.json` + 渠道 `channel.ts`）→ `chore(release): 发布 vX.Y.Z` 提交 → PR 合并 → 在 main 打 `vX.Y.Z` tag 并建 GitHub Release（Release body 即版本说明，控制台「发现新版本」卡片读它；见 `docs/WORKFLOW.md`） |
+| **查日志 / 排查故障** | 见 [LOGGING.md](./LOGGING.md) §10「故障分诊」 |
+| **压缩存量日志正文**（维护，非日常） | `mx log --compact`（把已封存轮转段里仍是明文的抓取正文压成压缩态；新写入本就压缩，见 `docs/LOGGING.md` §9） |
+
+本文件只保留**别处没有的内容**：
+
+- `§0 语法铁律`（动词优先、为什么 `mx <cid> <动词>` 不可用）
+- `§2 常用工作流`（具体步骤、参数、坑）
+- `credentials.json` 不见了但账号池里还有货的处置（见下）
+
+> **`credentials.json` 不见了但账号池里还有货**：先 `mx acct <cid> list` 看池子。
+> 池里有状态正常的账号就 `mx acct <cid> use <key>` —— 它会把池里那份复制回主凭据文件，
+> **不用重新走浏览器授权**。`relogin` 只删主 `credentials.json`，池里的
+> `accounts/<key>.json` 仍保留，需要时可以用 `mx acct <cid> use <key>` 切回。
+
+
+### 9.4. 常用工作流
+
+### 2.1 启动 / 重启并确认生效
+
+```bash
+mx start            # 幂等：已在跑直接返回
+mx restart          # 改完代码或配置后
+mx status --json    # gateway.reachable=true 且顶层 stale_build=false
+```
+
+判定字段：`gateway.reachable`、顶层 `stale_build`、`console.ui_state`。
+JSON 里**没有**顶层 `status` 字段（人读输出里的 `状态:` 对应 `console.ui_state`）。
+`mx status` 的退出码恒为 0，必须解析 JSON。
+
+改了 `packages/core/**`、`packages/cli/**`、`packages/ui/**` 后必须先 `npm run build`
+再 `mx restart`；只 restart 不 build，运行的是旧代码，`status` 会报 `stale_build=true`。
+此时不要宣称修复已生效。
+
+### 2.2 看模型：两个命令别混
+
+```bash
+mx model list                 # 池视图：有哪些对外模型（按模型分组，逐渠道列剩余额度）
+mx model usage                # 池账本：各渠道用得怎么样（每渠道一行）
+mx model catpaw              # 渠道视角：catpaw 能供哪些对外模型（缓存优先，首次会拉一次）
+mx model catpaw --refresh    # 强制重拉上游目录（失败 exit 1）
+curl -s http://127.0.0.1:4412/v1/models   # 客户端实际看到的 id
+```
+
+对外 id 是**模型家族裸模型名**（清单以 `mx model list` / `GET /v1/models` 为准，不在此枚举）；家族外的名字一律 400。
+渠道由网关按账号池剩余额度**自动挑**，请求里不带渠道前缀。
+
+`--refresh` 的退出语义不同：`mx model <cid> --refresh` 失败非零退出；
+`mx model usage --refresh` 失败只打印一行（`--json` 下连这行都没有），函数始终返回 0 ——
+脚本要另看账单时间戳或日志。
+
+### 2.3 登录与账号池
+
+```bash
+mx login list                 # 可登录渠道
+mx login catpaw               # 已有凭据时幂等，不会重新授权
+mx relogin catpaw             # 清掉主凭据后重新授权（token 过期/换号）
+mx acct catpaw                # 账号池 + 当前生效账号（默认 list）
+mx acct catpaw use <key>      # 切换生效账号（会替换主凭据文件）
+mx acct catpaw add            # 走该渠道登录流程并加入池（必须给 cid）
+mx acct catpaw remove <key>   # 生效账号=同时登出；非必要不要删
+```
+
+账号健康态：连续失败 3 次标 `error`，鉴权失败标 `unauthorized`，额度耗尽标 `cooldown`；
+三者都会被路由跳过，但**凭据不会自动删除**。不要手工删 `~/.modelmux/**/credentials.json` ——
+手工删会让 `status` 显示未登录；要重登用 `relogin`，要恢复池内账号用 `acct <cid> use <key>`。
+
+### 2.4 额度与账本
+
+```bash
+mx bill                     # 全部渠道的额度/账单（只读，直连上游）
+mx bill catpaw              # 单渠道（会打印套餐名、百分比、到期天数）
+mx bill catpaw --accounts   # 再加**逐账号**额度表（池内 ≥2 个账号时本来就默认列）
+mx model usage              # 池账本（各渠道用得怎么样：请求成败、已用量、冷却）
+mx model usage --refresh    # 立刻重查各渠道账单
+```
+
+`mx bill` 是上游额度；`mx model usage` 是本地池账本，两者不是一回事。
+`model list` 与 `model usage` 是**两个不同视图**：前者按模型分组回答「从哪几家出」，
+后者按渠道列账本。账本的「账号池剩余额度之和」是**选路主键**（其余数字只作健康度观察）。
+
+额度是**账号级**的：同一渠道下每个账号各有自己的余额（loomy 实测 4 个账号各自 5000/日
++ 各自一次性新手奖励）。`mx bill <cid>` 因此会逐账号列一遍（池内 ≥2 个账号时默认列），
+生效账号那行带 `*`。请求失败时网关也会按账单证据判断是否**自动换号**
+（两段式：本地快照 → 实时重查；详见 `docs/ACCOUNT-ROTATION.md`）。
+
+### 2.5 日志与 Web
+
+```bash
+mx log --list
+mx log --kind access --outcome failure --lines 50
+mx log --kind lifecycle --lines 30
+mx web                     # 确保网关在跑 -> 打印 http://127.0.0.1:4412/web/
+```
+
+排查「为什么慢 / 为什么失败 / 网关挂了」时看 [LOGGING.md](./LOGGING.md) §10「故障分诊」，
+不要在本文件里重复展开日志字段与错误码。
+
+
+### 9.5. 参数与坑
+
+- `--json` / `--quiet`：主要作用于 `status` / `bill` / `path` / `log` / `acct` / `login` /
+  `model`；`start` / `stop` / `restart` / `web` 只解析不输出 JSON，`--quiet` 只影响启停。
+- `--refresh`：`model <cid>` 重拉目录；`model usage` 重查账单；退出语义见 §2.2。
+- `--wait <秒>`：启动健康等待（默认 30，可用 `MODELMUX_START_WAIT_MS` 覆盖）。
+  启动失败**恒非零退出**；`--strict` 仅兼容保留（默认即严格），传不传都一样。
+- `--realm`：登录域（多数渠道忽略或仅兼容）；`--wechat`：扫码登录入口 ——
+  参数仍存在，但**目前没有渠道实现** `loginWechat`，传入会报不支持。
+- `--addr`：网关监听地址（默认 `127.0.0.1:4412`）；`--ui-port` 是**控制台端口**，
+  不是监听地址。`mx web` 不读 `--addr`，只认 `--host` / `--port` ——
+  改了网关端口后，`mx status` 要带 `--addr`，`mx web` 要带 `--port`。
+- `mx log` 默认是 system 日志；查请求必须加 `--kind access`。
+- 不要在网关有活跃流时随手 `mx restart`，会切断客户端请求。
+- 管理命令不需要远程服务器或管理员权限（端口被系统占用除外）；`bill` / `login`
+  会访问上游网络。
+
+
+### 9.6. 输出约定
+
+- 先给可直接执行的命令，再解释一句；不要贴大段帮助文本。
+- 需要判断结果时给判定字段：`gateway.reachable`、顶层 `stale_build`、`console.ui_state`；
+  **不要用 `mx status` 的 exit code 判断健康**。
+- 涉及敏感信息时不回显 token / cookie；`mx bill` 只展示额度与套餐信息。
+
+> 来源：原 `mx-cli` 技能（已并入本节，技能不再注册）。
 
 ## 10. 交付检查清单
 

@@ -9,11 +9,11 @@
 
 | 维度 | 当前设计 | 说明 |
 |---|---|---|
-| 对外模型 id 形态 | `<cid>/<模型>` 动态池（见 §2） | 客户端用渠道前缀显式选池子 |
+| 对外模型 id 形态 | **对外模型家族裸模型名**（家族表见 §2；实际清单看 `GET /v1/models`） | 渠道由网关自动挑，客户端不指定 |
 | 模型目录来源 | 磁盘缓存 → 远端目录 → 渠道内置兜底表（见 §2.8） | 三级来源，兜底表在渠道包里 |
 | 账号池存储布局 | `accounts.json` + `accounts/<key>.json`（见 §3.4） | 渠道零改动接入 |
 | 账号选择与失败转移 | 当前生效账号 + 401/403 刷新重试 + 连败标记跳过；鉴权失效一律手动切号 | 见 §3.3 |
-| 跨渠道自动选池 | 不做：渠道由请求前缀显式指定 | 见 §2.4 |
+| 跨渠道自动选池 | **有效优先级降序** = 剩余额度 × 速度系数 × 可靠性系数（慢渠道、从未跑通的渠道打折，见 §2.4），失败顺延下一家 | 渠道对客户端透明 |
 | 额度耗尽自动换号 | 明确额度信号直查实时账单 + 冷却旧账号 + 本次请求重试一次；生效账号已在冷却时请求前提前切走 | 见 §2.4 与 [ACCOUNT-ROTATION.md](./ACCOUNT-ROTATION.md) |
 | 轮询 / 最久未用 | 未实现 | 见 §3.4 |
 
@@ -21,82 +21,96 @@
 
 - **一个 CLI**：`mx`（bin `modelmux` 全名等价）—— 一个网关进程、一个入口。
 - **渠道的新角色**：不是「一个网关」，而是**一个池子**。
- - **模型池**：该渠道 `catalog` 对外暴露的全部可用模型（共享层不做家族白名单，见 `CONTRACT-TS.md` §4.1）。
+ - **模型池**：该渠道 `catalog` 对外暴露、且属于对外家族的全部可用模型（家族表见 `CONTRACT-TS.md` §4.1）。
  - **账号池**：该渠道的多个账号；`credentials.json` 只是当前生效账号的兼容镜像（见 §3.4）。
-- **对外形态**：一个 base URL（`http://127.0.0.1:4412/v1`）+ **`<cid>/<模型>` 池 id**
- （`loomy/kimi-k2.6` 这种）。客户端用渠道前缀显式指定渠道；
- 渠道内部的账号池轮换照旧 —— 见 §2。
+- **对外形态**：一个 base URL（`http://127.0.0.1:4412/v1`）+ **对外模型家族的裸模型名**
+ （家族表见 §2）。客户端只说要哪个模型，**哪家渠道出**由网关按账号池剩余额度自动挑，失败顺延下一家 —— 见 §2。
 
-> 裸模型名（不带渠道前缀）一律 `400 unknown_model` —— 渠道选择权在请求方手里。
+> 渠道对客户端**透明**：请求里不带渠道前缀；家族外的模型名（哪怕是别家真实存在的模型）
+> 一律 `400 unknown_model`。模型家族是网关的**产品面**，声明在
+> `packages/core/gateway/src/pool/model-family.ts`（共享层唯一允许出现模型名的地方）。
+>
+> **入站协议**：除 OpenAI chat（`/v1/chat/completions`）外，网关原生服务 Anthropic
+> Messages（`/v1/messages`，Claude Code 直连）与 OpenAI Responses（`/v1/responses`，
+> Codex 直连）—— 请求翻译成内部 chat 形态后走**同一条**池转发管线，回程按协议编码；
+> 这两条路径上家族外的模型名一律 400；唯一例外是 Claude Desktop 的三个角色名，
+> 按固定表映射到池模型（见 [CONTRACT-TS.md §4.1.1](./CONTRACT-TS.md)）。
+> 端点、解析与客户端接入见 [CLIENT-INTEGRATION.md](./CLIENT-INTEGRATION.md)。
 
 ---
 
-## 2. 公共模型池：`<cid>/<模型>` 池 id（全渠道模型并集）
+## 2. 公共模型池：对外模型家族裸模型名
 
-网关对外暴露**全部渠道 `catalog` 归一化后的模型**，每个 id 挂上渠道前缀：
+网关对外只暴露**家族表里声明的模型**，客户端用**裸模型名**请求：
 
 ```
-/v1/models = ⋃ 各渠道 exposedIds()  →  归一化（小写、版本号点号、去 `-official`/日期/`-latest`、剥厂商路径段）  →  渠道内去重  →  <cid>/<模型>  →  排序
+/v1/models = 家族中「至少一个渠道能供给」的 canonical 名  →  排序
+                 ↑ 渠道目录里的等价写法（大小写 / 连字符版本号 / sn- 包装 / -official / 日期后缀）归一后匹配
 ```
 
-上游目录里有什么就对外暴露什么（各渠道的 kimi / qwen / MiniMax / 豆包 / 盘古 等型号同样进池）。
+| 对外模型 id | 渠道侧等价写法（只用于内部归一） | `owned_by` | 候选渠道（**以渠道目录实时声明为准**，下列为实测示例） |
+|---|---|---|---|
+| `deepseek-v4.1-flash` | `deepseek-flash`（workbuddy 的上游 id） | `deepseek` | traecn、loomy、workbuddy、raccoon、codebuddycn、catpaw（渠道级窗口 600k）—— 上游写法逐渠道不同（如 raccoon 的 `sn-deepseek-v4-1-flash-1017`），catpaw 的渠道级窗口见注册表 `channels.catpaw.contextWindow` |
+| `kimi-k3.1-pro` | `sn-kimi-k3-1-pro`（raccoon 的上游 id） | `moonshot` | codebuddycn、workbuddy、qwenworkcn、raccoon、traecn、catpaw —— 上游写法逐渠道见注册表 `channels` 段 |
 
-**归一化只作用于前缀之后的模型段**（渠道 id 原样；模型段收敛各渠道的不同写法）：
+**客户端只认这两个名字**：入站解析放行的只有对外公布的裸名（大小写不敏感，可带
+`modelmux/` 前缀与 `[1m]` 后缀）。渠道侧等价写法（`deepseek-flash`、
+`sn-deepseek-v4-1-flash-1017`）只用于把**渠道目录条目**归到家族，客户端写了照样
+`400` —— 对外一个模型只有一个名字（2026-11-15 产品口径）。
 
-| 渠道 | 目录里的原始写法（实测） | 对外池 id |
-|---|---|---|
-| raccoon | `sn-deepseek-v4-1-flash` | `raccoon/deepseek-v4.1-flash` |
-| traecn | `DeepSeek-V4-Flash-Official` | `traecn/deepseek-v4-flash` |
-| loomy | `deepseek-v4-flash-0731` | `loomy/deepseek-v4-flash` |
-| qoder / qodercn | `gfmodel`（按展示名归一） | `qoder/glm-5.3-flash` |
+> 候选渠道 = **渠道目录 `exposedIds()` 现算** ∪ **注册表 `channels` 声明**（兜底，见
+> [MODEL-CATALOG.md](./MODEL-CATALOG.md) §5）：目录是上游能力的实时事实（上游加/下模型、
+> 用户改 `hidden` 都立刻反映），注册表保证新装 / 未登录 / 目录未拉时候选不消失。
+> 隐藏条目（`hidden` / `visible === false`）、官方「自定义模型」占位、上游标记不可用的
+> 通道由各渠道自己排除，共享层不做闸门。家族外的条目（各渠道的 kimi / qwen / MiniMax /
+> 豆包 等）**不进对外池**。机械校验见 `scripts/verify-contract.mjs` 的「统一模型注册表」一节。
 
-**跨渠道不合并**：`catpaw/glm-5.3-flash` 与 `raccoon/glm-5.3-flash` 是两个独立 id ——
-同名模型用哪家渠道，由请求方写前缀决定。
-
-> 过滤只由**渠道自己的目录**决定：隐藏条目（`hidden` / `visible === false`）、
-> 官方「自定义模型」占位（`custom_model_*`）、上游标记不可用的通道会被各渠道排除，
-> 共享层不做家族闸门。`traecn` 的隐藏条目与 `custom_model_*` 同样不出现在 `/v1/models`。
-
-来源：`packages/core/gateway/src/pool/pool-targets.ts`（池 id 与匹配）、`pool-usage.ts`（账本与健康度）。
+来源：`pool/model-family.ts`（家族表与对外名单）、`pool/inbound-model.ts`（客户端名解析）、
+`pool/pool-targets.ts`（匹配与候选）、`pool-usage.ts`（账本与额度）。
 
 ### 2.1 匹配 = 归一化 + 精确相等
 
-各渠道目录的命名完全不同，所以池层先归一化（`canonicalModelId`）：
+各渠道目录的命名完全不同，所以先归一化（`canonicalModelId`）：
 
 1. 取 `/` 最后一段（去 `deepseek/`、`z-ai/` 这类厂商前缀）
 2. 全小写
-3. 去渠道包装前缀（`sn-`）
+3. 去渠道包装前缀（`sn-` 等）
 4. 「数字-数字」的连字符转点：`v4-1` → `v4.1`、`5-3` → `5.3`
 5. 去尾部修饰：`-official`、`-<4位数字>`、`-latest`
 
-然后做**精确相等**匹配 —— 用包含匹配的话，`glm-5.3-flash` 会把
-`glm-5.3-flashx` 一起捞进来，精确相等是唯一的隔离保证。
+然后做**精确相等**匹配 —— 用包含匹配的话，`deepseek-v4-flash` 会把
+`deepseek-v4.1-flash` 一起捞进来，精确相等是唯一的隔离保证。
 
-客户端请求名走同一条归一化路径（渠道归属由**第一个 `/`** 显式声明，模型段再剥厂商路径
-不会串渠道）；裸模型名（无 `/`）判为格式错误，一律 `400 unknown_model`。
+客户端请求名走 `pool/inbound-model.ts`：先剥 `[1m]` 后缀与 `modelmux/` 前缀，再对
+**对外名单**做精确匹配（`isClientModelId`），命中即取 canonical；没命中再看 Claude Desktop
+的三个角色名（固定表）。两者都不中一律 `400 unknown_model`，文案列出对外公布的两个名字。
+渠道目录条目走另一条路（`canonicalOf` + 同一套宽松归一化）：目录里的上游写法
+（`DeepSeek-Flash`、`sn-deepseek-v4-1-flash-1017`）照旧归到同一 canonical，于是「目录里写
+`deepseek-flash` 的渠道，请求 `deepseek-v4.1-flash` 也能打过去」。家族内但**没有任何渠道
+供给**的同样是 `400`（没货），「候选渠道当前都不可用」才是 `503`。
 
-渠道目录里的一切条目都对外暴露（全池）；请求时该渠道目录里没有的模型回
-`400 unknown_model`（渠道没货，换渠道是客户端的决定），登录态问题回 `503`。
+### 2.2 账本：路由主键（剩余额度 × 速度 × 可靠性）＋ 健康度观察
 
-### 2.2 账本：观察渠道健康度
+账本（`pool-usage.json`）按渠道记录**账号池剩余额度之和**（逐账号 `credits.remain` 累加，
+没有逐账号快照时回落渠道级 `remain`）与 ok / fail 计数。它有两个用途：
 
-账本（`pool-usage.json`）按渠道记录账单已用量与 ok / fail 计数；渠道由 `<cid>/` 前缀显式指定，
-账本用于：
+- **跨渠道选路的排序主键**：**有效优先级 = 剩余额度 × 速度系数 × 可靠性系数**降序，无额度数据的排最后（见 §2.4）；
+- `mx model list` / `mx model usage` / Web 控制台展示渠道健康度（已用量、冷却、连败），
+  以及**账号池的展示排序**（`pool/pool-usage.ts::sortChannelsByUsage`，只影响展示）。
 
-- `mx model list` / `mx model usage` / Web 控制台展示渠道健康度（已用量、冷却、连败）；
-- **账号池的展示排序**（`mx acct` 与 Web 账号池页）：`ok + fail` 就是该渠道的**使用频率**，
-  频率降序、同频按 cid 字典序；两者都是 0（该渠道一次没被调用过）时是纯字母序。
-  实现见 `pool/pool-usage.ts::sortChannelsByUsage` —— 只影响展示，**路由仍由 `<cid>/` 前缀决定**。
+**渠道开关先于一切排序**：设置弹窗关闭的渠道（`setting.json` 的 `disabled_channels`）
+在 `poolCandidates` 里直接被跳过 —— 不参与选路、不占候选位，账号池列表也不渲染。
+关闭 ≠ 注销：凭据、登录态、账本原样保留，勾回来立即恢复。它不是「优先级排到最后」，
+而是「不存在」；配额与口径仍按启用集合统计。
 
 上游账单**没有「请求次数」**这种字段，只有额度（积分 / credits / 美元，各家单位不同）——
-账本数字只作健康度参考，不作路由依据。
+跨渠道相加只是**近似**的优先级信号，真正的额度判据仍在渠道内（`ACCOUNT-ROTATION.md` 的账单核查）。
 
-> **失败冷却只标记、不剔除请求**：冷却期（`FAIL_COOLDOWN_MS = 60s`，
-> `packages/core/gateway/src/pool/pool-usage.ts:33`）内该渠道在账本里被标「冷却中」，
-> 供视图观察。但路由侧「剔除冷却渠道 → 全冷却时回退完整候选」这条逻辑在现行
-> `<cid>/<模型>` 形态下**没有实际效果** —— 候选至多一条，剔除后必然回退到它自己
-> （`packages/core/gateway/src/http/chat/route.ts:114-121`）。
-> 也就是说：**冷却不会让请求失败，也换不到别的渠道**，只是账本上的一个观察标记。
+> **失败冷却同时影响候选集与观察**：冷却期（`FAIL_COOLDOWN_MS = 60s`，
+> `packages/core/gateway/src/pool/pool-usage.ts`）内该渠道被**硬排除**出候选；
+> 全池都在冷却时回退到完整候选（冷却只是短暂状态，服务不能因此不可用）。
+> 额度耗尽的**账号**冷却由 `runtime/account-pool.ts` 管（窗口刷新自动恢复），
+> 逐账号冷却的账号在 `totalRemainOf` 里按 0 计。
 
 ### 2.3 账本落点与刷新节奏
 
@@ -104,7 +118,7 @@
 
 ```json
 { "version": 1, "channels": {
-   "lobsterai": { "used": 17, "size": 100, "remain": 83, "unit": "credits",
+   "raccoon": { "used": 17, "size": 100, "remain": 83, "unit": "credits",
                  "billing_at": "2026-10-08T…", "billing_ok": true,
                  "ok": 12, "fail": 0, "cooldown_until": 0,
                  "accounts": { "<account-key>": { "ok": 10, "fail": 1,
@@ -133,31 +147,90 @@
 为什么不用自然日：多个渠道的日额度在本地 0 点**之后**才到账，按自然日抓基线会让
 `remain > 基线`，比例被 clamp 成恒 100%（2026-10-24 实测 traecn / qodercn / raccoon）。
 为什么不用上游 `size`：各渠道口径不一（loomy 的 `dailyQuota` 只在首登响应里、
-workbuddyai 的 `size` 是月包），拿它当分母同样恒 100%。
+月包型渠道的 `size` 是月包），拿它当分母同样恒 100%。
 
 前端只认基线：没有基线或 `remain` 不是有限数字时不画进度条、不显示百分比
 （不回退 `remain_percent`）。
 
-### 2.4 路由与失败转移
+### 2.4 路由与失败转移（跨渠道）
 
-1. **解析**：`<cid>/<模型>` → 渠道段（大小写不敏感）+ 模型段（归一化）；
-   渠道未注册 / 目录未命中 → `400 unknown_model`。
-2. **单候选尝试**：渠道已由请求方指定，候选**至多一条**；请求体由该渠道单独构建
-   —— 上游 slug 与渠道一一对应（TRAE 认 `DeepSeek-V4-Flash`，不认全小写），
-   且 `catpaw` 的 `prepareChat` 有建会话副作用，只能在轮到它时才执行。
-3. **只在「上游响应头到达之前」重试**：一旦开始转发就不能换请求（响应头已发给客户端）。
-4. **渠道内部**先做一次「刷新 token → 用新 token 重试本账号」；仍失败则标记该账号
+1. **解析**：对外名单精确匹配 → canonical（家族外 → `400 unknown_model`）；
+   家族内但没有任何渠道供给 → `400`（没货）。日志的 `model` 写 canonical 名。
+2. **候选收集**：能供给该模型的渠道先按**档位**、档位内再按**有效优先级降序**排好
+   （`pool/pool-targets.ts::poolCandidates`）—— 客户端不指定渠道。
+   候选 = 渠道目录 `exposedIds()` 现算 ∪ 注册表 `channels` 声明兜底（见
+   [MODEL-CATALOG.md](./MODEL-CATALOG.md) §5）。
+
+   **档位（`priorityTier`，数值越小越优先）是硬的**：不同档位的渠道永不按额度比较，
+   低档位只要还有额度就一定排在前面。用于「额度当天清零、必须在别的渠道之前用掉」的渠道
+   （如 loomy：签到送的额度不用就作废）。乘法权重做不到这一点 —— 实测 loomy 1020×2
+   仍输给 traecn 2329×1，易失额度照样留着不用。
+
+   **档位内**先按**是否排队**（能力位 `capabilities.queue`，缺省 false）：不排队的渠道
+   整体排在排队渠道之前 —— 上游会排队的渠道不作为「有货就先用」的对象，但**仍在候选里**，
+   真撞到排队时网关立即换下一条（不等待）。再按**有效优先级 = 剩余额度 × 速度系数 × 可靠性系数**：
+
+   **模型级渠道偏好**（`<root>/model-prefs.json`）在**排序之后**把指定渠道提到最前：
+   用户表达「这个模型就走这家」，优先于一切自动排序。它**只换顺序、不改候选集** ——
+   被偏好的渠道冷却 / 额度耗尽 / 凭据失效时，后面几家照常顶上，不需要额外开关。
+   偏好指向未注册或不供该模型的渠道时静默落空（渠道包可能后装，偏好是用户意图）。
+   落点见 [STORAGE-CONVENTION.md](./STORAGE-CONVENTION.md)。
+   **覆盖范围**由家族表的 `PREFS_CANONICALS` 声明：只有多渠道供给的模型有偏好语义，
+   收窄到唯一渠道的模型（`SINGLE_CHANNEL_SUPPLY`）不渲染下拉。
+   每次选路的**候选顺序、实际尝试与被剔除的原因**（未登录 / 超窗 / 凭据失效 / 冷却）
+   都落进访问日志的 `route` 字段（见 [LOGGING.md](./LOGGING.md) §3.1），控制台展开详情可见 ——
+   否则「这次为什么走了这家」事后无从查证。
+
+   | 量 | 口径 |
+   | --- | --- |
+   | 剩余额度 | `totalRemainOf(cid)`（账本，零网络开销） |
+   | 选路权重 | 渠道声明的 `priorityWeight`（缺省 1）；只改同档位内的相对次序 |
+   | 速度系数 | `clamp(avgTps / 100, 0.25, 1)`；`avgTps` = **最近 3 个有日志的日期**的实测均值（按「渠道 × 模型」优先、不足回落渠道级；每天读尾部 1MB，按天遍历而不是全局取最近 N 条 —— 后者会被忙渠道占满，把一天只有几条的慢渠道挤出样本），TTL 60s |
+   | 可靠性系数 | `(ok + 1) / (ok + fail + 1)`，成功率的拉普拉斯平滑估计；没有样本 → 1（**不罚**，新登录的渠道不该因为「还没被用过」就排最后）；`ok=0 / fail=4` → 0.2 |
+   | 不罚的情况 | 速度：没有数据 / 样本 < 2 条 → 系数 1（门槛取 2 而不是 3：一天只有 2 条请求的渠道最需要被识别，门槛 3 会让它们永远进不了样本）；可靠性：没有任何请求样本 → 1 |
+
+   为什么乘而不是加：额度差异常是数量级（0 vs 5000），速度差只有几倍 —— 相加会让速度几乎不起作用，
+   相除会让慢渠道彻底失去竞争力。乘法让「慢」表现为「同样的货，优先级打折」，只影响同一量级内的排序；
+   下限 0.25 保证**唯一有货的慢渠道**仍然可用（只是排后）。
+   为什么读日志而不是请求结束时记账：TPS 要等响应结束（`generateMs` + usage）才拿得到，
+   而路由发生在请求**入口** —— 只能用「最近一段时间的实测」当先验。
+   为什么要可靠性：`ok/fail` 是**本地实测**，额度只是上游快照 —— 一个只剩额度、却从未跑通的渠道
+   会一直排在首位，每个请求先白撞一次 —— 本地 `ok/fail` 实测正是为了暴露这类
+   「额度好看却跑不通」的渠道。可靠性只**压低**优先级，不否定「谁还有货」：
+   额度差足够大时（10 倍）它不翻盘。
+3. **候选过滤**：凭据读不出的渠道直接退出路由（不可能成功，白耗尝试预算）；
+   生效账号已被标 `unauthorized`（凭据失效，**终态**，重试永远不会成功）的渠道硬排除；
+   冷却中的渠道硬排除。全被过滤掉时回退完整候选（服务不能因此不可用），仍全失败 → `503 not_authenticated`。
+   **上下文窗口过滤**：请求体估算的输入 tokens（`estimateInputTokens`，与
+   `/v1/messages/count_tokens` 同一套启发式）超过渠道级窗口（注册表 `channels` 条目的
+   `contextWindow`，缺省回落模型级）的候选直接跳过；**不参与冷却回退**——输入超窗是硬
+   事实，回退把超窗渠道放回来也一定失败。全部候选超窗 → `400 input_exceeds_context`；
+   窗口数据缺失的渠道不过滤（没有数据不能当没有能力）。跳过写网关日志。
+4. **逐候选尝试**：请求体由**该候选渠道**单独构建（上游 slug 与渠道一一对应，
+   TRAE 认 `DeepSeek-V4-Flash` 不认全小写；`catpaw` 的 `prepareChat` 有建会话副作用，
+   只在轮到它时才执行）。**只在上游响应头到达之前**重试，一旦开始转发就换不动。
+5. **渠道内部**先做一次「刷新 token → 用新 token 重试本账号」；仍失败则标记该账号
    不可用并返回鉴权错误，**由用户手动切换账号**（`mx acct <cid> use <key>` /
    Web 账号池），不自动切号。
-5. **额度耗尽例外**：失败错误码属于「可能是额度问题」那一类（`quota_exhausted` /
-   `upstream_error` / `upstream_timeout`）时，先按**账单证据**判断（见下），
-   确认额度不足才把生效账号标冷却并**自动切到池内有额度的账号**，本次请求用新账号
-   **重试一次**（同一候选，因为池 id 已钉死渠道）。判据、边界与理由见
-   [ACCOUNT-ROTATION.md](./ACCOUNT-ROTATION.md)。
-   其中 `quota_exhausted` 已明确是额度问题，账本快照不参与否决（快照会滞后，见该文件 §3.1）；
-   另有**前置**路径：请求发出前发现生效账号在冷却，直接切走（同文件 §3.5）。
-   鉴权类失败（`not_authenticated` / `upstream_unauthenticated`）**不在**此列 ——
-   换账号会把「凭据被撤销」掩盖成随机成功，仍然只能手动处理。
+   这条刷新在**两条**路径上都要走：既覆盖 `openStream` 收到的 401/403，也覆盖
+   `prepareChat` 这类**建连之前**的前置（有的渠道鉴权失败就发生在前置里，上游回
+   渠道自己的业务码）—— 漏掉后者，一个「access_token 死了、refresh_token 还活着」
+   的账号会被当成终态永久踢出候选，而它恰恰是额度最高的那条。
+   刷新成功即清掉 `unauthorized` 标记（凭据已活，不该再当终态）。
+6. **额度耗尽例外**：失败错误码属于「可能是额度问题」那一类（`insufficient_quota` /
+   `upstream_error` / `upstream_timeout`）时，先按**账单证据**判断，确认额度不足才把
+   生效账号标冷却并**自动切到池内有额度的账号**，本次请求用新账号重试一次；
+   判据、边界与理由见 [ACCOUNT-ROTATION.md](./ACCOUNT-ROTATION.md)。
+7. **跨渠道顺延**：某个候选的账号全部耗尽 / 该渠道失败 / **上游 200 却零产出**时，
+   试**下一个候选渠道** —— 「第一家全烧光 → 遍历下一家」，直到全部试完才回最终错误。
+   空流能顺延的前提是**响应头挪到首次真正写出才落**（`http/chat/forward.ts` 的 `ensureHead`）：
+   写过头就等于向客户端承诺接了这个请求，再换渠道会变成两个响应。
+   尝试上限默认不设（候选渠道数），`MODELMUX_POOL_MAX_TRIES` 可作安全阀。
+8. **客户端日志**：访问日志的 `model` 是 canonical 模型名、`cid` 是**实际接管**本次请求的
+   渠道（逐次尝试写入，最后一条即服务方）—— 用来定位「哪个渠道的 deepseek 偏慢」。
+
+鉴权类失败（`not_authenticated` / `upstream_unauthenticated`）**不在**换号之列 ——
+换账号会把「凭据被撤销」掩盖成随机成功，仍然只能手动处理。
 
 #### 额度耗尽 → 账号**冷却**（不是故障）
 
@@ -167,7 +240,7 @@ workbuddyai 的 `size` 是月包），拿它当分母同样恒 100%。
 |---|---|---|---|
 | 瞬时故障 | 连败达 `FAIL_STREAK_LIMIT`（3） | `error` + `trip_until`（Web 显示「熔断 · X 后试探」） | **到期自动恢复**（半开试探）：成功恢复 `ok`，再失败退避翻倍（30s → 1m → … 封顶 30min） |
 | 凭据失效 | 401/403、刷新失败、`not_authenticated` | `unauthorized` | 只能重新登录（自动重试永远无效） |
-| **额度耗尽** | 上游错误体命中 `isQuotaExhausted`（如 workbuddyai 的 `429 + code=6004`） | **`cooldown`**（Web 显示「冷却 · 原因 · X 后恢复」） | **到期自动恢复**（惰性，无需定时器，到期自动放行） |
+| **额度耗尽** | 上游错误体命中 `isQuotaExhausted`（含 `429` + 用量超限业务码） | **`cooldown`**（Web 显示「冷却 · 原因 · X 后恢复」） | **到期自动恢复**（惰性，无需定时器，到期自动放行） |
 
 **熔断自动恢复（`trip_until`，2026-10-28 起）**：
 
@@ -222,7 +295,7 @@ workbuddyai 的 `size` 是月包），拿它当分母同样恒 100%。
   | 信号 | 原文样例 | 作用范围 | 处置 |
   |---|---|---|---|
   | **余额不足** | loomy `HTTP 402` + `insufficient_quota`「积分余额不足」 | 计费用量 | 只冷却**付费**模型；免费模型继续打上游 |
-  | **账户级用量限额** | workbuddyai `HTTP 429` + `code=6004`「usage exceeds frequency limit」 | **所有模型**（含倍率 0 的） | **一律冷却**，截止取上游给的**滚动重置时间**（如 `17:36`，不是次日 0 点） |
+  | **账户级用量限额** | `HTTP 429` + 「usage exceeds frequency limit」类业务码 | **所有模型**（含倍率 0 的） | **一律冷却**，截止取上游给的**滚动重置时间**（如 `17:36`，不是次日 0 点） |
 
   识别见 `http/chat/errors.ts` 的 `isQuotaExhausted`（是否额度类）与 `isUsageLimit`（是否账户级
   用量限额）；词表只按真机原文维护（见 `tests/quota-signal.test.ts`）。
@@ -262,28 +335,27 @@ workbuddyai 的 `size` 是月包），拿它当分母同样恒 100%。
 走既有的「刷新 token → **重试当前账号**」链路；仍失败则标该账号 `unauthorized`、
 **保留凭据**、回 502 `upstream_unauthenticated`，**不自动切号**（见 §3.3）。未声明的渠道行为不变。
 
-#### 排队帧退避重试（`isQueueError`）
+#### 排队即换渠道（`isQueueError`）
 
 有些上游过载/排队时**不拒绝连接**，而是回 HTTP 200 + SSE 里投递一个业务错误帧
-（qoder / qodercn 的 `code:"10605"` + `retryAfterSeconds`）。渠道声明
-`upstream.isQueueError(frame)` 后，共享层在**尚未向客户端写出任何字节**时消费上游流做探测：
+（qoder 系上游的 `code:"10605"`）。渠道声明 `upstream.isQueueError(frame)` 后，
+共享层在**尚未向客户端写出任何字节**时消费上游流做探测：
 
-- 翻译器逐帧处理：内容帧 → 立即停止（已有实质输出，不能再重试）；
-  错误帧 → 问 `isQueueError`：是排队就记下延迟继续等，否则**记下来交回转发/回报**（不能吞）；
-- 排队帧 → 按 `retryAfterSeconds`（封顶 12s）等待后**重开上游**（同一请求体、重新取凭据）；
-- 排队期间向**流式**客户端按轮次发进度文案（**`reasoning_content` delta**，每条以空行收尾才会换行）。
-  刻意不走 `content`：客户端按 chunk 到达顺序建行，提醒走 `content` 会先建出正文行，
-  模型的思考就落到正文后面了（2026-10-24 实测）；
-- 总时长上限 **120 秒**（含首次尝试与所有等待，`MODELMUX_QUEUE_BUDGET_MS` 可覆盖）；
-  耗尽仍无内容 → **直接回正常应答**劝主人换渠道（文案带真实渠道 id），不再干等；
-- **排队解除后补一条正文分界**「排队成功，开始生成…」：
-  提醒与模型的真思考同在思考块里，没有正文分隔时看不出排队已结束。补了之后渲染顺序是
-  `思考块(提醒) → 正文(排队成功) → 思考块(真思考) → 正文(回答)`；只在排队真的解除过时发。
+- 翻译器逐帧处理：内容帧 → 立即停止探测（已有实质输出，不能再换）；
+  错误帧 → 问 `isQueueError`：是排队就放弃本候选，否则**记下来交回转发/回报**（不能吞）；
+- **排队即放弃本候选、换下一条**：`ProbeState.switchChannel` 置位后
+  `attemptCandidate` 返回 `retry`，编排层换下一个候选渠道。不等待、不重开同一条流、
+  不向客户端写任何排队相关字节。
+- 换完没有下一条可用时，整条请求以 503 `upstream_queued` 收尾 —— **排队请求永不被接受**。
 - 探测阶段已消费的帧**按原序补写**给客户端再续传剩余流，不丢前缀；探测用的**翻译器实例
   也一并与转发层共享**（它的行缓冲里可能还有半行）。
 
-注意：这是**请求级**的等待重试（单活跃账号模型下的简化形态）。
-账号切换一律**手动**：鉴权失败只刷新 token 重试本账号，失败就标记不可用，
+早先那套「按 `retryAfterSeconds` 退避重试 + 排队进度文案 + 超预算劝换渠道 + 排队成功分界」
+已全部移除（2026-11-08）：qoder 实测首轮就要等 15s+、整轮可拖到两分钟，等待换来的结果是
+客户端早已超时走人。相应的预算常量（`MODELMUX_QUEUE_BUDGET_MS`）、放弃文案与
+`queuedOut` / `giveUpText` 两个状态字段一并删除。
+
+注意：账号切换一律**手动**：鉴权失败只刷新 token 重试本账号，失败就标记不可用，
 由用户 `mx acct <cid> use <key>` 决定下一步（见 §3.3）。
 
 **三个必须保持的行为（均有回归测试锁死）**：
@@ -307,16 +379,16 @@ workbuddyai 的 `size` 是月包），拿它当分母同样恒 100%。
 
 | 命令 | 看什么 |
 |---|---|
-| `mx model list` | **池视图**：有哪些模型 —— 按渠道分组，每渠道一行（模型数 + 账本状态）+ 该渠道的模型 id 列表 |
-| `mx model <cid>` | **渠道视角**：该渠道对外暴露哪些模型（`--refresh` 重拉上游目录） |
+| `mx model list` | **池视图**：有哪些模型 —— 按**模型**分组，每个 deepseek 模型一行（渠道数）+ 逐渠道的剩余额度 / 账本状态 / 目录原始写法 |
+| `mx model <cid>` | **渠道视角**：该渠道能供给哪些对外模型（`--refresh` 重拉上游目录） |
 | `mx model usage [--refresh]` | **池账本**：各渠道用得怎么样 —— 每渠道一行（已用量 / 单位 / ok / fail / 冷却）；`--refresh` 立刻重查各渠道账单 |
 | `mx bill [<cid>] [--accounts]` | **额度**（直连上游，不经网关）：渠道级一行 + **按账号**逐行（池内 ≥2 个账号时默认列出，`--accounts` 强制列出）—— 额度是账号级的，只看渠道那行分不清谁还剩多少（见 [ACCOUNT-ROTATION.md](./ACCOUNT-ROTATION.md) §2） |
 
-> `model list` 与 `model usage` 是**两个不同视图**（前者按渠道分组列模型，后者只按渠道列账本），
-> 两者都**不表示路由顺序** —— 渠道由池 id 前缀指定，账本只作健康度观察。
+> `model list` 与 `model usage` 是**两个不同视图**（前者按模型分组，后者按渠道列账本）；
+> 账本的「账号池剩余额度之和」是**选路主键**（§2.4），其余数字只作健康度观察。
 
 > 单渠道独立运行（`packages/core/channels/<cid>/dist/cli.js start`）**也走池**：
-> `/v1/models` 同样是 `<cid>/<模型>` 形态，只是候选渠道只有一个。
+> `/v1/models` 同样是 deepseek 裸模型名，只是候选渠道只有一个。
 
 ### 2.6 池元数据：最大上下文、最大输出与思考档位
 
@@ -329,9 +401,9 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 
 | 语义 | 候选字段名 | 渠道缓存里实际写的键 |
 |---|---|---|
-| 上下文窗口 | `contextWindow` / `context_window` / `maxInputTokens` / `max_input_tokens` | 驼峰 `contextWindow`（catpaw·loomy·raccoon）、下划线 `context_window`（lobsterai·traecn·workbuddy·workbuddyai）、上游原样 `max_input_tokens`（qoder·qodercn） |
-| 最大输出 | `maxOutputTokens` / `max_output_tokens` / `maxOutput` / `max_output` / `maxTokens` / `max_tokens` | `maxOutput`（catpaw·loomy·raccoon·qoder·qodercn）、`max_output`（lobsterai·traecn·workbuddy·workbuddyai） |
-| 思考档位 | `effort`（对象）/ `efforts`（数组） | 对象 `effort:{supportedLevels,defaultLevel}`（catpaw）、数组 `efforts:[…]` + `defaultEffort` / `default_effort`（loomy·traecn·lobsterai）、**渠道解析后写进来的同一形态**（qoder·qodercn，见下） |
+| 上下文窗口 | `contextWindow` / `context_window` / `maxInputTokens` / `max_input_tokens` | 驼峰 `contextWindow`（catpaw·loomy·raccoon）、下划线 `context_window`（traecn·workbuddy）、上游原样 `max_input_tokens`（qwenworkcn） |
+| 最大输出 | `maxOutputTokens` / `max_output_tokens` / `maxOutput` / `max_output` / `maxTokens` / `max_tokens` | `maxOutput`（catpaw·loomy·raccoon·qwenworkcn）、`max_output`（traecn·workbuddy） |
+| 思考档位 | `effort`（对象）/ `efforts`（数组） | 对象 `effort:{supportedLevels,defaultLevel}`（catpaw）、数组 `efforts:[…]` + `defaultEffort` / `default_effort`（loomy·traecn）、**渠道解析后写进来的同一形态**（qwenworkcn，见下） |
 
 - **`context_window` 报的是「最大上下文」**：qoder 的 `context_config` 是档位表
   （`{"1M":{token_count:1000000}, …}`），取**最大档**而非默认档 —— 客户端永远走最大上下文，
@@ -346,17 +418,16 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
   - **没有目录端点的渠道走规格通道**：渠道用内置快照、官方文档逐模型给了档位 →
     经 `catalog.modelSpec().effort` 交给池层，来源标 `spec`（不是 `upstream`）。
     表见 [MODEL-SPECS.md](./MODEL-SPECS.md) §3.2。
-  - **上游形态与池层形态不一致时，由渠道在落盘前归一**：qoder / qodercn 上游下发的是
+  - **上游形态与池层形态不一致时，由渠道在落盘前归一**：qoder 系上游（现 `qwenworkcn`）下发的是
     `thinking_config.enabled.efforts{}`（对象 map，默认档由 `is_default` 标出），
     渠道 catalog 的 `wireEffort()` 把它归一成 `effort:{supportedLevels[],defaultLevel}`
     写进目录缓存（刷新时写、旧缓存读时补），池层 `effortOf()` 一行没改。
     实测覆盖：qoder 11 条 + qodercn 8 条（2026-10-25）。
   - 上游的 `thinking_config.disabled`（「可关闭思考」）**不映射**成 `off` 档 ——
     那会让客户端发出 `reasoning_effort: "off"`，而上游关闭思考走的是另一套字段。
-    详见 [channels/qoder/PROTOCOL.md](./channels/qoder/PROTOCOL.md) 的「上游 model 字段与思考档位」。
+    详见 qoder 渠道协议存档（git 历史，渠道已移除） 的「上游 model 字段与思考档位」。
 - **`effort` 可为 `null` = 渠道没声明**（兜底**不许编档位**）：
-  渠道目录**普遍不下发**思考档位 —— 实测只有 catpaw（`effort` 对象）、loomy / traecn /
-  lobsterai（`efforts` 数组）、qoder / qodercn（`thinking_config`，见上）有真值。
+  渠道目录**普遍不下发**思考档位 —— 实测只有 catpaw（`effort` 对象）、loomy / traecn（`efforts` 数组）、qoder 系上游（`thinking_config`，见上）有真值。
   **不许给所有模型都填 `["low","high"]`** —— 那是把「不知道」说成「支持」（界面上 200 个
   模型都会显示 low/high）。空数组同样算未声明（traecn 全部模型都写 `[]`）。`effort` 为
   `null` 时控制台显示「不支持」。
@@ -378,21 +449,19 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 `/web/api/state` 下发，客户端据此决定要不要信这个数字；控制台表格当前不展示来源标记
 （详见 [WEB-CONSOLE.md](./WEB-CONSOLE.md)）。
 
-上游自己的字段名（lobsterai 的 `maxTokens`、workbuddyai 的 `maxOutputTokens` /
+上游自己的字段名（workbuddy 的 `maxOutputTokens` /
 `max_output_tokens` / `max_tokens`）由**渠道**解析后写进缓存的 `max_output`；
 汇聚层只认缓存里那两种写法（`pool-targets.ts` 的 `CONTEXT_KEYS` / `OUTPUT_KEYS`）。
 
 - **上游不发 → 问渠道要「已知规格」**：上游目录**普遍只下发部分字段**，缺的那部分由渠道表补。
   实测（见各渠道 PROTOCOL 的「模型窗口规格」节）：
   - **上下文也发**：catpaw（`parameterDefinitions[id=context]` 逐型号档位）、loomy（`context_length`）、
-    lobsterai（`contextWindow`）、qoder / qodercn（`max_input_tokens` + `context_config` 档位表）、
+    qwenworkcn（`max_input_tokens` + `context_config` 档位表）、
     raccoon（`params.context_window`）、traecn（Remote `context_window_tokens`）、
-    workbuddy / workbuddyai（`maxInputTokens`）。
+    workbuddy（`maxInputTokens`）。
   - **输出上限也发**：loomy（`max_output_tokens`）、raccoon（`params.max_tokens`）、
-    traecn（Solo `model_detail_list[].max_tokens`）、workbuddy / workbuddyai（`maxOutputTokens`）。
-  - **只发上下文、不发输出**：catpaw / lobsterai / qoder / qodercn（输出按公开规格补）。
-  - **完全无上游目录**：**astudio**（清单随应用包内置，应用侧另有 `model-gateway/catalog-*.json`
-    下发窗口与输出上限）—— 只能按该内置目录补。
+    traecn（Solo `model_detail_list[].max_tokens`）、workbuddy（`maxOutputTokens`）。
+  - **只发上下文、不发输出**：catpaw / qwenworkcn（输出按公开规格补）。
   缺字段的渠道用**渠道包根的 `models.json`**（按公开规格维护的数据文件）回答 —— 入口是
   **可选钩子** `catalog.modelSpec?(modelId)`（契约见 [CONTRACT-TS.md](./CONTRACT-TS.md) §5.3）。
   当前**全部渠道**都实现了该钩子（规格数据落 `channels/<cid>/models.json`，
@@ -409,15 +478,16 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 ### 2.7 跨渠道同 model id 兜底
 
 同一个规范模型名常被**多个渠道**同时提供，而各渠道上游按**自己的上限**裁剪过同一个模型 ——
-实测同一个 id 的窗口能差一倍（`deepseek-v4-pro`：catpaw 报 700000、lobsterai/traecn/workbuddy
-报 1000000；`minimax-m3`：workbuddy 报 512000、loomy 报 1048576）。
+实测同一个 id 的窗口能差一倍（同为 v4-pro 的实测：一家报 700000、另一家
+报 1000000）。
 某渠道**本渠道取不到**窗口 / 输出上限 / 思考档位时，就用兄弟渠道同名的已知值兜底。
 
-池 id **不跨渠道合并**（`catpaw/glm-5.3-flash` 与 `raccoon/glm-5.3-flash` 仍是两个池 id）。
+对外**只列对外名**（渠道侧写法如 `deepseek-flash` 不进清单）；同一个模型的
+多家渠道在「模型 × 渠道」视图里逐行展开（渠道各有自己的倍率与上游写法）。
 
-实测规模（2026-10-25，走真实注册链路取数）：207 个池 id / 117 个唯一规范名 /
-**29 个跨渠道重复名**；兜底能补的：窗口 4 条、输出上限 13 条、思考档位 45 条
-（另有 19 条档位是上游已下发、归一后即可用，见 §2.6）。
+实测口径（2026-10-25，走真实注册链路取数）：跨渠道重复名 29 个（当时是全池 207 个 id）；
+兜底能补窗口 4 条、输出上限 13 条、思考档位 45 条（另有 19 条档位是上游已下发，
+归一后即可用，见 §2.6）。
 
 **取值口径**（`buildCrossModelIndex()`，`pool-targets.ts`）：
 
@@ -435,7 +505,7 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 
 本渠道规格排在跨渠道**之前**：规格是渠道自己按公开规格维护的真值
 （[MODEL-SPECS.md](./MODEL-SPECS.md)），比兄弟渠道被上游裁剪过的值更权威 ——
-所以兜底**只替换占位值**，不会把 `traecn/deepseek-v4-pro` 从 1000000（规格）改成
+所以兜底**只替换占位值**，不会把规格窗口 1000000 改成
 700000（catpaw 的上游值）。每个值从哪来记在 `sources` 里（见 §2.6），随接口下发。
 
 **只在枚举路径生效**：`/v1/models` / 控制台 state / `mx model list` 走 `poolModelMetas()`
@@ -457,7 +527,7 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 - **兜底表必须能真的兜住**：用**真实上游 id**，不用占位名（占位名如 `catpaw-flash`，
   上游根本不存在，选中必然失败）。
 - **兜底表的形态随上游协议而定**：目录条目表（多数渠道）、上游目录快照
-  （qodercn 的国内版目录 14 条）、上游元数据快照（qoder 的 `STATIC_META`，
+  （qoder 系的目录快照）、上游元数据快照（同族实现的 `STATIC_META`，
   供请求体的 `model_config` 用）、以及**上游协议要求的数值表**（catpaw 的
   `modelType` 数值表 —— turn / round 的请求体要的是**数字** modelType 而不是模型名，
   目录拉不到时没有这张表就等于全部模型不可用）。
@@ -475,9 +545,9 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 `upstream` 再 import `catalog` 就成环（ESM 环依赖下模块初始化顺序不可靠）。因此：
 
 1. `upstream` 侧导出 `setModelMetaLookup(lookup)`，只认注入进来的查询器
-   （`packages/core/channels/qoder/src/upstream.ts:498-502`）；
+   ；
 2. 渠道装配处（`channel.ts`）接上：`upstream.setModelMetaLookup(catalog.metaOfKey)`
-   （`packages/core/channels/qoder/src/channel.ts:30`）；
+   ；
 3. 查询器按**上游 key** 查（`buildChatBody` 只拿到 key；对外 id 是另一套名字，
    见 `catalog.metaOfKey` 与 `catalog.entryOf` 的分工）。
 
@@ -485,8 +555,7 @@ DeepSeek 官方 `GET /models`，见 `pool-targets.ts` 的 `PoolModelMeta`）。�
 
 | 渠道 | 状态 | 后果 |
 |---|---|---|
-| `qoder` | 已接线 | 请求体的 `model_config` 带上目录里的 `display_name` / `is_vl` / `is_reasoning` / `max_input_tokens`（`packages/core/channels/qoder/src/upstream.ts:676-687`） |
-| `qodercn` | 已接线 | 请求体的 `model_config` 带上目录里的 `display_name` / `is_vl` / `is_reasoning` / `max_input_tokens`（`packages/core/channels/qodercn/src/channel.ts:44`、`packages/core/channels/qodercn/src/upstream.ts:593-603`） |
+| `qwenworkcn` | 已接线 | 请求体的 `model_config` 带上目录里的 `display_name` / `is_vl` / `is_reasoning` / `max_input_tokens`（`packages/core/channels/qwenworkcn/src/channel.ts:46`、`packages/core/channels/qwenworkcn/src/upstream.ts:489`） |
 
 判定依据是「目录里的真实值」而不是写死的常量：写死会让上游看到互相矛盾的推理开关。
 
@@ -522,6 +591,9 @@ interface CredModule {
 
 共享层的 `account-pool.ts` 用「复制文件 + `cred.load()` 契约字段（uid/domain）」实现，
 当前全部渠道经 `channel.ts` 注册后都走同一套账号池，无需各自实现这段接口。
+`cred.load()` 必须返回 `accessToken/uid/domain` 契约字段（缺了会让池派生出幽灵账号）。
+账号被上游拒绝（401 / 连败）走 §3.3 的凭据失效换号：标 `unauthorized` 并自动切下一个
+健康账号（额度类换号对无额度概念的渠道不适用，`account-rotate.ts` 按能力分流）。
 
 ### 3.3 策略
 
@@ -544,6 +616,8 @@ interface CredModule {
 - **连败标记**：连续**瞬时**失败达 `FAIL_STREAK_LIMIT = 3` 次即熔断（`error` + `trip_until`），
   **凭证一律保留**；到期自动放行一次半开试探（成功恢复、再失败退避翻倍）。
   也可用后端命令 `resetAccount` 提前恢复、切号（`mx acct <cid> use <key>`）或重登提前恢复。
+  例外：渠道经 `upstream.isCapacityError` 声明的**容量型过载**（推理集群无空闲实例，
+  换账号没用）不计连败，只记渠道级冷却 —— 钩子语义见 `CONTRACT-TS.md` 的上游模块钩子清单。
 - **额度耗尽自动换号**：请求失败（错误码属「可能是额度问题」那类）后按**账单证据**
   决定是否换到池内有额度的账号，并在**同一请求**里重试一次；判据与边界见 §2.4。
   自动切号有**两条**路径（额度问题是可恢复的，故与凭据失效区别对待）：失败后的自动换号
@@ -595,8 +669,8 @@ interface CredModule {
   - `name`：**名称类字段**（`nickname` → `displayName` → `username` → 邮箱 → 手机号，
     见 `NAME_FIELDS`），渠道没给就是空串 —— Web 据此决定「显示名字」还是「显示脱敏 id」。
   - `label`：`name` 的兜底版本，取不到名称才退化成 `uid` / `key`；CLI 文本视图用它。
-  - 渠道实测：traecn / qoder / qodercn / raccoon 给 nickname，loomy 给已脱敏手机号，
-    workbuddy / workbuddyai 的 nickname 可能为空，**catpaw 只有 uid**。
+  - 渠道实测：traecn / raccoon / qwenworkcn 给 nickname，loomy 给已脱敏手机号，
+    workbuddy 的 nickname 可能为空，**catpaw 只有 uid**。
     读池子时（`refreshLabels`）若渠道补上了名称，两者会一起升级。
 - `health`：`ok` | `unauthorized` | `unknown` | `error` | `cooldown`。由**网关**在刷新失败时写
   `unauthorized`、请求成功时写 `ok`；同值短路（进程内缓存），稳态下不产生额外 I/O。
@@ -610,8 +684,12 @@ interface CredModule {
 - **共享层不解析渠道磁盘格式**：只做「复制文件 + 记下 `cred.load()` 的契约字段 uid/domain」，
  所以全部渠道**零改动**就支持账号池。
 - **同步按身份，不按时间**：`credentials.json` 变新时先比 `accountKey` —— 同一账号 → 回灌池内
- 那份（渠道 `refresh()` 只写 live 文件）；不同账号 → 收成新账号并设为 active。
- 只看 mtime 回灌会在「换账号登录」时把旧账号的池内文件覆盖成别人的凭证。
+  那份；不同账号 → 收成新账号并设为 active。
+  只看 mtime 回灌会在「换账号登录」时把旧账号的池内文件覆盖成别人的凭证。
+- **账号自己的续期落点**：对某个账号的凭据做操作（账单刷新、签到领取）时，共享层用
+  `accounts.runForAccountCredential(cid, key, …)` 把 `credentialsPath()` 的落点限定到
+  `accounts/<key>.json`，渠道 `refresh()` 无需改动就写进该账号的文件；不限定时只写 live
+  （那是生效账号的路径，写错会把生效账号顶掉）。见 [CONTRACT-TS.md](./CONTRACT-TS.md)。
 - **切换** = 把 `accounts/<key>.json` 复制回 `credentials.json` + 更新 `active`（不用重新授权）。
 - **重登（`mx relogin` / 控制台「+」添加账号）不删旧凭据**：授权流程要等人操作（扫码 / 粘回调），
   期间渠道处于「登录中」，旧凭据本来还能正常服务。旧实现**先 `unlink(credentials.json)` 再授权**，
@@ -654,6 +732,32 @@ interface CredModule {
 
 > 当前**没有渠道**用到这类状态。新增渠道需要时按上面两条规则做，别把账号级状态塞进共享层。
 
+### 3.6 自动签到的额度口径（「今天签到领到多少」）
+
+调度器（`auth/auto-signin.ts`）按**四口径阶梯**确定额度，拿到就停：
+
+| 口径 | 来源 | 用途 |
+| --- | --- | --- |
+| `channel` | 渠道自报：`SigninOutcome.reward` / `SigninStatus.reward`（raccoon 账单、traecn 状态端点、qoder 活动记录的 `benefit.amount`） | 直接进台账 |
+| `daily` | 渠道公布的**每日发放额度**（`SigninStatus.dailyReward`，如 loomy 每天 5000）—— 签到动作本身就是当日额度的发放时用最直接 | 上游不回报入账额时的权威口径 |
+| `delta` | 领取**前后各查一次额度**的差值（`balance.before/after` 落台账）；事后重试时取「领取当时的 after」与「当下余额」的**较大者**，避免两次轮询之间的消耗把奖励算少 | 异步入账时事后补回 |
+| `carry` | **跨额度窗口对比**：上一窗口最后余额（`pool-usage` 的 `prev`）→ 当下；要求两次单位一致 | 最弱口径，只在前三者都拿不到时用；界面标注「估算」 |
+
+规则：
+
+- **有界重试**：额度未知（`reward: null`）时按 30 分钟一轮重试，最多 `REWARD_MAX_TRIES = 4` 次
+  （只对**当天**的记录重试，跨天由新的一轮领取重新记）；超次停在 `null`，不再打扰上游。
+  旧实现问一次就写终态，异步入账（账单 / 积分类上游）会白丢数字。
+- **不猜**：渠道报不出、也测不到差额时只显示「已签到 HH:MM」，不写 0。
+- **签到窗口未必是本地 0 点**：渠道可在 `SigninStatus.resetAt` / `windowStartsAt` 声明当前窗口的
+  结束与开始时刻（qoder 系上游是 10:00 UTC+8）。调度器把领取时的 `resetAt` 记进台账（`windowEndsAt`），
+  `Date.now() > windowEndsAt` 就允许再领一轮 —— 否则当天活动永远领不到，面板还显示「已签到」。
+  **旧记录**没有 `windowEndsAt` 时问一次上游：`windowStartsAt > 记录时刻` 才判定属于已结束的旧窗口
+  （拿 `resetAt` 直接比会对任何旧记录都成立，导致每轮重复领取）。**查询失败不落盘、不缓存**，
+  下一轮重问 —— 把失败当成「渠道不声明窗口」会让非 0 点日界的渠道在本次进程内永久停摆。
+- 台账新增审计字段 `balance` / `rewardSource` / `rewardTries` / `rewardAt` / `windowEndsAt`；
+  旧记录缺字段时读成「还没测 / 还没判定」，不读成 0。
+
 ## 4. 公共层设计
 
 ### 4.1 注册表
@@ -675,9 +779,11 @@ hasChannel(cid?: string): boolean;
 
 ### 4.2 路由层
 
-- `/v1/chat/completions`：**池路由** —— 客户端用 `<cid>/<模型>` 显式指定渠道（见 §2.4）。
-- `/v1/models`：读统一快照 `~/.modelmux/model-catalog.json`，缺失或渠道集合变化时重建
-  （见 [MODEL-CATALOG.md](./MODEL-CATALOG.md)）。
+- `/v1/chat/completions`：**池路由** —— 客户端用 **deepseek 裸模型名**请求，渠道由网关按
+  账号池剩余额度自动挑（见 §2.4）。模型名先过**入站模型解析**（剥 `[1m]` 后缀与
+  `modelmux/` 前缀，再对对外名单精确匹配）；家族外的名字一律 400。
+- `/v1/models`：读**统一模型注册表** `~/.modelmux/models.json`（缺失/损坏时回落随包默认表，
+  应答带 `registry_source` 说明来源），见 [MODEL-CATALOG.md](./MODEL-CATALOG.md)。
 - `/health`：报告**整体**状态 + 每个渠道一行（登录/池子/是否上架），而不是单个渠道。
 
 ### 4.3 进程与入口

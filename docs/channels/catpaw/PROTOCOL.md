@@ -9,8 +9,7 @@
 
 | 顺序 | 文档 | 一句话 |
 | --- | --- | --- |
-| 0 | [FINDINGS.md](FINDINGS.md) | **先看这个**：全部结论汇总 + 证据等级 |
-| 0 | [FLOW.md](FLOW.md) | 端到端数据流：登录态怎么落盘、怎么加密、怎么被解出来 |
+| 0 | [FINDINGS.md](FINDINGS.md) | **先看这个**：全部结论汇总 + 证据等级（凭据落点 / 加密方案 / 密钥材料 / 解密验证 / scope 机制 / 敏感面） |
 
 ## 方法论
 
@@ -61,6 +60,76 @@
   `X-Auth-Token`）与直连域 `ai.catpaw.meituan.com`（对话 / 模型目录，`X-Passport-Token` + Cookie）。
   代码里分别是 `cred.ts` 的 `GATEWAY_HOST` 与 `upstream.ts` 的 `DIRECT_HOST`。
 - 登录**只有一条路径**：真实 URL 授权 + `poll-token` 轮询（见下「唯一登录路径」）。
+
+## 端到端数据流
+
+### 桌面端凭据从哪来（逆向结论，证据等级见 FINDINGS.md）
+
+```text
+                     ┌──────────────────────── 妙手桌面端（Electron, catpaw-moon） ────────────────────────┐
+                     │                                                                                    │
+    用户扫码/登录 ──> │  passport 登录 → 拿到 SSO access_token（152 字符）                                  │
+                     │        │                                                                           │
+                     │        ├─> StorageService.Oe(payload)  ← key = SHA256(machineId + 盐)              │
+                     │        │        └─> %APPDATA%\catpaw-moon\catx-credential.json                     │
+                     │        │                 { "ssoTokenEnc": "<base64(iv‖tag‖ct)>" }   ← 加密            │
+                     │        │                                                                           │
+                     │        └─> catx-auth-provider.json / catx-scope-pointer.json / catpaw-uuid         │
+                     │                 （通道名、存储 scope、设备 UUID —— 都不是秘密）                      │
+                     └────────────────────────────────────────────────────────────────────────────────────┘
+                                                      │
+             同一台机器上，同一条 token 还有一条明文出口（CLI 侧）
+                                                      ▼
+                     ┌──────────────── CLI（paw / catdesk, dataFolderName=.meituan-catpaw） ─────────────┐
+                     │  %USERPROFILE%\.meituan-catpaw\auth.json                                          │
+                     │    { auth:{loginType,accessToken,tokenType}, account:{uid,…}, scopeSuffix, … }     │
+                     │    ← 明文，用于交叉验证                                                            │
+                     └────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+解密路径（AES-256-GCM，密钥由机器码派生）与 scope 机制见 [FINDINGS.md](FINDINGS.md)。
+**现役渠道实现不读桌面端任何文件**：凭据只来自 `mx login catpaw` 的真实 URL 登录，
+落盘在 `~/.modelmux/catpaw/credentials.json`（见 `src/cred.ts`）。
+
+### 上游调用路径（三段式）
+
+```text
+{ access_token, uid? }
+   │
+   ▼ ①  POST .../api/agent/conversation/round          提交本轮消息（单条 user）
+       body: { conversationId, source:"CatX",
+               messages:[{type:"user", role, messageId,
+                          content:[{type:"text", text:"<折叠后的完整 prompt>"}]}],
+               modelType, mode:"CATX_APP", toolVersion:"2.0.2",
+               requestContext:{modelParams:{declarativeParams:{effort,context}}} }
+       折叠：system/developer + 对话历史 + 工具说明 → 一条 user 文本
+       校验：上游要求末条是 user；本实现恒为单条 user，不触发序列校验
+       上限：不使用 systemPromptContext；prompt 预算 900KB
+   │
+   ▼ ②  POST .../api/agent/conversation/event          回报轮次状态 running
+   │
+   ▼ ③  POST .../api/agent/conversation/turn           执行轮次
+       headers: M-TRACEID / M-APPKEY / gray-set / X-Agent-Version
+                Cookie: X-Passport-Token=<access_token>   user-uid: <uid>
+       body:    { conversationId, turnRequestId, source:"CatX", action:"turn",
+                  message:{type:"user",content:[{type:"text",text}]},
+                  modelType, mode:"CATX_APP", permissionMode:"default",
+                  toolVersion:"2.0.2" }
+   │
+   ▼  text/event-stream
+ data: {"message":{"content":[…]},"contextInfo":{"usage":{…}}}   ← 每帧是累积全文
+   │  SseReader 切行 → unwrapApiData 解信封 → SuffixDiff 转增量
+   ▼
+ { type:'delta' | 'reasoning' | 'tool_use' | 'usage' | 'done' }
+   │
+   └─ 流结束条件：识别上游生命周期终止帧（`finished` 不可依赖；不能等 TCP 关闭）
+```
+
+对应实现：`src/upstream.ts`（三段式协议 + 帧解码 + 消息折叠）。
+
+> 工具调用：上游**无原生用户工具通道**，网关把工具说明注入折叠后的 user 文本，模型以
+> ` ```tool_call ` 块输出，网关解析后转回 OpenAI `tool_calls`（`finish_reason=tool_calls`）。
+> 折叠 prompt 按 **900KB** 字节预算裁剪（保留系统指令、最新对话与工具说明）。
 
 ## 唯一登录路径
 
@@ -219,6 +288,13 @@
 - 以上都是**请求级**行为，不参与账号连败计数（凭据是健康的）。
 - **输出帧规范**：usage-only 的 SSE chunk 必须带空的 `choices: []`；缺字段会被严格校验的
   客户端整块拒收（ZCode 实测 `Type validation failed ... choices expected array`）。
+- **缓存字段**：上游把用量放在 `contextInfo.usage`，其中 `cache_read_tokens` / `cache_write_tokens`
+  是 **Anthropic 形态**（`prompt_tokens` **不含**缓存读，`total_tokens` = prompt + completion + cache_read，
+  实测 2026-11-09：prompt 47 / cache_read 29184 / total 29234）。渠道映射成
+  `prompt_tokens_details.cached_tokens` 透出，仪表盘据此统计命中率；上游没给时**不写该字段**
+  （共享层据此把缓存显示成 `—` 而不是 0%）。
+  `contextInfo.usageDistribution` 按 system_prompt / tools_and_subagents / mcp / skills /
+  conversation / model_output 分类给占比，未消费。
 
 ## 流结束语义（生命周期帧，2026-10-18）
 
@@ -322,38 +398,49 @@ translator 用 `idleCutoffAfterContentMs()` 声明阈值（默认 10 秒，可�
 `models.json` 的 `maxOutput`。公开规格是**模型上限**，上游可能更严
 （超限回 400）—— 客户端应能降档重试。
 
-## 图片能力：**本渠道不对外声明**
+## 图片能力：按上游逐型号声明放行，图片走对象存储转存
 
-> 结论先行：**上游声明 ≠ 本渠道可送达**。本渠道的 `/v1/models` 对 catpaw 的模型
-> 一律报 `input_modalities: ["text"]` —— 图片不会被送到上游（发了也等于不发）。
+> 结论先行：本渠道**能**传图。图片先转存到自家对象存储换公网 URL，再作为
+> `round.messages[].content[]` 的 `image_url` 分片送上去。是否放行由上游逐型号声明的
+> `supportImage` 决定：`deepseek-v4.1-flash` / `LongCat-2.5` / `glm-5.3-flash` 放行，
+> `deepseek-v4-pro` / `glm-5.3` / `auto` 拒收（抛 `UnsupportedInputError` 换渠道）。
 
 | 事实 | 等级 | 来源 |
 |---|---|---|
-| 上游模型目录**逐模型声明** `supportImage`（布尔）：`LongCat-2.0` / `glm-5.2` / `MiniMax-M3` / `kimi-k3` 为 true，`deepseek-v4-flash` / `deepseek-v4-pro` / `auto` 为 false | `[参考]` | `reference/HITZY2002_catpaw2api/internal/upstream/client.go:386`（`SupportImage bool` / `json:"supportImage"`）、`docs/reverse-engineering.md:129-142` 的真实模型表；`reference/icebears111_catpaw2api/internal/upstream/client.go:346` 同构 |
+| 上游模型目录**逐模型声明** `supportImage`（布尔） | `[参考]` | `reference/HITZY2002_catpaw2api/internal/upstream/client.go:386`（`SupportImage bool` / `json:"supportImage"`）、`docs/reverse-engineering.md:129-142` 的真实模型表；`reference/icebears111_catpaw2api/internal/upstream/client.go:346` 同构 |
 | 本机实测：上游 `/api/agent/maas/model-types` 确实带该标志（本仓目录缓存里 `LongCat-2.0` / `glm-5.3-flash` / `glm-5.3-flashx` 为 true，`glm-5.3` 为 false） | `[实测]` | 2026-10-20 `~/.modelmux/catpaw/cache/models.json` |
+| 本机实测（上游**原文**，绕开渠道归一化）：`deepseek-v4.1-flash` = **true**；`deepseek-v4-pro` / `glm-5.3` / `auto` = false；其余（`LongCat-2.5` / `glm-5.3-flash` / `glm-5.3-flashx` / `MiniMax-M3` / `kimi-k3` / `kimi-k3.1-pro`）为 true | `[实测]` | 2026-11-16 直打 `/api/agent/maas/model-types` 取原文（`.tmp/probe-catpaw-raw-catalog.mjs`）—— 渠道 API 读不到原值，`catalog.toModelInfo()` 已把它钉成 false |
 | 但那是**模型自身**的能力声明，与「本渠道能不能把图送过去」是两件事 | `[推断]` | 见下两条 |
-| 本渠道走的 conversation 协议（`/api/agent/conversation/{round,event,turn}`）请求体的消息内容只有 `{type:"text",text}` 分片，**没有图片字段**；`src/upstream.ts` 的 `textOfContent` 把多段 content 拍平成纯文本，`image_url` 分片直接丢弃 | `[代码]` | `packages/core/channels/catpaw/src/upstream.ts:255-259`（`UpstreamMessage.content` 的类型）、`packages/core/channels/catpaw/src/upstream.ts:291-305`（`textOfContent`） |
+| conversation 流程的图片分片：`{"type":"image_url","imageUrl":{"url":"<公网 URL>","detail":"low"}}` —— 分片键是 OpenAI 式 `image_url`，值对象却是 camelCase `imageUrl` | `[实测]` | 2026-11-16 带图对话通过（`.tmp/probe-catpaw-images7.mjs`）；桌面端持久化的 tool 消息同形 |
+| 转存链三步：`GET /api/s3/presign/generate?objectName&contentType&isUpload=true`（三参全必填）→ `PUT` 返回的签名地址 → 引用 `https://s3plus.meituan.net/catpaw-pub-external/<objectName>` | `[实测]` | 同上；presign 必填参数逐层试出 |
+| `requestContext` **不需要**任何图片声明位：只带现行的 `modelParams.declarativeParams.context` 就能通过 | `[实测]` | 同上 |
+| 端到端：`deepseek-v4.1-flash` 收到截图后准确描述出「妙手桌面应用工作界面 / 左侧列表 / Git 变更清单 / 测试报告 38/38 / 两张 diff 卡片 / 底部输入框」；`prompt_tokens=20400` 而文本估算只有 31 —— 差额即图片计入的输入 | `[实测]` | 2026-11-16 访问日志 `cid=catpaw status=200`（`.tmp/req-catpaw-image2.json`） |
+| 文本渲染路径不变：`textOfContent` 仍只取 `text` 与 tool 分片，图片另走 `collectImageUrls` 采集后注入 `content` | `[代码]` | `packages/core/channels/catpaw/src/upstream.ts`（`collectImageUrls` / `uploadImage` / `prepareChat`） |
 | 两家参考实现同构：恒发 `"images":[]`（属**另一条** nocode 建聊流程的字段，不是 conversation 流程），且 `flattenContent` 同样只保留 `text` 分片 | `[参考]` | `reference/icebears111_catpaw2api/internal/upstream/client.go:391`、`internal/server/request.go:168-188`（及其 `request_test.go:116`：含 `image_url` 分片的 content 拍平后只剩 `"a"`）；`reference/HITZY2002_catpaw2api/docs/reverse-engineering.md:76` |
 
-### 为什么必须改成「不声明」
+### 实现要点（`src/upstream.ts` / `src/catalog.ts`）
 
-- 早先 `src/catalog.ts` 直接抄上游的 `supportImage` 填 `supportsImages`，于是
-  `/v1/models` 对 catpaw 的模型报 `input_modalities: ["text","image"]` —— 但请求侧
-  仍会把 `image_url` 拍平成纯文本。**声明与实现不符**：客户端以为图能到，
-  用户看到的是「模型读不到图片」，且没有任何报错。
-- 现在 `src/catalog.ts` 的 `supportsImages` 恒 `false`（上游的 `supportImage`
-  不再抄进来），旧磁盘缓存在读时一并钉死并回写（池层直接读磁盘缓存，
-  不回写的话 `/v1/models` 还会看到旧值）。
+- `collectImageUrls()` 从 OpenAI `image_url.url` 与 Anthropic `image.source`（URL /
+  base64 两种）收图；base64 一律封成 `data:` 统一走转存，不留第二条路径。
+- `buildChatBody` 是**同步契约**，放不下上传：它只把待传清单挂到内部字段
+  `__images`，真正的 presign / PUT 在 `prepareChat`（async，且网关在 turn 发出前 await）。
+- `round.messages[0]` 与 `turn.message` 是**同一个对象引用**，注入一次两处同时生效；
+  `__roundBody` 因此挂对象而不是序列化串，注入后才序列化。
+- **一律转存、不透传外部 URL**：桌面端也恒先传自家 S3，而透传一个模型拉不到的
+  私网地址等于「图没送到」—— 静默失败比报错更坑。
+- 守卫按型号放行：`catalog.supportsImageOf()` 为 false 的型号带图抛
+  `UnsupportedInputError`（共享层信号 → 网关换候选重试，不是终局 400；实测
+  2026-11-07 曾因为抛普通 Error 被拦成 400）。守卫**不计连败** —— 渠道对纯文本
+  请求是好的，冷却会误伤后续正常请求。
+- 单张上限 10MB、上传超时 20s；超限直接拒（宁可换渠道，不要把 20MB 塞给上游）。
 
-### 将来要支持图片，得先答清这三件事
+### 仍未验证
 
-1. conversation 流程（不是 nocode 建聊流程）到底有没有图片字段？字段名与形态
-   （URL / base64 / 文件 id）是什么？—— 目前**无任何证据**。
-2. 若有，`round.messages[].content[]` 的分片类型怎么写（`image` / `image_url`？）
-   与 `requestContext` 里要不要额外的声明位？
-3. 真机带图实测通过后，再把 `supportsImages` 接回上游的 `supportImage`。
-
-在这三条落定之前，**不要**因为上游目录写了 `supportImage: true` 就对外声明能吃图。
+- 外部 URL 能否**跳过转存**直接引用：桌面端恒先传 S3，本渠道也一律转存，透传未测。
+- `detail` 是否必填：桌面端带 `low`，本渠道照带，未试缺省。
+- 目录**未刷新**时拿不到上游 `supportImage` 原值（旧磁盘缓存里那阵被钉死成 false），
+  此时 `supportsImageOf()` 一律 false、带图请求会顺延到别的渠道 ——
+  `mx model catpaw --refresh` 后恢复。
 
 ## 边界与伦理
 
@@ -385,10 +472,18 @@ poll-token 轮询，**全程只有一次人工点击**。凭据只来自这条�
   `requestContext.modelParams.declarativeParams.context` 下发；折叠后的 prompt 预算 **900KB**，
   超预算先丢最早历史。
 - **token 72h 到期只能重登**：上游**没有刷新端点**，`refresh()` 只是有效性探测。
-- **不支持图片输入**：上游目录虽逐模型声明 `supportImage`，但 conversation 协议
-  没有图片传输路径（内容被拍平成纯文本）→ 本渠道不对外声明图片能力，
-  `/v1/models` 报 `input_modalities: ["text"]`。见「图片能力」。
+- **图片输入按上游逐型号声明放行**：`deepseek-v4-pro` / `glm-5.3` / `auto` 声明
+  `supportImage:false`，带图请求会抛 `UnsupportedInputError` 换渠道；其余型号放行，
+  图片经对象存储转存后作为 `content` 的 `image_url` 分片送出。见「图片能力」。
 - **家族 B 协议不实现**（IDE 侧 `/api/gpt/*`）：token 与家族 A 不通用，见「已知边界」。
+- **deepseek-v4.1-flash 供给实测（2026-11-14）**：目录条目 `contextWindow: 600000`
+  （供此模型各渠道中最低）、倍率 x0.06、effort 档位 `low/high/max`（默认 high）、
+  最大输出上游不给。缓存由渠道映射 `contextInfo.usage.cache_read_tokens` →
+  `prompt_tokens_details.cached_tokens` 透出（Anthropic 形态；口径见
+  [CACHE-HIT-RATE.md](../../CACHE-HIT-RATE.md) §5.2）；全量命中率无记录。
+
+**glm-5.3-flash 供给实测（2026-11-14）**：目录条目 `contextWindow: 800000` /
+倍率 x0.06；同目录的 `glm-5.3-flashx`（800K / x0.16）是同族另一型号，不进 glm-5.3-flash 池。
 
 ### 推荐模型
 
@@ -396,7 +491,7 @@ poll-token 轮询，**全程只有一次人工点击**。凭据只来自这条�
 | --- | --- | --- |
 | `catpaw/deepseek-v4.1-flash` | 2026-10-18 真机验证全绿 —— 普通/流式、单工具、并行工具、tool 结果回灌、非流式聚合、system 数组、developer 角色均通过 | `[实测]` |
 | `catpaw/deepseek-v4-flash`、`catpaw/deepseek-v4-pro` | 目录中可用，未做完整工具矩阵 | — |
-| `catpaw/longcat-2.0`、`catpaw/glm-5.3-flash` | API 层可跑通；端到端测试**全过**（见下），真实客户端兼容问题未复现，疑与客户端实现有关 | `[实测]` |
+| `catpaw/longcat-2.0`、`catpaw/glm-5.3-flash` | API 层可跑通；端到端测试**全过**（见下），真实客户端兼容问题未复现，疑与客户端实现有关。`glm-5.3-flash` 在随包 `models.json` 已标 `hidden`（glm 已移出对外家族；隐藏集合见共享层 `hiddenModelIds`），不再作为本渠道的对外候选 | `[实测]` |
 
 ### 环境变量
 
@@ -421,6 +516,20 @@ mx bill catpaw            # 额度与倍率（测试后核对是否扣费）
 登录入池 / `mx model catpaw --refresh` / 最小对话 / 工具调用往返 / 流式 SSE。
 
 ## 参考实现
+
+### 7.x 2026-11-20 生态对齐（loomy2api 同轮调研落地）
+
+- **余额闸门**：额度为 0 时上游回 HTTP 200 + 助手正文，判据是帧内无 `model`/`modelDisplayName`
+  字段 + 余额措辞（magpie #933 多源实测）。翻译器转成 402 错误帧，`quotaSignal(200, 正文)`
+  认同一措辞——账号冷却、请求换下一家候选。
+- **429 渠道级频控**：建会话约 6 次/窗口、冷却 ~41s（magpie-catpaw 真机）；
+  `quotaSignal(429)` 报 rate_limit，走渠道级短冷却、不烧账号连败。
+- **原生工具通道**：上游支持 `toolConfigs[]` + `fromClient` + 结构化 tool_use 往返
+  （Agent2Providers tools.rs）——此前「上游无原生用户工具通道」的表述**作废**；迁移待真机。
+- **目录过滤**：`extendedInfo.isAuto`（自动选择入口）与 `provider=USER_CUSTOM`（依赖客户端
+  本地 apiKey）不是真实上游模型，解析层直接丢弃；响应兼容 `data.modelTypes` 双形态。
+- **风险登记**（待真机复核，未改实现）：`permissionMode` 取值分歧（抓包 unsafeBypassPermissions
+  vs 本仓 default）；图片路径分歧（内联 base64 vs S3 转存）。
 
 clone 到 `reference/` 的学习材料（不入库）；结论进本文件。
 

@@ -33,17 +33,6 @@
 | [KanoNoUta/thief-neko](https://github.com/KanoNoUta/thief-neko) | MIT | 同上 |
 | [zhou-gy/catpawai-proxy](https://github.com/zhou-gy/catpawai-proxy) | NOASSERTION | 同上 |
 
-### lobsterai
-
-| 仓库 | 许可证 | 落点 |
-|---|---|---|
-| [netease-youdao/LobsterAI](https://github.com/netease-youdao/LobsterAI) | MIT | `docs/channels/lobsterai/PROTOCOL.md`（官方客户端，用于协议事实） |
-| [greatleo31/lobsterAi2api](https://github.com/greatleo31/lobsterAi2api) | MIT | 同上 |
-| [xinxinshuhao-create/lobsterai2api](https://github.com/xinxinshuhao-create/lobsterai2api) | MIT | 同上 |
-| [skyletter/lobsterai2api-docker](https://github.com/skyletter/lobsterai2api-docker) | NOASSERTION | 同上 |
-| [L0NE-6/LobsterAI-AutoCheckin](https://github.com/L0NE-6/LobsterAI-AutoCheckin) | MIT | 同上（签到逻辑） |
-| [gurio-wine/dsh-account-hub](https://github.com/gurio-wine/dsh-account-hub) | MIT | 同上（多账号治理思路） |
-
 ### loomy
 
 | 仓库 | 许可证 | 落点 |
@@ -53,15 +42,24 @@
 | [xxhhlk/loomy2api](https://github.com/xxhhlk/loomy2api) | MIT | 同上 |
 | [xingluoyuankong/loomy2api](https://github.com/xingluoyuankong/loomy2api) | MIT（历史参照，微信登录已移除） | 同上 |
 
-### qoder / qodercn
+### qoder 系（COSY 协议）
 
 | 仓库 | 许可证 | 落点 |
 |---|---|---|
-| [cubk1/qoder2api](https://github.com/cubk1/qoder2api) | NOASSERTION | `docs/channels/qoder/PROTOCOL.md` |
-| [shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub) | MIT | `docs/channels/qoder/PROTOCOL.md`、`docs/channels/qodercn/PROTOCOL.md` |
+| [cubk1/qoder2api](https://github.com/cubk1/qoder2api) | NOASSERTION | `docs/channels/qwenworkcn/PROTOCOL.md`（同一套 COSY 协议） |
+| [shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub) | MIT | `docs/channels/qwenworkcn/PROTOCOL.md` |
 | [Zhengyuuuui/qoder2api](https://github.com/Zhengyuuuui/qoder2api) | NOASSERTION | 同上 |
-| [EchoPing07/Qoder-2API-Go](https://github.com/EchoPing07/Qoder-2API-Go) | MIT | `docs/channels/qodercn/PROTOCOL.md` |
-| [jyao0708/qoder2api](https://github.com/jyao0708/qoder2api) | MIT | `docs/channels/qodercn/PROTOCOL.md` |
+| [EchoPing07/Qoder-2API-Go](https://github.com/EchoPing07/Qoder-2API-Go) | MIT | `docs/channels/qwenworkcn/PROTOCOL.md` |
+| [jyao0708/qoder2api](https://github.com/jyao0708/qoder2api) | MIT | `docs/channels/qwenworkcn/PROTOCOL.md` |
+
+### qwenworkcn
+
+| 仓库 | 许可证 | 落点 |
+|---|---|---|
+| [wicm84266964/Buddy2api](https://github.com/wicm84266964/Buddy2api) | MIT | `docs/channels/qwenworkcn/PROTOCOL.md`（`providers/qwenwork/` 的 constants / cosy / token / checkin） |
+| [REALOIYO/dsh-qwenwork-connector](https://github.com/REALOIYO/dsh-qwenwork-connector) | MIT | 同上（`src/adapter/` 的 auth / body / codec / cosy / catalog） |
+| [Alphaxiaoteng/qwenwork2api](https://github.com/Alphaxiaoteng/qwenwork2api) | MIT | 同上 |
+| [harwinvoid/magpie-plugin-qwenwork](https://github.com/harwinvoid/magpie-plugin-qwenwork) | MIT | 同上（设备码登录流程） |
 
 ### raccoon
 
@@ -84,24 +82,11 @@
 
 | 仓库 | 许可证 | 落点 |
 |---|---|---|
-| [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | MIT | `docs/channels/workbuddy/PROTOCOL.md`、`docs/channels/workbuddyai/PROTOCOL.md` |
+| [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | MIT | `docs/channels/workbuddy/PROTOCOL.md` |
 | [HanawaBanana/workbuddy2api](https://github.com/HanawaBanana/workbuddy2api) | MIT | `docs/channels/workbuddy/PROTOCOL.md` |
 | [xiaofan6ya/workbuddy2api](https://github.com/xiaofan6ya/workbuddy2api) | — | 同上（已 404） |
 | [Sliverkiss/CodeBuddy2api](https://github.com/Sliverkiss/CodeBuddy2api) | MIT | 同上 |
 | [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) | — | 同上（已 404） |
-
-### workbuddyai
-
-| 仓库 | 许可证 | 落点 |
-|---|---|---|
-| [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub) | **MIT**（主参照，已 clone 到 `packages/core/channels/workbuddyai/reference/`，不入库） | `docs/channels/workbuddyai/PROTOCOL.md` |
-| [Tom6814/WorkBuddy2API](https://github.com/Tom6814/WorkBuddy2API) | MIT | 同上 |
-| [ckldy/workbuddy2api](https://github.com/ckldy/workbuddy2api) | NOASSERTION | 同上 |
-
-> 从 `workbuddy2api-hub` 学到的具体结论：`6004`（用量限额）的重置时间写在 **msg 文本**里
-> （`... reset at YYYY-MM-DD HH:MM:SS UTC+8 ...` / `将在 ... 重置`），且必须用 `timegm`
-> 语义解析（见 `wb_proxy.py::parse_rate_limit_reset`）。本仓库据此用 TypeScript 重写了
-> `upstream.quotaResetAt()`，**未复制其代码**。
 
 ## 3. 模型规格参考（官方模型卡）
 

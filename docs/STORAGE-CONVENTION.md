@@ -17,8 +17,9 @@
 ├── prefs.json                   ← 预留（曾用于正文抓取开关，已改为恒开启，当前无写入方）
 ├── gateway.pid                  ← 仓库级网关监督进程 PID（不属于任何渠道）
 ├── gateway-worker.pid           ← 仓库级网关 worker PID（监督进程维护）
-├── watchdog.pid                 ← 外部守护 PID（scripts/mx-watchdog.mjs）
-├── watchdog.pause               ← 外部守护暂停标记（存在时只探测不拉起）
+├── watchdog.pid                 ← 外部守护常驻模式单实例锁（scripts/mx-watchdog.mjs；--once 不留此文件）
+├── watchdog.pause               ← 外部守护暂停标记（存在时只探测不拉起；显式停止置、显式启动清）
+├── watchdog.state.json          ← 外部守护每轮状态（mtime = 最后存活时刻，见 DAEMON-SUPERVISOR.md §7）
 ├── logs/                        ← 运行日志（类型/日期/结果分层，见 LOGGING.md）
 │   ├── access/<date>/           ← 请求元数据（success / failure / other / slow）
 │   ├── error/<date>/            ← 错误上下文
@@ -27,8 +28,14 @@
 │   ├── payload/<date>/          ← 请求正文抓取（恒开启，见 LOGGING.md §9）
 │   └── watchdog.log             ← 外部守护日志
 ├── pool-usage.json              ← 公共模型池的渠道账本（账单已用量 + 失败冷却）
+├── models.json                  ← **统一模型注册表**（对外模型 + 规格 + 上游 id 兜底映射）
+│                                   缺失/损坏时回落随包默认表；`MODELMUX_REGISTRY_FILE` 可整体改指向
+├── model-prefs.json             ← **模型级渠道偏好**（**多渠道供给**的对外模型「优先走哪家」，`null` = 自动选路）│                                   由控制台「渠道偏好」下拉写入，见 POOL-ARCHITECTURE.md §2.4
+├── setting.json                 ← **用户级设置**（主题 system/dark/light、禁用渠道表；读写见 runtime/user-settings.ts）
+├── update.json                  ← **版本更新检测状态**（上次检查时间 / 最近一次结果；
+│                                   读写见 runtime/update-check.ts）
 └── channels/                    ← 唯一渠道层（0.1.2 起）
-    ├── workbuddyai/             ← cid 层
+    ├── workbuddy/             ← cid 层
     │   ├── credentials.json         当前生效账号（兼容镜像）
     │   ├── accounts.json            账号池索引（active + 元信息）
     │   ├── accounts/<key>.json      单账号凭证
@@ -47,21 +54,6 @@
 分层名 = `cid`（全小写、仅 `[a-z0-9-]`），**不带点、不带任何前缀后缀** —— 它已经在
 渠道层下的一层，冗余前缀与隐藏前缀都没有意义。
 
-### 兼容层（0.1.0 / 0.1.1）
-
-`<root>/channels/<cid>/` 是 0.1.2 起的布局；0.1.0/0.1.1 把渠道放在 `<root>/<cid>/`。
-为兼容**旧版本可执行文件**，迁移不删除旧位置，而是留**相对软链**：
-
-```
-~/.modelmux/<cid>  →  channels/<cid>
-```
-
-- **新代码**：`paths.channelDir` 解析时 `channels/<cid>` 存在就用它，不存在才回落旧位置；
-  **写跟随解析结果** —— 数据只有一份，不会分裂。
-- **旧版本可执行文件**：经软链继续读写同一份数据。
-- 软链由迁移逻辑生成（`runtime/storage-migrate.ts`，幂等）：`mx start` / `mx restart` /
-  `mx serve` 启动时自动触发，也可手动执行 `node scripts/migrate-storage.mjs`。
-
 ## 2. 渠道约定
 
 - 渠道清单以 `mx model list` 为准（本文件不维护逐渠道表，避免两处漂移）。
@@ -77,9 +69,8 @@
 ## 3. 规范（条文）
 
 1. **单一存储根**：`~/.modelmux/`，由共享层唯一解析，渠道不得自行拼绝对路径。
-2. **按 cid 分层**：`<root>/channels/<cid>/`（0.1.2 起）。`cid` 全小写、仅 `[a-z0-9-]`、
-   等于 `ChannelConfig.cid`。0.1.0/0.1.1 的 `<root>/<cid>/` 旧布局由 `paths.channelDir`
-   回落兼容，迁移后以软链指向新位置 —— **两处指向同一份数据，不存在分裂**。
+2. **按 cid 分层**：`<root>/channels/<cid>/`。`cid` 全小写、仅 `[a-z0-9-]`、
+   等于 `ChannelConfig.cid`。
 3. **根目录覆盖变量**：`MODELMUX_HOME`（唯一覆盖变量）。
 4. **目录内固定文件名**（定义处：`packages/core/gateway/src/runtime/paths.ts` 的 `FILES`；`accounts.json` / `accounts/<key>.json` 另见 `runtime/account-pool.ts`）：
 
@@ -97,15 +88,6 @@
   运行日志统一在 `<root>/logs/`（见 [`LOGGING.md`](./LOGGING.md)）。
 
 5. **渠道特有文件必须落在自己的 cid 层内**：
-  - `models.json` —— **渠道模型表**（清单 + 规格：窗口 / 输出上限 / 模态 / 档位 / 倍率 / 隐藏标记）。
-    - **首启浇种**：文件不存在时由共享层从**随包种子**（渠道包根 `models.json`，
-      bundle 后为 `dist/models/<cid>.json`）复制一次，来源记 `"seed"`。
-    - **之后以用户文件为准**：可手改；渠道的 `refresh()` 拉到真实目录后覆写（来源记 `"upstream"`）。
-    - **可安全删除**：删掉后下次启动重新浇种，回到随包种子。
-    - **快照**：每次覆盖前生成 `models.json.bak.<时间戳>`（默认保留最近 3 份，同秒重复加
-      `-2`/`-3` 后缀）；刷新失败或返回空表时回退到最近一份可用快照。
-      快照与被保护文件同目录同前缀，删除它们只会失去回退能力，不影响运行。
-    - **代码里不得再写同一份数据**（`catalog.ts` 零模型名、零规格数字，见 CONTRACT-TS §5.3）。
   - `cache/` 可安全删除、可重建（缓存，丢了只是变慢/回落兜底表）
     - `cache/models.json` —— **远端模型目录缓存**：各渠道 `upstream.fetchModels()`
       拉到的真实目录，由共享层 `catalog-cache.ts` 原子写入（信封
@@ -122,10 +104,11 @@
 
        | 文件 | 渠道 | 内容 |
        |---|---|---|
-                     | `client-version.json` | lobsterai | 客户端版本号兜底（更新接口抽风时用「最后一次已知可用」版本） |
        | `usage.json` | traecn | 对话流观测到的通道余额快照（`notify_usage`） |
   - `state/` 跨重启保持的**状态**：`state/signin.json`（签到台账：
-    `{version, timezone, last_claim, history}`，由共享层在**领取成功**或自动签到回填时写入）、
+    `{version, timezone, last_claim, history, accounts?, probe?, probes?}`，由共享层在**领取成功**
+    或自动签到回填时写入；`last_claim`/`accounts[key]` 的字段与口径见
+    [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §3.6）、
     `state/auto-signin.json`（自动签到的当日失败计数，连败 3 次熔断）。
   - `debug/` 抓包落盘默认位置（`<CID>_DEBUG_DUMP` 仅作覆盖，值须为绝对路径）。
     它抓的是**上游响应**；请求侧正文是另一套（根级 `logs/payload/`，恒开启，
@@ -145,5 +128,7 @@
 10. **根级共享运行时文件**：属于「全部渠道」而不属于任一渠道的文件放根上 ——
    `gateway.pid` / `logs/`（仓库级网关）、`pool-usage.json`（公共模型池的渠道账本：
    账单已用量 + 失败冷却，见 `docs/POOL-ARCHITECTURE.md` §2.3）、
-   `watchdog.pid` / `watchdog.pause`（外部守护 `scripts/mx-watchdog.mjs`）。走 `paths.rootFile()`
+   `watchdog.pid` / `watchdog.pause` / `watchdog.state.json`（外部守护 `scripts/mx-watchdog.mjs`）、
+   `update.json`（版本更新检测状态：上次检查时间 / 最近结果，
+   见 `docs/WEB-CONSOLE.md` 的设置弹窗版本行）。走 `paths.rootFile()`
    或 `paths.logsDir()`，文件名同样受本节第 7 条的校验。

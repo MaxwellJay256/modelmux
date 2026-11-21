@@ -29,10 +29,10 @@ import { claimedTodayPerLedger, ledgerExists } from "../../auth/signin-ledger.js
 import { runInChannel } from "../../runtime/channel-context.js";
 import * as gateway from "../../http/server.js";
 import * as paths from "../../runtime/paths.js";
-import { migrateLegacyChannelDirs } from "../../runtime/storage-migrate.js";
 import * as poolUsage from "../../pool/pool-usage.js";
 import { baseUrlOf, displayBase } from "../../http/portfree.js";
 import { detectStaleBuild, staleBuildHint } from "./stale-build.js";
+import { setWatchdogPaused } from "../../runtime/watchdog-flag.js";
 import {
   appendSystem,
   compactPayloads,
@@ -75,6 +75,24 @@ export const DEFAULT_WAIT_MS = (() => {
 /** 范围内的渠道清单（仓库级 = 全部已注册渠道）。 */
 function scopeChannels(scope: Scope): Channel[] {
   return scope.cid !== undefined ? [getChannel(scope.cid)] : channels();
+}
+
+/**
+ * 网关子进程的环境：继承调用方，但**摘掉 `TZ`**。
+ *
+ * 为什么：网关的一切时间口径都是「本机时间」—— 日志按本地日期分目录（`localDate`）、
+ * 额度窗口键按本地 0 点（`quotaPeriod().resets_at`）、冷却截止按本地次日。若 launcher
+ * （Claude Code 的 settings.json env 里就有 `TZ: "UTC"`）带着 `TZ` 起网关，同一台机器
+ * 在不同进程里会算出**不同**的窗口键（实测：`w:1794067200000` 与 `w:1794096000000`
+ * 相差 8 小时），基线因此被判「换窗口」重置，签到到账的额度被当成新基线
+ * （2026-11-07 实测 loomy 生效账号基线 201，而其余账号正确为 5000）。
+ *
+ * 只摘 `TZ`：其它变量（代理、调试开关、`MODELMUX_*`）都是调用方的正当意图。
+ */
+export function gatewayEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...base };
+  delete env["TZ"];
+  return env;
 }
 
 /** 额度百分比的报表格式化（两位小数；`--json` 仍输出渠道原始值）。 */
@@ -134,16 +152,11 @@ export async function start(options: StartOptions = {}): Promise<number> {
   const waitMs = options.waitMs ?? DEFAULT_WAIT_MS;
   const { quiet = false, auto = false, force = false } = options;
   const name = scope.name;
+  // 显式启动 = 撤销「用户明确要停」的标记，让外层守护恢复保护（见 runtime/watchdog-flag.ts）
+  setWatchdogPaused(false);
   const log = (m: string): void => {
     if (!quiet) console.log(`[${name}] ${m}`);
   };
-
-  // 旧布局迁移（幂等）：0.1.0/0.1.1 的 `<root>/<cid>/` 搬进 `channels/<cid>/` 并留软链，
-  // 旧版本可执行文件经软链继续可用。发生迁移才提示，否则静默。
-  const migration = migrateLegacyChannelDirs(paths.rootDir());
-  if (migration.moved.length > 0) {
-    log(`已把 ${migration.moved.length} 个渠道目录迁入 channels/（旧位置留软链兼容旧版本）`);
-  }
 
   if (auto && !autoStartEnabled(options.cid)) {
     log("auto_start 已关闭，跳过自动挂载");
@@ -210,6 +223,7 @@ export async function start(options: StartOptions = {}): Promise<number> {
     stdio: ["ignore", logFd, logFd],
     windowsHide: true,
     cwd: ensureScopeDir(scope),
+    env: gatewayEnv(),
   });
   closeSync(logFd);
   child.unref();
@@ -285,6 +299,9 @@ export async function stop(options: { quiet?: boolean; addr?: string; cid?: stri
       log("网关在运行但没有 PID 文件（非本机守护拉起），未做处理");
       return 1;
     }
+    // 无 PID 文件且端口上不健康 = 网关确实没在跑，这正是「显式停止」要的结果：
+    // 置标记，否则外层守护下一轮探测失败就会把它重新拉起来
+    setWatchdogPaused(true);
     log("网关未在运行");
     return 0;
   }
@@ -293,7 +310,9 @@ export async function stop(options: { quiet?: boolean; addr?: string; cid?: stri
   // 进程对象还在，都不能声称停止（实测踩过：stop 报成功、删了 PID 文件，
   // 进程照常服务）。端口的最终核验放到 worker 清理完之后做。
   if (!dead || pidAlive(pid)) {
-    // 进程还活着就不能声称「已停止」：留着 PID 文件，下一次 stop 还能再试
+    // 进程还活着就不能声称「已停止」：留着 PID 文件，下一次 stop 还能再试。
+    // 这里**不置**守护暂停标记：标记的语义是「用户不要再拉起」，而网关此刻仍在跑，
+    // 置标记既不会让它停下，只会让守护在它下次崩溃时不再拉回。
     log(`未能停止网关 (PID ${pid})：进程仍在运行，请手动结束`);
     return 1;
   }
@@ -329,6 +348,8 @@ export async function stop(options: { quiet?: boolean; addr?: string; cid?: stri
   } catch {
     /* 已被清掉 */
   }
+  // 显式停止：外层守护不再把它拉回来（用户要的就是「停」）
+  setWatchdogPaused(true);
   log(`已停止网关 (PID ${pid})`);
   return 0;
 }
@@ -395,6 +416,47 @@ function runningScopeOf(scope: Scope, health: Record<string, unknown> | null): S
     if (pid && pidAlive(pid)) return candidate;
   }
   return candidates[0] ?? scope;
+}
+
+/**
+ * 终端显示宽度：CJK 全角字符占两列，拉丁与半角占一列。
+ *
+ * `padEnd` 按码元数补空格，中文标签会被少算一列，对齐直接偏掉 —— 报表对齐必须按显示宽度算。
+ */
+function charWidth(ch: string): number {
+  const code = ch.codePointAt(0) ?? 0;
+  return (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe30 && code <= 0xfe4f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6)
+  )
+    ? 2
+    : 1;
+}
+
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += charWidth(ch);
+  return width;
+}
+
+/** 标签列宽：取所有报表字段里最宽的标签（`auto_start` = 10 列）。 */
+const LABEL_COLUMN = 10;
+
+function field(label: string, value: string): string {
+  const pad = LABEL_COLUMN - displayWidth(label);
+  return `${pad > 0 ? label + " ".repeat(pad) : label}: ${value}`;
+}
+
+/** 续行：签到分组等多行字段的后续行，缩进到值列，与上方各字段的值对齐。 */
+function cont(label: string, value: string): string {
+  // 分组标签也进标签列（最宽的「无签到功能」正好 10 列）：三行渠道清单才纵向对齐
+  const pad = LABEL_COLUMN - displayWidth(label);
+  return `${" ".repeat(LABEL_COLUMN + 2)}${label}${" ".repeat(Math.max(1, pad))}${value}`;
 }
 
 /** 聚合状态：网关健康、控制台快照、守护 PID、凭证、auto_start。 */
@@ -488,49 +550,46 @@ export async function status(
   const state =
     (consoleState?.["ui_state"] as string | undefined) ?? (gatewayUp ? "running" : "down");
   const head = gatewayUp
-    ? `网关: ${baseUrlOf(addr)} [OK]`
+    ? `${baseUrlOf(addr)} [OK]`
     : foreign
-      ? `网关: ${baseUrlOf(addr)} [端口被 ${foreign} 占用]`
-      : `网关: ${baseUrlOf(addr)} [不可达]`;
-  // 一行一个字段：挤成一行在窄终端里会被折断成难读的形状
-  console.log(head);
-  console.log(`状态: ${state}`);
-  console.log(`守护PID: ${info.daemon_pid ?? "无"}`);
-  console.log(`凭证: ${credentialsPresent ? "有" : "无"}`);
-  console.log(`auto_start: ${info.auto_start ? "开" : "关"}`);
+      ? `${baseUrlOf(addr)} [端口被 ${foreign} 占用]`
+      : `${baseUrlOf(addr)} [不可达]`;
+  const lines = [
+    field("网关", head),
+    field("状态", state),
+    field("守护 PID", String(info.daemon_pid ?? "无")),
+    field("凭证", credentialsPresent ? "有" : "无"),
+    field("auto_start", info.auto_start ? "开" : "关"),
+  ];
   // 仓库级时逐渠道报登录态（渠道级只有一行，且行首已有渠道名，不重复）
   if (list.length > 1) {
-    console.log(
-      `渠道: ${perChannel.map((c) => `${c.cid}${c.present ? "✓" : "✗"}`).join(" ")}`,
-    );
+    lines.push(field("渠道", perChannel.map((c) => `${c.cid}${c.present ? "✓" : "✗"}`).join(" ")));
   }
-  const signinParts = [
-    ...info.signin.channels.map((c) => `${c.cid}${c.claimed_today ? "✓" : ""}`),
-    ...info.signin.unsupported.map((cid) => `${cid}-`),
-  ];
-  if (signinParts.length > 0) {
-    if (info.signin.tracked > 0) {
-      console.log(
-        `签到（本地记录）: 今天已签 ${info.signin.claimed_today}/${info.signin.tracked} 个渠道` +
-          `（${signinParts.join(", ")}）`,
-      );
-    } else {
-      console.log(`签到: -（${info.signin.unsupported.join(", ")} 无签到功能）`);
+  // 签到按状态分三组：台账里「未签」与「无签到功能」混排会让同一个渠道出现两次
+  // （既在台账里、又在不支持列表里），且 `-` 标记没有含义；拆成互斥三组后每渠道只出现一次
+  if (info.signin.channels.length > 0) {
+    lines.push(
+      field("签到", `今天已签 ${info.signin.claimed_today}/${info.signin.tracked}（仅本地台账）`),
+    );
+    const claimed = info.signin.channels.filter((c) => c.claimed_today).map((c) => c.cid);
+    const unclaimed = info.signin.channels
+      .filter((c) => !c.claimed_today && !info.signin.unsupported.includes(c.cid))
+      .map((c) => c.cid);
+    if (claimed.length > 0) lines.push(cont("已签", claimed.join(" ")));
+    if (unclaimed.length > 0) lines.push(cont("未签", unclaimed.join(" ")));
+    if (info.signin.unsupported.length > 0) {
+      lines.push(cont("无签到功能", info.signin.unsupported.join(" ")));
     }
+  } else if (info.signin.unsupported.length > 0) {
+    lines.push(field("签到", `无台账（${info.signin.unsupported.join(", ")} 无签到功能）`));
   }
-  // 下一步建议：有异常才说话，正常不打扰（status 是高频诊断命令的收尾）
-  const notLoggedIn = perChannel.filter((c) => !c.present);
-  if (notLoggedIn.length > 0) {
-    const first = notLoggedIn[0]!;
-    console.log(
-      list.length === 1
-        ? `建议: mx login ${first.cid}（未登录）`
-        : `建议: ${notLoggedIn.length} 个渠道未登录，逐个 mx login <cid>（如 mx login ${first.cid}）`,
-    );
-  }
-  if (stale.stale) console.log(staleBuildHint(stale));
+  // 不再提示「未登录渠道去 mx login」：谁没登录在控制台账号池里一眼可见，
+  // 没登录就是用户没号或不想走这个渠道，不需要每次 status 都催一遍
+  if (stale.stale) lines.push(staleBuildHint(stale));
   const message = consoleState?.["message"];
-  if (typeof message === "string" && message) console.log(`提示: ${message}`);
+  if (typeof message === "string" && message) lines.push(field("提示", message));
+  // 一行一个字段：挤成一行在窄终端里会被折断成难读的形状
+  console.log(lines.join("\n"));
   return 0;
 }
 
@@ -705,7 +764,7 @@ function printAccountRows(rows: poolUsage.AccountCreditsRow[], indent = ""): voi
 /** 日志筛选条件（CLI `mx log` 用）。 */
 export interface LogFilter {
   kind?: string;
-  outcome?: "success" | "failure" | "other";
+  outcome?: "success" | "failure";
   date?: string;
 }
 

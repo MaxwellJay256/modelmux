@@ -1,19 +1,21 @@
 /**
- * 控制台根组件：React Query 客户端 + 路由挂载（`/` 仪表盘、`/accounts` 账号池）。
+ * 控制台根组件：React Query 客户端 + 路由挂载（`/` 仪表盘、`/accounts` 账号池、
+ * `/logs` 请求日志、`/api-keys` API key 管理；未知路径兜底回仪表盘）。
+ * 设置不是路由页面，是顶栏齿轮弹窗（`components/SettingsModal.tsx`）。
  *
- * 路由 `basename` 必须与 `vite.config.ts` 的 `base` 一致（单端口模式挂 `/web`，
- * 演示构建挂根路径）—— 只改 Vite 的 `base` 不改 Router 会整页空白。
+ * 路由 `basename` 必须与 `vite.config.ts` 的 `base` 一致（挂 `/web`）——
+ * 只改 Vite 的 `base` 不改 Router 会整页空白。
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import type { ReactElement } from "react";
 import { LayoutSingle } from "./components/LayoutSingle";
 import { ToastProvider } from "./components/Toast";
 import { Dashboard } from "./pages/Dashboard";
-import { Models } from "./pages/Models";
 import { Accounts } from "./pages/Accounts";
 import { Logs } from "./pages/Logs";
+import { ApiKeys } from "./pages/ApiKeys";
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1 } } });
 
@@ -22,33 +24,26 @@ const qc = new QueryClient({ defaultOptions: { queries: { retry: 1 } } });
  *
  * 单端口模式下 UI 挂在网关的 `/web` 下（见 `vite.config.ts` 的 `base`）。
  * `basename` 必须与之一致 —— 只设 Vite 的 `base` 只影响**资源引用**，
- * Router 仍按 `/` 匹配路径，访问 `/web/` 会没有任何路由命中而**整页空白**（实测踩过）。
- *
- * 演示构建用 `__DEMO_BASE__`（Pages 项目站点是 `/modelmux/`，本地预览是 `/`）：
- * 与 `vite.config.ts` 的 `base` 同一个值，两处必须一起变。
+ * Router 仍按 `/` 匹配路径，访问 `/web/` 会没有任何路由命中而**整页空白**（实测出现过）。
  */
-declare const __DEMO_MODE__: boolean;
-declare const __DEMO_BASE__: string;
-const DEMO_BASENAME =
-  typeof __DEMO_BASE__ === "string" ? __DEMO_BASE__.replace(/\/+$/, "") : "";
-const BASENAME =
-  typeof __DEMO_MODE__ !== "undefined" && __DEMO_MODE__ ? DEMO_BASENAME : "/web";
+const BASENAME = "/web";
 
 export function App(): ReactElement {
   return (
     <QueryClientProvider client={qc}>
-      {/* Toast 挂在这里：两个页面都要能用，且不受路由切换影响（见 components/Toast.tsx） */}
+      {/* Toast 挂在这里：各页面都要能用，且不受路由切换影响（见 components/Toast.tsx） */}
       <ToastProvider>
         <BrowserRouter basename={BASENAME}>
           <Routes>
-            {/* 布局重构（Strangler）：单栏 LayoutSingle 已切换；旧 Layout 保留可回退，
-                阶段 3 删侧栏时一并移除 */}
             <Route element={<LayoutSingle />}>
               <Route path="/" element={<Dashboard />} />
-              <Route path="/models" element={<Models />} />
               <Route path="/accounts" element={<Accounts />} />
               <Route path="/logs" element={<Logs />} />
+              <Route path="/api-keys" element={<ApiKeys />} />
             </Route>
+            {/* 兜底：历史链接/书签里的旧路径（如已下线的 /web/models、/web/admin/*）不匹配
+                任何路由时连 Layout 都不渲染，整页只剩底色 —— 重定向回仪表盘 */}
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>
       </ToastProvider>

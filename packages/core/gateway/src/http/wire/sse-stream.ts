@@ -91,7 +91,10 @@ export interface AggregatedCompletion {
   created: number;
   model: string;
   choices: AggregatedChoice[];
-  usage: Record<string, unknown>;
+  /**
+   * 上游给的 usage；**上游没给就是 undefined**（不伪造全 0 —— 见下方聚合处的说明）。
+   */
+  usage: Record<string, unknown> | undefined;
 }
 
 /** 把上游的 SSE 流聚合为标准 OpenAI chat.completion JSON（非流式响应用）。 */
@@ -104,7 +107,7 @@ export function aggregateChatSse(buf: Buffer): AggregatedCompletion {
   let id = "";
   let model = "";
   let created = 0;
-  let usage: Record<string, unknown> | null = null;
+  let usage: Record<string, unknown> | undefined;
 
   for (const block of buf.toString("utf8").split("\n\n")) {
     for (const line of block.split("\n")) {
@@ -193,8 +196,12 @@ export function aggregateChatSse(buf: Buffer): AggregatedCompletion {
       message,
       finish_reason: finish || (calls.length > 0 ? "tool_calls" : "stop"),
     }],
-    usage:
-      usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    // 上游没给 usage 就**不编造**：此前这里填 `{0,0,0}`，让「上游不提供用量」与
+    // 「真的用了 0 token」在日志与 UI 上长得一模一样（有的渠道结束帧只带会话
+    // 标识、不带任何计数，实测确认上游不提供 → 请求日志整列显示 `0 / 0`）。
+    // 这里显式给 `undefined`（不是省略键）—— `tokensOf` 据此返回 null，日志记 noUsage、
+    // 表格显示 `-`。对外 JSON 序列化时 undefined 键会被丢弃，客户端拿到的仍是原形态。
+    usage,
   };
 }
 
@@ -224,6 +231,39 @@ export function firstSseError(buf: Buffer): { code?: string; message?: string } 
         ...(typeof e["code"] === "string" ? { code: e["code"] } : {}),
         ...(typeof e["message"] === "string" ? { message: e["message"] } : {}),
       };
+    }
+  }
+  return null;
+}
+
+/**
+ * 取**单帧**里的业务错误对象（`data: {"error":{…}}`）；不是错误帧返回 null。
+ *
+ * 与 `firstSseError` 的区别：那个翻的是已聚合的整段字节，这个只看一帧 ——
+ * 流式路径需要逐帧记账（见 `http/chat/stream.ts` 的 `noteStreamError`）。
+ */
+export function errorFrameOf(frame: Buffer | string): Record<string, unknown> | null {
+  const text = Buffer.isBuffer(frame) ? frame.toString("utf8") : frame;
+  // 快判：绝大多数帧是内容帧，不值一次 JSON 解析（与 `noteFrameUsage` 同口径 ——
+  // 本函数在流式热路径上逐帧调用）
+  if (!text.includes('"error"')) return null;
+  // 逐 `data:` 行扫：翻译器正常一帧一条，但 TCP 合并 / 渠道实现可能一帧里有多行
+  for (const line of text.split("\n")) {
+    const data = line.trim();
+    if (!data.startsWith("data:")) continue;
+    const payload = data.slice("data:".length).trim();
+    if (payload === "" || payload === "[DONE]") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      /* 非 JSON 的 data 行（心跳 / 注释 / 半截帧）直接跳过，不视为错误帧 */
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const err = (parsed as Record<string, unknown>)["error"];
+    if (err && typeof err === "object" && !Array.isArray(err)) {
+      return err as Record<string, unknown>;
     }
   }
   return null;
@@ -294,6 +334,43 @@ export interface RelayOptions {
   dsml?: DsmlByteFilter;
   /** 探测层已消费的前缀帧：必须按原序先写客户端。 */
   prefix?: Buffer[];
+  /**
+   * 入站协议回程编码器（结构化最小接口，见 protocol/types.ts 的 ProtocolSink）。
+   *
+   * 传入时规范化后的帧不再直写 `out`，改交编码器转译成协议事件字节；
+   * 结尾也不再 `out.end()`（编码器的 finish() + 调用方收尾负责）。
+   */
+  sink?: {
+    writeOpenAiFrame(frame: Buffer | string): void;
+    /** 可选：零帧等异常收尾时写结构化错误帧（协议编码器实现它）。 */
+    writeError?(code: string, message: string): void;
+  };
+  /**
+   * 每写一帧回调一次（**只观测，不改帧**）。
+   *
+   * 用途是流内业务错误的逐帧记账：openai 线型的帧在本函数内部流转，
+   * 调用方看不到，只能由这里递出去（见 `http/chat/stream.ts`）。
+   */
+  onFrame?: (frame: Buffer | string) => void;
+  /**
+   * **惰性写响应头**：第一次真正要往客户端写东西之前调用（幂等，由调用方保证）。
+   *
+   * 为什么要惰性：一进转发层就 writeHead，等于向客户端承诺「这个请求我接了」，
+   * 之后发现上游 200 却零产出（空流）就再也换不了候选 —— 换渠道会变成两个响应。
+   * 把写头挪到首次写出，零产出且未写头的情况就能交回上层改试下一条渠道。
+   */
+  ensureHead?: () => void;
+}
+
+/**
+ * `relay` 的结果。
+ *
+ * `produced` = 实际交付给客户端的帧数（0 = 上游 200 但零帧）；
+ * `disconnected` = 客户端已断开（那种情况没有收件人，上层不该再换候选去喂它）。
+ */
+export interface RelayResult {
+  produced: number;
+  disconnected: boolean;
 }
 
 export async function relay(
@@ -302,38 +379,97 @@ export async function relay(
   contentType: string,
   cid?: string,
   opts: RelayOptions = {},
-): Promise<void> {
+): Promise<RelayResult> {
   const isSse = contentType.toLowerCase().includes("text/event-stream");
   // 只要上层给了过滤器就启用：openai 线型的响应语义是 SSE，content-type 可能不准
   const dsml = opts.dsml;
+  const sink = opts.sink;
   const capture: Buffer[] | null = captureEnabled(cid) ? [] : null;
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder("utf-8");
+  /** 异常向上传播时置位：`finally` 据此**不**收尾，留给调用方写错误帧。 */
+  let propagateFailure = false;
+  /** 客户端已断开：没有收件人，照常收尾，也不给上层留「换候选」的余地。 */
+  let disconnected = false;
+  /**
+   * 交付给客户端的帧数。
+   *
+   * 0 = 上游回了 200 却一个帧都没有 —— 静默 `end()` 会让客户端收到「空的成功响应」
+   * （ZCode 报成 "Provider returned a business error"），访问日志与账本还都记 success
+   * （2026-11-16 实测 loomy 一次 10.3s 空流）。非流式聚合路径早有同口径判定，
+   * 流式路径此前漏了。`prefix` 帧也算产出：它们确属本次响应。
+   */
+  let produced = 0;
+
+  /** 有编码器时不直写 out：帧交编码器转译（收尾与 end 也归调用方）。 */
+  const writeOut = (frame: Buffer | string): void => {
+    // 首次写出才落响应头：在此之前都还算「这条渠道没接住这个请求」，上层可换候选
+    opts.ensureHead?.();
+    produced += 1;
+    if (sink) sink.writeOpenAiFrame(frame);
+    else out.write(frame);
+  };
 
   try {
     // 探测层消费掉的前缀帧先写：它们属于同一次响应，顺序不能倒
     for (const frame of opts.prefix ?? []) {
       for (const outFrame of dsml ? dsml.push(frame) : [frame]) {
         noteFrameUsage(out, outFrame);
-        out.write(outFrame);
+        opts.onFrame?.(outFrame);
+        writeOut(outFrame);
       }
     }
 
     if (dsml) {
+      // 上游没按 SSE 回（错误 JSON 直落正文）时 DSML 过滤器一个事件都切不出来：
+      // 非 SSE 兜底必须先判，否则错误体会被当空流吞掉，协议客户端收到「空成功消息」。
+      if (!isSse) {
+        const chunks: Buffer[] = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (capture) capture.push(Buffer.from(value));
+          chunks.push(Buffer.from(value));
+        }
+        opts.ensureHead?.(); // 非 SSE 正文也是「往客户端写东西」：先落头
+      emitNonSseBody(Buffer.concat(chunks).toString("utf8"), sink, out);
+        produced += 1; // 非 SSE 正文同样是一次交付（不算空流）
+        return { produced, disconnected };
+      }
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         if (capture) capture.push(Buffer.from(value));
         for (const outFrame of dsml.push(value)) {
           noteFrameUsage(out, outFrame);
-          out.write(outFrame);
+          opts.onFrame?.(outFrame);
+          writeOut(outFrame);
         }
       }
       for (const outFrame of dsml.finish()) {
         noteFrameUsage(out, outFrame);
-        out.write(outFrame);
+        opts.onFrame?.(outFrame);
+        writeOut(outFrame);
       }
-      return;
+      return { produced, disconnected };
+    }
+
+    if (!isSse) {
+      // 上游没按 SSE 回（错误 JSON 直落正文）：**整段读完一次性交付**。
+      // 边读边发会把已读前缀反复拼进正文（第 N 段带上前 N-1 段）；开了抓包时
+      // `capture` 已收下当前段，再拼一次就是两份正文。协议客户端拿到的消息会
+      // 被重复内容挤占 500 字符窗口，真正的错误细节反而被截掉。
+      const chunks: Buffer[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (capture) capture.push(Buffer.from(value));
+        chunks.push(Buffer.from(value));
+      }
+      opts.ensureHead?.(); // 非 SSE 正文也是「往客户端写东西」：先落头
+      emitNonSseBody(Buffer.concat(chunks).toString("utf8"), sink, out);
+      produced += 1; // 非 SSE 正文同样是一次交付（不算空流）
+      return { produced, disconnected };
     }
 
     let buffer = "";
@@ -341,10 +477,6 @@ export async function relay(
       const { done, value } = await reader.read();
       if (done) break;
       if (capture) capture.push(Buffer.from(value));
-      if (!isSse) {
-        out.write(Buffer.from(value));
-        continue;
-      }
       buffer += decoder.decode(value, { stream: true });
       for (;;) {
         const lf = buffer.indexOf("\n\n");
@@ -362,7 +494,8 @@ export async function relay(
         if (processed !== null) {
           const frame = processed.replace(/\r+$/, "");
           noteFrameUsage(out, frame);
-          out.write(`${frame}\n\n`);
+          opts.onFrame?.(frame);
+          writeOut(`${frame}\n\n`);
         }
       }
     }
@@ -372,18 +505,52 @@ export async function relay(
         const processed = processEvent(buffer);
         if (processed !== null) {
           noteFrameUsage(out, processed);
-          out.write(processed);
+          opts.onFrame?.(processed);
+          writeOut(processed);
         }
       }
     }
   } catch (err) {
     // 客户端提前断开（如主动取消请求）属正常情况，降级为调试日志
-    if (!isBenignDisconnect(err)) throw err;
+    if (isBenignDisconnect(err)) {
+      disconnected = true;
+    } else {
+      // 异常要往上抛给 `relayStream` 的 catch 去写错误帧 —— 所以下面 finally 不能先 end：
+      // `writeError()` 首行是 `if (res.writableEnded) return`，一旦这里 end 了，
+      // 错误帧与 `[DONE]` 会被静默吞掉，客户端只看到 SSE 截断（与 stream.ts 的
+      // 「必须避免截断」约定直接冲突）。
+      propagateFailure = true;
+      throw err;
+    }
   } finally {
     await reader.cancel().catch(() => {});
     if (capture) debugDump("resp", "sse", Buffer.concat(capture), cid);
-    out.end();
+    // 零帧**不在这里**写错误帧、也不 end：头还没写时上层要改试下一条候选
+    // （写了就成了两个响应，end 掉了更没法重试）—— 判定与收尾都在 `forward.ts`。
+    if (!sink && !propagateFailure && (produced > 0 || out.headersSent || disconnected)) out.end();
   }
+  return { produced, disconnected };
+}
+
+/**
+ * 上游返回非 SSE 正文（多为错误 JSON 直落 body）时的统一兜底。
+ *
+ * 协议客户端（anthropic / responses）只认事件帧 —— 直接把 JSON 字节写过去会让它解析失败；
+ * 有编码器就转成一个错误事件。裸 OpenAI 客户端可以吃原字节，照写。
+ */
+function emitNonSseBody(
+  text: string,
+  sink: { writeOpenAiFrame: (frame: string) => void } | undefined,
+  out: ServerResponse,
+): void {
+  if (sink) {
+    const body = text.trim();
+    sink.writeOpenAiFrame(
+      `data: ${JSON.stringify({ error: { code: "upstream_error", message: body.slice(0, 500) || "upstream returned a non-SSE body" } })}\n\n`,
+    );
+    return;
+  }
+  out.write(Buffer.from(text, "utf8"));
 }
 
 function isBenignDisconnect(err: unknown): boolean {
@@ -400,8 +567,8 @@ function isBenignDisconnect(err: unknown): boolean {
  * 从一个 SSE 帧里提取 usage 并记到请求日志。
  *
  * 两条转发路径共用：翻译器路径（`chat/stream.ts`）与 `openai` 线型的直通路径
- * （本文件的 `relay`）。直通路径**不采集 usage 的话**，workbuddy / lobsterai /
- * loomy / raccoon / workbuddyai 的流式请求访问日志会全部没有 usage 字段
+ * （本文件的 `relay`）。直通路径**不采集 usage 的话**，workbuddy /
+ * loomy / raccoon 等渠道的流式请求访问日志会没有 usage 字段
  * （2026-10-24 实测：这几个渠道当日流式请求 usage 采样全部为 0）。
  *
  * 快判：绝大多数帧不含 `"usage"`，只做一次子串扫描就返回，不给直通路径

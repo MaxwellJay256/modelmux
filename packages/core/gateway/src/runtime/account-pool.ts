@@ -12,14 +12,14 @@
  */
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
 
 import { getChannel, type Channel } from "./channel.js";
 import { runInChannel } from "./channel-context.js";
+import { runWithCredentialPath } from "./credential-scope.js";
 import { logThrottled } from "./logger.js";
-import { channelDir, credentialsPath, ensureDir } from "./paths.js";
-import { writeJsonSecret } from "./secret-file.js";
+import { accountCredentialsPath, channelDir } from "./paths.js";
+import { poolStore } from "./pool-store.js";
+import { ACCOUNT_DIR, INDEX_NAME } from "./pool-store.js";
 
 /**
  * 账号健康状态。
@@ -30,7 +30,7 @@ import { writeJsonSecret } from "./secret-file.js";
  * - `cooldown`：**额度耗尽**（不是故障）—— 等到 `cooldown_until` 上游窗口刷新后自动恢复，
  *   也可以由用户在 Web 上提前解除（见 `clearAccountState`）。
  *   与 `error` 分开是因为额度耗尽会自然好转，把它当故障会让账号被永久跳过
- *   （workbuddyai 的 429/6004 被打 `fail_streak` → 显示「不可用」，就是混判的后果）。
+ *   （`429` + 用量超限业务码被打 `fail_streak` → 显示「不可用」，就是混判的后果）。
  */
 export type AccountHealth = "ok" | "unauthorized" | "unknown" | "error" | "cooldown";
 
@@ -72,6 +72,14 @@ export interface PoolAccount {
   trip_until?: string | null;
   /** 当前熔断退避长度（ms，翻倍用；缺省 0 = 首次熔断）。 */
   trip_backoff_ms?: number;
+  /**
+   * 上次同步时 live / 池内凭据的内容哈希（`reconcileActive` 的回灌判据）。
+   *
+   * 为什么不用 mtime：Windows 同刻写入会把「refresh 改了 live」判成未变，
+   * 池内从此留旧 token。capture / activate / reconcile 三个同步点都会刷新这两笔。
+   */
+  synced_live_hash?: string;
+  synced_pool_hash?: string;
 }
 
 export interface PoolIndex {
@@ -81,14 +89,12 @@ export interface PoolIndex {
   accounts: PoolAccount[];
 }
 
-const INDEX_NAME = "accounts.json";
-const ACCOUNT_DIR = "accounts";
 /**
  * **名称类字段**（按「区分度」排序，越靠前越像人读的账号名）。
  *
  * 只放能代表「这是谁」的字段；`uid` / `key` 这类机器标识不进表 —— 它们是兜底，
- * 不是名字。各渠道实测：traecn/qoder/qodercn/raccoon 给 nickname，loomy 给
- * 已脱敏手机号，workbuddy/workbuddyai 给 nickname（可能为空），catpaw 只有 uid。
+ * 不是名字。各渠道实测：traecn / raccoon / qwenworkcn 给 nickname，loomy 给
+ * 已脱敏手机号，有的渠道给 nickname（可能为空），catpaw 只有 uid。
  */
 const NAME_FIELDS = [
   "nickname",
@@ -116,30 +122,19 @@ const NAME_FIELDS = [
 const LABEL_FIELDS = [...NAME_FIELDS, "account", "login"] as const;
 const EXPIRY_FIELDS = ["expiresAt", "expireTime", "expiry", "expires_at", "refreshExpiresAt"] as const;
 
-function accountDir(cid?: string): string {
-  return join(channelDir(cid), ACCOUNT_DIR);
-}
-
-function indexFile(cid?: string): string {
-  return join(channelDir(cid), INDEX_NAME);
-}
-
-function accountFile(key: string, cid?: string): string {
-  if (!/^[a-z0-9][a-z0-9.-]*$/.test(key)) throw new Error(`invalid account key: ${key}`);
-  return join(accountDir(cid), `${key}.json`);
+/**
+ * 在「凭据落点 = 该账号文件」的上下文里对**这个账号**跑 `fn`。
+ *
+ * 为什么需要它：渠道的 `cred.refresh()` 会 `save()` 到 `credentialsPath()`。不限定落点时，
+ * 用非生效账号的凭据续期会把 live 文件写成那个账号的凭据（`syncPool` 据此把生效账号切走）。
+ * 套上这层后，渠道侧零改动就把续期结果写进该账号自己的文件。
+ */
+export function runForAccountCredential<T>(cid: string, key: string, fn: () => T): T {
+  return runInChannel(cid, () => runWithCredentialPath(accountCredentialsPath(key, cid), fn));
 }
 
 function nowIso(): string {
   return new Date().toISOString();
-}
-
-/** 「谁新用谁」的时间戳（毫秒）；不存在返回 0。 */
-function mtimeMs(path: string): number {
-  try {
-    return statSync(path).mtimeMs;
-  } catch {
-    return 0;
-  }
 }
 
 function hint(cred: Record<string, unknown>, fields: readonly string[]): string {
@@ -183,10 +178,156 @@ export function accountKey(credential: { uid?: unknown; domain?: unknown; access
   return createHash("sha256").update(basis, "utf8").digest("hex").slice(0, 16);
 }
 
+/**
+ * key 的稳定身份（改备注名不影响账号身份）。
+ *
+ * 身份必须绑定 key 本体而不是显示名 —— 用 label 当身份时改一次备注就会
+ * 被当成新账号（旧账号成孤儿再被裁掉），凭据/健康历史全丢。
+ *
+ * 生效凭据（credentials.json）与账号文件必须用**同一个派生**：两处 uid 不一致时
+ * `syncPool` 会从凭据派生出一个池里不存在的「幽灵账号」（实测踩过），
+ * 所以 writeActiveKeyProvider 也调用本函数。
+ */
+export function keyUid(key: string): string {
+  return createHash("sha256").update(`key\u0000${key}`, "utf8").digest("hex").slice(0, 12);
+}
+
+/**
+ * 「凭据即 key」渠道的池同步：一组 key → 池内账号（一个 key = 一个账号）。
+ *
+ * 与真实渠道完全同构：账号文件内容 `{accessToken: key, uid, domain: cid}` 落
+ * `accounts/<accountKey>.json`，生效凭据 = `credentials.json`（账号池切换即改它）。
+ * 不在列表里的 key 连账号一起移除；生效 key 被删时自动改指第一个；列表为空则
+ * 清空池并删生效凭据。幂等，可反复调用（注册表每次变动 / 启动时同步）。
+ */
+export function syncKeyAccounts(
+  cid: string,
+  entries: Array<{ key: string; label?: string }>,
+  /** 指定生效 key（登录/新增 key 时让它立即生效）；缺省保留原 active 或取第一个。 */
+  preferredActive?: string,
+): void {
+  const index = readIndex(cid);
+  const stamp = nowIso();
+  const wanted = new Map<string, { credential: Record<string, unknown>; label: string }>();
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) continue;
+    const credential = { accessToken: key, uid: keyUid(key), domain: cid };
+    wanted.set(accountKey(credential), { credential, label: entry.label?.trim() || key });
+  }
+
+  const kept: PoolAccount[] = [];
+  for (const account of index.accounts) {
+    // 裁掉「从注册表移除的 key」与「domain 为空的脏账号」：本函数只服务
+    // 凭据即 key 的渠道，其账号一定带 domain=cid —— domain 空项是旧路径残留，
+    // 留着会以幽灵账号身份被显示/被选中
+    const stale = !wanted.has(account.key) && (account.domain === cid || account.domain === "");
+    if (stale) {
+      // 账号凭据删不掉不阻塞索引裁剪（store 内部吞异常，与现状一致）
+      poolStore().deleteAccountCredential(account.key, cid);
+      continue;
+    }
+    kept.push(account);
+  }
+
+  for (const [key, item] of wanted) {
+    const existing = kept.find((a) => a.key === key);
+    const account: PoolAccount = {
+      key,
+      uid: String(item.credential["uid"] ?? ""),
+      domain: cid,
+      name: existing?.name ?? "",
+      label: item.label,
+      added_at: existing?.added_at ?? stamp,
+      last_used_at: existing?.last_used_at ?? stamp,
+      expires_at: null,
+      health: existing?.health ?? "ok",
+      health_at: existing?.health_at ?? stamp,
+      fail_streak: existing?.fail_streak ?? 0,
+      // 健康状态与冷却/熔断原样保留：重同步不该清掉失败历史
+      ...(existing?.cooldown_until ? { cooldown_until: existing.cooldown_until } : {}),
+      ...(existing?.cooldown_reason ? { cooldown_reason: existing.cooldown_reason } : {}),
+      ...(existing?.trip_until ? { trip_until: existing.trip_until } : {}),
+      ...(existing?.trip_backoff_ms ? { trip_backoff_ms: existing.trip_backoff_ms } : {}),
+    };
+    const at = kept.findIndex((a) => a.key === key);
+    if (at >= 0) kept[at] = account;
+    else kept.push(account);
+    poolStore().writeAccountCredential(key, item.credential, cid);
+  }
+
+  // 生效账号必须落在本次同步的 key 集合里：首选 preferredActive（登录/新加 key），
+  // 否则保留旧 active（若仍有效），最后回退第一个
+  const preferredKey = preferredActive
+    ? [...wanted.entries()].find(([, item]) => item.credential["accessToken"] === preferredActive)?.[0]
+    : undefined;
+  const active =
+    preferredKey ??
+    (kept.some((a) => a.key === index.active && wanted.has(a.key)) ? index.active : (kept[0]?.key ?? null));
+  writeIndex({ version: 1, active, accounts: kept }, cid);
+
+  // 生效凭据：与 active 对齐（缺失 / 指向已删 key / 内容不一致时改写；无 key 则清理）
+  const target = active ? wanted.get(active) : undefined;
+  if (!target) {
+    poolStore().deleteActiveCredential(cid);
+    return;
+  }
+  const parsed = poolStore().readActiveCredential(cid) as Record<string, unknown> | null;
+  // uid 也要比对：旧版本写的凭据 uid 派生不同，仅凭 token 相同跳过会把不一致形态留在存储里
+  const current = parsed && typeof parsed["accessToken"] === "string" ? parsed["accessToken"] : "";
+  const currentUid = parsed && typeof parsed["uid"] === "string" ? parsed["uid"] : "";
+  if (current === String(target.credential["accessToken"]) && currentUid === String(target.credential["uid"])) return;
+  poolStore().writeActiveCredential(target.credential, cid);
+}
+
 /** 读索引；文件缺失/损坏时返回空池（不抛错）。 */
+/**
+ * 索引的进程内缓存（按文件路径 + mtime）。
+ *
+ * 为什么必须有：排序比较器（`pool-targets.sortByPriority` → `priorityOf` →
+ * `totalRemainOf` → `readIndex`）在一个 3~5 候选的请求里会同步读盘 **10~20 次**
+ * 并各自 JSON 解析一遍（2026-11-08 评审实测）。稳态下索引不变，每次请求读 20 次
+ * 纯属白费。
+ *
+ * 用 mtime 做失效依据（不是 TTL）：写盘（`writeIndex`）会更新 mtime，其他进程
+ * （CLI `acct` 命令）改过也会体现在 mtime 上，所以不会读到陈旧状态。
+ */
+const indexCache = new Map<string, { stamp: number; index: PoolIndex }>();
+
+/** 缓存键：cid 缺省（单渠道回落形态）与具体渠道区分开。 */
+function poolKey(cid?: string): string {
+  return cid ?? "(default)";
+}
+
+/** 清掉某渠道（或全部）的索引缓存 —— 写盘后调用，保证同一进程内立刻读到新值。 */
+function invalidateIndexCache(cid?: string): void {
+  if (cid === undefined) {
+    indexCache.clear();
+    return;
+  }
+  indexCache.delete(poolKey(cid));
+}
+
 export function readIndex(cid?: string): PoolIndex {
+  let stamp: number;
+  let raw: unknown | null;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(indexFile(cid), "utf8"));
+    stamp = poolStore().indexStamp(cid);
+    raw = poolStore().readIndex(cid);
+  } catch {
+    // 落点解析失败（多渠道未显式给 cid）：与现状一致返回空池
+    return emptyIndex();
+  }
+  const key = poolKey(cid);
+  const cached = indexCache.get(key);
+  if (cached && cached.stamp === stamp) return cached.index;
+  const index = normalizeIndex(raw);
+  indexCache.set(key, { stamp, index });
+  return index;
+}
+
+/** 规范化存储读回的原始索引（`readIndex` 的缓存未命中路径）。 */
+function normalizeIndex(parsed: unknown): PoolIndex {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return emptyIndex();
     const rec = parsed as Record<string, unknown>;
     const list = Array.isArray(rec["accounts"]) ? rec["accounts"] : [];
@@ -219,6 +360,8 @@ export function readIndex(cid?: string): PoolIndex {
         cooldown_until: typeof a["cooldown_until"] === "string" ? a["cooldown_until"] : null,
         cooldown_reason: typeof a["cooldown_reason"] === "string" ? a["cooldown_reason"] : undefined,
         trip_until: typeof a["trip_until"] === "string" ? a["trip_until"] : null,
+        synced_live_hash: typeof a["synced_live_hash"] === "string" ? a["synced_live_hash"] : undefined,
+        synced_pool_hash: typeof a["synced_pool_hash"] === "string" ? a["synced_pool_hash"] : undefined,
         trip_backoff_ms:
           typeof a["trip_backoff_ms"] === "number" && Number.isFinite(a["trip_backoff_ms"])
             ? Math.trunc(a["trip_backoff_ms"])
@@ -227,9 +370,6 @@ export function readIndex(cid?: string): PoolIndex {
     }
     const active = typeof rec["active"] === "string" ? rec["active"] : null;
     return { version: 1, active, accounts };
-  } catch {
-    return emptyIndex();
-  }
 }
 
 function emptyIndex(): PoolIndex {
@@ -237,9 +377,10 @@ function emptyIndex(): PoolIndex {
 }
 
 function writeIndex(index: PoolIndex, cid?: string): void {
-  ensureDir(cid);
-  mkdirSync(accountDir(cid), { recursive: true });
-  writeJsonSecret(indexFile(cid), index);
+  poolStore().writeIndex(index, cid);
+  // 写盘后立刻失效缓存：同一进程内 stamp 粒度可能不变（Windows mtime 精度有限），
+  // 只靠 stamp 比对会读到写之前的旧值。
+  invalidateIndexCache(cid);
 }
 
 /**
@@ -324,8 +465,7 @@ export function captureActive(
   options: { label?: string } = {},
 ): PoolAccount | null {
   const channel: Channel = getChannel(cid);
-  const source = credentialsPath(cid);
-  if (!existsSync(source)) return null;
+  if (!poolStore().hasActiveCredential(cid)) return null;
 
   // 读不到就是**没东西可收**（未登录）；但失败原因必须可诊断 —— 见 loadCredentialOf
   const raw = loadCredentialOf(channel);
@@ -350,13 +490,11 @@ export function captureActive(
     fail_streak: 0,
   };
 
-  mkdirSync(accountDir(cid), { recursive: true });
-  copyFileSync(source, accountFile(key, cid));
-  try {
-    chmodSync(accountFile(key, cid), 0o600);
-  } catch {
-    /* 忽略 */
-  }
+  const store = poolStore();
+  store.copyActiveToAccountCredential(key, cid);
+  // 收号即初次同步：记下两边内容哈希，reconcile 才能判「此后谁变过」
+  account.synced_live_hash = credentialHash(store.readActiveCredential(cid));
+  account.synced_pool_hash = credentialHash(store.readAccountCredential(key, cid));
 
   const accounts = [...index.accounts.filter((a) => a.key !== key), account];
   writeIndex({ version: 1, active: key, accounts }, cid);
@@ -369,7 +507,7 @@ export function captureActive(
  * ## 为什么需要
  *
  * 账号 key 是**从凭据派生**的（`accountKey()`：有 uid 用 `sha256(domain\0uid)`，
- * 没有就退化到 token 派生）。凭据里的字段一变（本次：astudio 补上了 `domain` 字段），
+ * 没有就退化到 token 派生）。凭据里的字段一变（如渠道补上新字段），
  * **同一个账号会算出另一个 key** —— 旧条目指向的文件就没人再维护了。
  *
  * 旧条目的凭证文件被删（切账号、重新登录、清理）后，索引里还留着它 →
@@ -379,7 +517,7 @@ export function captureActive(
  * 连带修好 `active` 指向已删文件的情况。
  */
 function pruneMissingFiles(index: PoolIndex, cid?: string): PoolIndex {
-  const kept = index.accounts.filter((a) => existsSync(accountFile(a.key, cid)));
+  const kept = index.accounts.filter((a) => poolStore().hasAccountCredential(a.key, cid));
   if (kept.length === index.accounts.length) {
     // 条目都在，但 active 可能指向一个已被换掉的 key（key 变了的情形）
     if (index.active && kept.some((a) => a.key === index.active)) return index;
@@ -404,19 +542,26 @@ export function activateAccount(key: string, cid?: string): PoolAccount {
     const known = index.accounts.map((a) => a.key).join(", ") || "(empty pool)";
     throw new Error(`account not found: ${key} (pool for this channel: ${known})`);
   }
-  const from = accountFile(key, cid);
-  if (!existsSync(from)) throw new Error(`account file missing: ${from}`);
-  ensureDir(cid);
-  copyFileSync(from, credentialsPath(cid));
-  try {
-    chmodSync(credentialsPath(cid), 0o600);
-  } catch {
-    /* 忽略 */
+  if (!poolStore().hasAccountCredential(key, cid)) {
+    throw new Error(`account file missing: ${accountCredentialsPath(key, cid)}`);
   }
+  poolStore().copyAccountCredentialToActive(key, cid);
+  // 切号也是一次同步（live := 池内那份），记下两边哈希避免 reconcile 误判回灌
+  account.synced_live_hash = credentialHash(poolStore().readActiveCredential(cid));
+  account.synced_pool_hash = credentialHash(poolStore().readAccountCredential(key, cid));
   account.last_used_at = nowIso();
   // 手动切号 = 给这份凭据第二次机会：清零连败，并把 error / cooldown 标记一并恢复
   clearTrippedState(account);
   writeIndex({ version: 1, active: key, accounts: index.accounts }, cid);
+  // 生效账号变了 → 旧生效账号的健康度缓存作废（缓存键含账号，不清会慢慢堆积）
+  try {
+    const scope = channelDir(cid);
+    for (const cacheKey of healthCache.keys()) {
+      if (cacheKey.startsWith(`${scope}\u0000`)) healthCache.delete(cacheKey);
+    }
+  } catch {
+    /* 路径不可用时没有缓存可清 */
+  }
   return account;
 }
 
@@ -489,7 +634,7 @@ export function clearAccountState(key: string, cid?: string): ClearAccountStateR
   if (changed) writeIndex(index, cid);
   // 生效账号的状态缓存在进程里：清了盘不更新缓存的话，下一次 `markActiveHealth`
   // 会拿旧值短路（它按「内存里的值 == 目标值」早退），状态会看起来没被清掉。
-  if (scope !== undefined && index.active === key) healthCache.set(scope, account.health);
+  if (scope !== undefined && index.active === key) healthCache.set(healthKey(scope, key), account.health);
   return { cleared: changed, health: account.health };
 }
 
@@ -508,19 +653,10 @@ export function removeAccount(
   const hit = index.accounts.find((a) => a.key === key);
   if (!hit) return { removed: false, wasActive: false, loggedOut: false };
   const wasActive = index.active === key;
-  try {
-    rmSync(accountFile(key, cid), { force: true });
-  } catch {
-    /* 文件已不在也算删掉 */
-  }
+  poolStore().deleteAccountCredential(key, cid);
   let loggedOut = false;
   if (wasActive) {
-    try {
-      rmSync(credentialsPath(cid), { force: true });
-      loggedOut = true;
-    } catch {
-      /* 删不掉就算了，下次同步会把它收回来 */
-    }
+    loggedOut = poolStore().deleteActiveCredential(cid);
   }
   writeIndex(
     { version: 1, active: wasActive ? null : index.active, accounts: index.accounts.filter((a) => a.key !== key) },
@@ -544,7 +680,7 @@ export function purgeCredentials(cid?: string): { accounts: number; credential: 
   // `rmSync(credentialsPath)`，之后再探就永远是 false，汇报就成了「凭据本来就没有」。
   let credential = false;
   try {
-    credential = existsSync(credentialsPath(cid));
+    credential = poolStore().hasActiveCredential(cid);
   } catch {
     /* 路径不可用：按没有处理 */
   }
@@ -553,16 +689,47 @@ export function purgeCredentials(cid?: string): { accounts: number; credential: 
   for (const account of index.accounts) {
     if (removeAccount(account.key, cid).removed) accounts += 1;
   }
-  try {
-    rmSync(credentialsPath(cid), { force: true });
-  } catch {
-    /* 删不掉：如实报告（credential 保持探测值） */
-  }
+  // 删不掉：如实报告（credential 保持探测值）—— store 内部吞异常
+  poolStore().deleteActiveCredential(cid);
   return { accounts, credential };
 }
 
-/** 进程内的健康度缓存：稳态下每个请求不读盘（仅状态变化时写索引）。 */
+/**
+ * 凭据在运行期彻底失效时，把**生效账号**从池里摘掉（连带删凭据、清 `active`）。
+ *
+ * 与 `purgeCredentials` 的区别：只动生效那一个账号，不碰兄弟账号 —— 后者是
+ * 用户显式登出才用的「清全池」动作。
+ *
+ * 为什么必须连池记录一起处理：只 unlink `credentials.json` 会留下
+ * 「未登录 + 账号生效中」（`accounts.json.active` 仍指向那个 key、账号文件还在、
+ * health 仍 ok），路由会把请求继续发给一个没有凭据的活跃账号 ——
+ * POOL-ARCHITECTURE §3.4 记的 2026-10-24 三连掉线就是这个形态。
+ *
+ * 返回被摘掉的账号 key；池里本来没有生效账号时返回 null（幂等）。
+ */
+export function removeActiveAccountAfterAuthLoss(cid?: string): string | null {
+  const index = readIndex(cid);
+  const active = index.active;
+  if (!active) return null;
+  removeAccount(active, cid);
+  return active;
+}
+
+/**
+ * 进程内的健康度缓存：稳态下每个请求不读盘（仅状态变化时写索引）。
+ *
+ * 键必须是 `<渠道目录>\u0000<生效账号 key>`，不能只用渠道目录：
+ * 切号（`activateAccount`）之后新账号的健康度可能与缓存里旧账号的相同，
+ * 此时同值短路会**跳过写盘**，磁盘上就留着旧状态 —— 路由层按磁盘剔除终态渠道
+ * （`route.ts` 读 `activeAccountHealth`），于是「B 账号已 unauthorized」永远不生效
+ * （2026-11-08 评审指出）。带上账号 key 后，切号即换键，短路自然失效。
+ */
 const healthCache = new Map<string, AccountHealth>();
+
+/** 缓存键：渠道作用域 + 当前生效账号（无生效账号时用空串占位）。 */
+function healthKey(scope: string, active: string): string {
+  return `${scope}\u0000${active}`;
+}
 
 /**
  * 标记当前生效账号的健康度（网关在刷新失败/请求成功时调用）。
@@ -576,14 +743,16 @@ export function markActiveHealth(health: AccountHealth, cid?: string): void {
   } catch {
     return; // 路径不可用（未注册/多渠道路由下未给 cid）→ 静默跳过，别影响请求
   }
-  if (healthCache.get(scope) === health) return;
   const index = readIndex(cid);
-  if (!index.active) {
-    healthCache.set(scope, health);
+  const active = index.active ?? "";
+  const key = healthKey(scope, active);
+  if (healthCache.get(key) === health) return;
+  if (!active) {
+    healthCache.set(key, health);
     return;
   }
-  const hit = index.accounts.find((a) => a.key === index.active);
-  healthCache.set(scope, health);
+  const hit = index.accounts.find((a) => a.key === active);
+  healthCache.set(key, health);
   if (!hit) return;
   // 恢复 ok 时顺手清掉熔断退避（半开试探成功 / 人工恢复都走这里）。
   const hadTrip = hit.trip_until != null || (hit.trip_backoff_ms ?? 0) > 0;
@@ -600,6 +769,61 @@ export function markActiveHealth(health: AccountHealth, cid?: string): void {
   writeIndex(index, cid);
 }
 
+/**
+ * 额度查询成功 → 把生效账号的**异常状态**复活成 `ok`。
+ *
+ * 覆盖三类需要复原的状态：
+ * - `unauthorized`：token 失效未必永久（上游抖动、临时 401、用户在别处续了 token），
+ *   早先只由「重新登录」清除，卡住的账号只能人工重登。
+ * - `cooldown` 且**已到期**：`coolingDown` 到期后逻辑上视为可用，但 `health` 字段
+ *   一直停在 `cooldown`，UI 与账本都显示「冷却中」—— 额度接口已经能通，就该写回 `ok`。
+ *   未到期的 cooling 不动（窗口确实还没刷新）。
+ * - `error` 且已过 `trip_until`：半开试探若一直轮不到（路由可能按别的顺序挑），
+ *   额度能通也说明账号活着，一并清掉熔断退避。
+ *
+ * 判据用「额度查询成功」而不是「模型请求成功」：额度接口同样要带凭据，能通即证明
+ * 凭据有效；模型请求可能因排队 / 额度 / 内容等原因失败，不足以反推凭据。
+ *
+ * 只在当前**生效账号**上做：用户没在用的那份凭据不该被这条旁路改写。
+ *
+ * @returns 是否真的改了状态（调用方可用它决定要不要写日志）。
+ */
+export function reviveAfterBilling(cid?: string): boolean {
+  let scope: string;
+  try {
+    scope = channelDir(cid);
+  } catch {
+    return false; // 路径不可用（未注册 / 多渠道路由下未给 cid）→ 静默跳过
+  }
+  const now = Date.now();
+  const index = readIndex(cid);
+  const active = index.active ?? "";
+  if (!active) return false;
+  const hit = index.accounts.find((a) => a.key === active);
+  if (!hit) return false;
+
+  const revivable =
+    hit.health === "unauthorized" ||
+    // 冷却到期：额度接口都通了，窗口已经刷新
+    (hit.health === "cooldown" && !coolingDown(hit, now)) ||
+    // 熔断已过试探时刻：额度能通说明账号活着，不必等半开
+    (hit.health === "error" && hit.trip_until != null && Date.parse(hit.trip_until) <= now);
+  if (!revivable) return false;
+
+  hit.health = "ok";
+  hit.health_at = nowIso();
+  hit.fail_streak = 0;
+  hit.trip_until = null;
+  hit.trip_backoff_ms = 0;
+  hit.cooldown_until = null;
+  hit.cooldown_reason = undefined;
+  // 与 `markActiveHealth` 同口径：缓存键是「作用域 + 生效账号」，不更新会让
+  // `route.ts` 的磁盘/内存判据分叉（内存仍是旧状态 → 该渠道继续被剔除）
+  healthCache.set(healthKey(scope, active), "ok");
+  writeIndex(index, cid);
+  return true;
+}
+
 /** 一天毫秒数（回落「次日 0 点」用）。 */
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -607,7 +831,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * 下一次**本地零点**（epoch ms）—— 渠道没给「下次刷新时间」时的兜底。
  *
  * 为什么敢兜底：上游额度窗口基本都按自然日重置（loomy 实测 `dailyCycleDate` 就是日期串、
- * workbuddyai 的用量限额 `6004` 也是日额度）。渠道能给出更准的时间就用渠道的（见 `until` 参数）。
+ * 用量超限类业务码也是日额度）。渠道能给出更准的时间就用渠道的（见 `until` 参数）。
  */
 export function nextLocalMidnight(now = Date.now()): number {
   const d = new Date(now);
@@ -650,7 +874,7 @@ export function activeAccountCooling(cid?: string, now = Date.now()): PoolAccoun
  *
  * 与 `error` 的分工：
  * - 额度耗尽不是故障 —— 上游窗口刷新后会自然好转，所以**不动 `fail_streak`**，
- *   否则「额度用满」会被连败熔断误判成「账号不可用」（workbuddyai 的 429/6004 就是受害者）；
+ *   否则「额度用满」会被连败熔断误判成「账号不可用」（`429` + 用量超限码就是受害者）；
  * - 真故障（连败、鉴权失效）仍走 `noteAccountFailure` / `markActiveHealth`。
  *
  * @param options.until  下次额度刷新时刻（epoch ms）。不给则回落**次日 0 点**。
@@ -680,7 +904,7 @@ export function noteAccountQuotaExhausted(
   hit.cooldown_until = new Date(untilMs).toISOString();
   hit.cooldown_reason = options.reason ?? "额度耗尽，等上游窗口刷新";
   // 刻意**不动 fail_streak**：额度耗尽不是连败，不该累积到熔断
-  healthCache.set(scope, "cooldown");
+  healthCache.set(healthKey(scope, index.active), "cooldown");
   writeIndex(index, cid);
   return untilMs;
 }
@@ -700,6 +924,10 @@ function expireCooldown(index: PoolIndex, cid?: string, now = Date.now()): boole
     account.cooldown_until = null;
     account.cooldown_reason = undefined;
     account.fail_streak = 0; // 窗口刷新 = 干净重来
+    // 熔断退避一并清掉：额度耗尽盖成 cooldown 的那条路径不碰 trip 字段，连败攒出来的
+    // backoff 若留到恢复后，下一次熔断会直接从封顶起步而不是 30s（实测推演 2026-11-07）
+    account.trip_until = null;
+    account.trip_backoff_ms = 0;
     changed = true;
   }
   if (changed) {
@@ -727,39 +955,43 @@ export function reconcile(cid?: string): boolean {
   return reconcileActive(cid, index);
 }
 
-/** 同一账号的 token 刷新：把 credentials.json 回灌池内那份（调用方已确认身份一致）。 */
+/**
+ * 同一账号的 token 刷新：把 credentials.json 回灌池内那份（调用方已确认身份一致）。
+ *
+ * 判「live 是否变过」用**内容哈希**（上次同步时记在 `synced_live_hash`），不用
+ * mtime：Windows 的 mtime 精度在「refresh 写 live 与上次回灌同刻」时会把变化判没，
+ * 池内从此留着旧 token —— 内容比较没有这个问题。池内文件被
+ * `runForAccountCredential` 单独刷新（签到 / 账单）时 live 未变，同样不回灌，
+ * 不会把池内的新 token 覆盖回旧值。
+ */
 function reconcileActive(cid: string | undefined, index: PoolIndex): boolean {
   if (!index.active) return false;
-  const pool = accountFile(index.active, cid);
-  const live = credentialsPath(cid);
-  if (!existsSync(pool) || !existsSync(live)) return false;
-  if (mtimeMs(live) <= mtimeMs(pool)) return false;
-
-  copyFileSync(live, pool);
-  try {
-    chmodSync(pool, 0o600);
-  } catch {
-    /* 忽略 */
-  }
+  const store = poolStore();
+  if (!store.hasAccountCredential(index.active, cid) || !store.hasActiveCredential(cid)) return false;
   const hit = index.accounts.find((a) => a.key === index.active);
-  if (hit) {
-    hit.last_used_at = nowIso();
-    hit.expires_at = parseExpiry(readRawCredential(cid));
-    writeIndex(index, cid);
-  }
+  if (!hit) return false;
+  const liveHash = credentialHash(store.readActiveCredential(cid));
+  if (liveHash === hit.synced_live_hash) return false; // live 相对上次同步没有变化
+  store.copyActiveToAccountCredential(index.active, cid);
+  hit.synced_live_hash = liveHash;
+  hit.synced_pool_hash = credentialHash(store.readAccountCredential(index.active, cid));
+  hit.last_used_at = nowIso();
+  hit.expires_at = parseExpiry(readRawCredential(cid));
+  writeIndex(index, cid);
   return true;
+}
+
+/** 凭据内容的稳定哈希（`synced_*_hash` 的载体；JSON 键序由写方保证一致）。 */
+function credentialHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value ?? null)).digest("hex").slice(0, 16);
 }
 
 /** 读 credentials.json 的原始 JSON（**仅用于展示字段**，不解释渠道语义）。 */
 function readRawCredential(cid?: string): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(credentialsPath(cid), "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
+  const parsed = poolStore().readActiveCredential(cid);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
 }
 
 /** 读当前生效凭证（走渠道自己的 `load()`，从而拿到契约字段 uid/domain）。未登录返回 null。 */
@@ -804,7 +1036,7 @@ export function noteAccountFailure(cid?: string): void {
     hit.health_at = nowIso();
     hit.trip_until = new Date(Date.now() + backoff).toISOString();
     hit.trip_backoff_ms = backoff;
-    healthCache.set(scope, "error");
+    healthCache.set(healthKey(scope, index.active), "error");
   }
   writeIndex(index, cid);
 }
@@ -841,10 +1073,28 @@ export function activeAccountIsError(cid?: string): boolean {
     const hit = index.accounts.find((a) => a.key === index.active);
     if (!hit || hit.health !== "error") return false;
     const until = hit.trip_until ? Date.parse(hit.trip_until) : Number.NaN;
-    return Number.isFinite(until) && until > Date.now();
+    if (Number.isFinite(until) && until > Date.now()) return true;
+    // 到期（旧数据缺 trip_until 视为早已到期）= 半开放行窗口：不再短路（放行试探）。
+    // 单实例网关没有「N 实例抢租约」的问题，直接放行。
+    return false;
   } catch {
     return false;
   }
+}
+
+/**
+ * 生效账号的健康态（池读不出来 / 没有生效账号时 `null`）。
+ *
+ * 路由用它剔除**终态**账号：`unauthorized` 是凭据本身失效（token 被撤销），
+ * 重试永远不会成功 —— 不剔除的话每次请求都会先白跑一趟这条候选。
+ * `error`（熔断）**不在此列**：它有半开试探时刻，到点必须放行一次自检。
+ */
+export function activeAccountHealth(cid?: string): AccountHealth | null {
+  // 不包 try：`readIndex` 自身已把读盘故障兜成空索引（空索引 → null → 不排除），
+  // 再包一层只会把真实故障藏起来
+  const index = readIndex(cid);
+  if (!index.active) return null;
+  return index.accounts.find((a) => a.key === index.active)?.health ?? null;
 }
 
 /** 熔断剩余信息（短路文案/界面用）；未熔断或已到试探时刻返回 null。 */
@@ -929,14 +1179,10 @@ export function syncPool(cid?: string): void {
 
 /** 池内某账号的凭证原始 JSON（供诊断；不解释渠道语义）。 */
 export function readAccountCredential(key: string, cid?: string): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(accountFile(key, cid), "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
+  const parsed = poolStore().readAccountCredential(key, cid);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
 }
 
 export { ACCOUNT_DIR, INDEX_NAME };

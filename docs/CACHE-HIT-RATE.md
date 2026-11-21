@@ -64,33 +64,66 @@
 5. **失败/中断请求没有 usage**：若当 0 计入分母会低估命中率（本仓库已有 `noUsage` 计数区分）
 6. **不同上游 usage 形态不同**（见 §5 → §6 的归一化）
 
-## 5. 各渠道 usage 形态（本仓库实测，2026-10-29，12 天全量真实日志）
+## 5. 各渠道 usage 形态
 
-量测脚本：`.tmp/probe-cache-fields.mjs --all`（按 cid 汇总「有缓存字段的条数 / 字段签名 / 加权命中率」）。
+### 5.1 日志口径（本仓库实测，2026-11-09，14 天全量真实日志）
+
+量测脚本：`.tmp/probe-cache-channels.mjs`（按 cid 汇总「有缓存字段的条数 / 字段签名 / 命中与输入 token」）、
+`.tmp/probe-cache-sanity.mjs`（字段自洽性校验）。
 
 | 渠道 | 有缓存字段 / 总条数 | 出现过的字段签名 | 加权命中率 |
 |---|---|---|---|
-| workbuddy | 3275 / 3275 | 两套风格全给（`prompt_cache_hit_tokens` + `miss` + `prompt_tokens_details.cached_tokens` + 顶层 `cached_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` + `prompt_cache_write_tokens`） | 97.7% |
-| loomy | 2058 / 2140 | `prompt_tokens_details.cached_tokens`（82 条无任何缓存字段） | 97.9% |
-| astudio | 1131 / 1221 | `prompt_tokens_details.cached_tokens`（90 条无） | 99.4% |
-| qodercn | 831 / 831 | `prompt_tokens_details.cached_tokens` | 96.3% |
-| workbuddyai | 449 / 449 | 同 workbuddy（两套风格全给） | 99.2% |
-| lobsterai | 210 / 219 | `prompt_tokens_details.cached_tokens`；6 条另带 `prompt_cache_hit_tokens` + `miss` | 96.6% |
-| raccoon | 186 / 199 | `prompt_tokens_details.cached_tokens`（13 条无） | 91.2% |
-| qoder | 87 / 87 | `prompt_tokens_details.cached_tokens` | 39.3% |
-| codearts | 4 / 31 | `prompt_tokens_details.cached_tokens`（27 条无） | 0.0% |
-| traecn / catpaw / orcaterm | **0** | 只有 `prompt_tokens` / `completion_tokens` / `total_tokens` | — |
+| loomy | 13224 / 13674 | `prompt_tokens_details.cached_tokens` | 98.4% |
+| workbuddy | 4123 / 4227 | 两套风格全给（`prompt_cache_hit_tokens` + `miss` + `prompt_tokens_details.cached_tokens` + 顶层 `cached_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` + `prompt_cache_write_tokens`） | 96.9% |
+| raccoon | 707 / 814 | `prompt_tokens_details.cached_tokens` | 86.0% |
+| lobsterai | 297 / 319 | `prompt_tokens_details.cached_tokens`；1 条另带 `prompt_cache_hit_tokens` + `miss` | 96.4% |
+| qodercn | 155 / 187 | `prompt_tokens_details.cached_tokens` | 86.1% |
+| catpaw | 0（历史）→ 已映射 | `prompt_tokens_details.cached_tokens` | 见 §5.2 |
+| traecn | **0** | 只有 `prompt_tokens` / `completion_tokens` / `total_tokens` | — |
 
 要点：
 
-- 12 天 8233 条里 **`hit >= prompt` 的一条都没有** —— 上游不会给出「满命中」，看到的 100%
-  只可能是显示取整造成的（见 §6 的精度规则）。
-- 同一渠道**混合形态**很常见（lobsterai 少数请求多给双字段、loomy 少数请求完全不给）——
+- **缓存字段确实存在，且不是官方直连才有**：14 天 35413 条里 9 个渠道带回缓存字段，
+  其中多数是第三方聚合上游（loomy / raccoon 等），它们把模型侧的 KV cache 计数透传上来。
+- **字段是自洽的上游统计，不是被中途改写**：全渠道 **0 条 `hit > prompt`、0 条负值**；
+  workbuddy 的 4123 条 DeepSeek 形态**全部**满足官方等式 `hit + miss == prompt`。
+- 同一渠道**混合形态**很常见（lobsterai 个别请求多给双字段、loomy 少数请求完全不给）——
   归一化必须**逐条按字段判断**，不能按渠道写死。
 - 同一渠道**不同模型**形态也可能不同：实测（2026-10-29）`loomy/spark-x2.6` 的 usage
   只有 `prompt_tokens` / `completion_tokens` / `total_tokens` + `points_consumed`，
   没有缓存字段（该模型倍率 0、`points_consumed: 0`，属免费模型）。
+- **输入 token 也可能单独缺失**：有的渠道 usage 里 `prompt_tokens` 恒为 `0`
+  （只有 `completion_tokens` 有值）—— 该渠道的「入」在统计里永远是 0，
+  同样是**缺口**而不是真实的零输入。
 - 结论：命中率**不可能对所有渠道统一显示** —— 无缓存字段的渠道必须显示 `—`，而不是 0%。
+
+### 5.2 上游原始响应里的缓存字段（2026-11-09 逐渠真实请求）
+
+日志只存共享层抽出的 `usage`，**响应体其余部分看不到** —— 单看日志会得出「上游不给缓存」
+的错误结论。逐渠打真实请求、dump 响应体全部叶子路径后：
+
+| 渠道 | 上游原始字段 | 语义 | 是否映射 |
+|---|---|---|---|
+| traecn | `cache_read_input_tokens`、`cache_creation_input_tokens`（+ `_total` 变体）、`prompt_cache_pool_record` | Anthropic 命名，但**实测恒为 0**（4 个模型 × 3 次请求，含 9235 token 相同前缀连发；`_total` 同样恒 0） | **否** —— 判为未填充的占位字段，映射会把「没给」变成假的 0% |
+| catpaw | `contextInfo.usage.cache_read_tokens` / `cache_write_tokens` | Anthropic 形态：`prompt_tokens` 不含缓存读，`total = prompt + completion + cache_read`（实测 prompt 47 / cache_read 29184 / total 29234） | **是** → `prompt_tokens_details.cached_tokens`（`prompt` 已含缓存读，走 OpenAI 形态） |
+
+> **catpaw 的缓存命中由渠道映射成 `prompt_tokens_details.cached_tokens` 透出**，与 loomy /
+> workbuddy 等一样计入仪表盘「缓存命中」。
+
+### 5.3 真实请求直连上游的字段（2026-11-13 探针实测）
+
+判据不能靠日志反推 —— 日志里的 `usage` 已经是归一化后的产物。**绕过网关直连上游**
+（用渠道包 `upstream.js` 的 `buildChatBody` / `buildChatHeaders` / `chatUrl` 自己发请求），
+直接看模型返回的**原始帧**：
+
+| 渠道 | 线协议 | 原始返回里的事实 |
+| --- | --- | --- |
+| workbuddy | openai | 末帧带完整 usage：`prompt_cache_hit_tokens: 0` / `prompt_cache_miss_tokens: 22`（**DeepSeek 形**），同时也有 `prompt_tokens_details.cached_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`；另每帧附带 `quota:{model,percent,reset_at,shared_models}` |
+| loomy | openai | 响应体是 **JSON 信封** `{code, desc, trace_id, data}`，SSE 流在 `data` 里 —— 不是裸 SSE |
+| traecn | custom | 直连回 **401**（`{code, message}`）—— 探针未带刷新后的凭据 |
+
+结论：§6 的三种缓存形态判定与**真实上游帧**一致；`quota` 对象是上游在对话帧里就给的额度信息，
+与 §5.2 的账单端点是两条独立取数路径。
 
 ## 6. 归一化规则（本仓库口径）
 
@@ -128,31 +161,35 @@
 - **缺失不补 0** —— 把「没采集到」显示成「完全没命中」是错误信息
 - 窗口聚合只收**分母可推**的记录（`Σhit / Σ(hit+miss)`）；无缓存字段的渠道不进分母
 
-### 显示精度：99.6% 不许显示成 100%
+### 显示精度：统一两位小数
 
 | 比率 | 显示 |
 |---|---|
-| `< 1%` | `<1%` |
-| `1% ~ 98.9%` | 整数百分比 |
-| `99% ~ 99.94%` | **一位小数**（如 `99.6%`） |
-| `99.95% ~ <100%` | `>99.9%` |
-| `= 100%` | `100%` |
+| 任意比率 | **两位小数**（`0.00%` / `45.67%` / `99.96%` / `100.00%`） |
+| 无数据（无 usage / 无缓存字段 / 分母推不出） | `—` |
 
-> 依据：前缀缓存下大量请求的命中率天然在 99% 上下，若四舍五入成 `100%`，日志页会出现
+> 依据：前缀缓存下大量请求的命中率天然在 99% 上下，四舍五入成 `100%` 会让日志页
 > 满屏 100%（本机 12 天 8233 条中有 3717 条 ≥99.5%），既看不出差异，又像数据出错。
-> 真正的满命中（上游明确 `hit == 分母`）与「近似满命中」必须可区分。
+> 两位小数让近似满命中（`99.96%`）与真正的满命中（`100.00%`）天然可区分，
+> 也不再需要 `>` / `<` 前缀来表达近似。
 
-## 7. 展示方案
+## 7. 展示方案（**上游不给比率，展示层按计数折算**）
+
+实测（2026-11-05，逐条扫全部渠道 access 日志的 `usage` 叶子字段）：**没有任何上游返回
+「命中率」字段**，只有命中 / 未命中的 **token 计数**（`cached_tokens`、
+`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 等）—— 比率只能由我们相除。
+上游从不返回比率字段，所以比率只能由 `hit / (hit + miss)` 在**展示层**折算 ——
+计算方式与各渠道字段形态见第 2–6 节：
 
 | 位置 | 内容 |
 |---|---|
-| 日志页表格 | 「缓存」列：命中率（`0%`–`100%`，99% 以上一位小数），无数据 `—` |
-| 日志页展开详情 | `命中 X · 未命中 Y · 比率`（便于核对绝对值） |
-| 日志页统计条 | 缓存命中（今日**加权** `Σhit/Σ(hit+miss)`）+ 命中/总输入绝对值 |
-| 仪表盘 KPI | 「今日 tokens」副行追加命中率（不加第 5 格，避免破四格栅格与手机端） |
-| 仪表盘最近请求 | 行内命中率；无数据显示 `—` |
+| 日志页表格 | 「缓存命中率」列：`hit / (hit + miss)` 的百分比（两位小数，如 `99.70%` / `0.00%` / `—`）。上游只回计数、不回比率，这里是**展示层折算**；分母为 0（只写了缓存）或没有缓存字段时是 `—`，不显示成 `0.00%` |
+| 日志页展开详情 | `命中 X · 未命中 Y`（上游计数原样展示）；无缓存字段的渠道写明「该上游无缓存字段」 |
+| 日志页统计条 | 不显示命中率 |
+| 仪表盘 KPI | 「今日 tokens」副行只给入 / 出 |
+| 仪表盘区间用量明细 | 只给「缓存命中 X tokens」（上游字段求和），不给比率 |
 
-> 同时给比率与绝对值：64-token 下限与 best-effort 会让纯比率在小样本下剧烈波动。
+> 第 2–6 节保留的是**上游字段语义与公式推导**（排障与对账用），不是界面口径。
 
 ## 8. 参考来源与性质标注
 

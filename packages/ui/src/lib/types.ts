@@ -18,8 +18,29 @@ export interface LoginInputRequest {
   captcha?: { gt: string; challenge: string; success?: unknown };
 }
 
+/** 版本更新提示（数据源：`/web/api/state` 的 `update`）。 */
+export interface UpdateNotice {
+  available: boolean;
+  /** 检测到的新版本（如 `v0.1.4`）。 */
+  version: string;
+  /** 下载入口（固定 GitHub Releases 的 Latest 页）。 */
+  url: string;
+  /** 本次检测时间（ISO）。 */
+  checkedAt: string;
+}
+
+/** 单个接入目标的「模型有更新」明细（与服务端 `integration_updates` 同构）。 */
+export interface IntegrationUpdate {
+  added: string[];
+  removed: string[];
+  at: string;
+}
+
 export interface UiSnapshot {
+  /** 网关状态（probing / login / running）；**不承载登录结果**。 */
   ui_state: string;
+  /** 上一轮登录的一次性结果：`idle` / `done` / `error`。 */
+  login_result?: "idle" | "done" | "error";
   message: string;
   /** 授权页 URL。不要在这里扫码（每次加载都是新的二维码会话）。 */
   auth_url: string;
@@ -35,41 +56,25 @@ export interface UiSnapshot {
   base_url: string;
   chat_url: string;
   endpoints: string[];
-  models: string[];
+  /** 网关自身版本（仓库 `VERSION` 常量），设置页版本行的数据源。 */
+  version: string;
+  /** 版本更新提示（后台每天检测一次；无提示为 null）。 */
+  update: UpdateNotice | null;
   /**
-   * 每模型附加信息（键 = 池模型 id）。
+   * 对外模型池的**「模型 × 渠道」矩阵**：一个 deepseek 模型可能由多个渠道供给。
    *
-   * 字段对齐共享层的 `PoolModelMeta`：消耗倍率、营销角标、上下文窗口、
-   * 单次输出上限、输入模态（多模态能力）。建模为可选是因为上游目录可能不带这些字段。
+   * 模型 id 是裸名（不再有 `<cid>/` 前缀）；`meta` 是**该渠道**的元数据
+   * （同一模型在不同渠道倍率/规格可能不同）。
    */
-  model_info?: Record<
-    string,
-    {
-      multiplier: number | null;
-      marketing: string;
-      contextWindow: number;
-      maxOutputTokens: number;
-      inputModalities: string[];
-      /**
-       * 思考模式（reasoning effort）档位；`null` = 渠道未声明。
-       *
-       * 与共享层 `PoolModelMeta.effort` 同形：**刻意可空**，界面据此显示
-       * 「不支持」而不是编造档位。
-       */
-      effort?: { supportedLevels: string[]; defaultLevel: string } | null;
-      /**
-       * 窗口 / 输出 / 档位各自从哪来（与共享层 `PoolModelMeta.sources` 同形）。
-       *
-       * `web_search` = 联网补全写入，`cross` = 兄弟渠道同 id 的推断值。
-       * 当前表格不渲染来源标记，字段保留给后续界面与排障使用。
-       */
-      sources?: {
-        contextWindow: "upstream" | "spec" | "web_search" | "cross" | "default";
-        maxOutputTokens: "upstream" | "spec" | "web_search" | "cross" | "default";
-        effort: "upstream" | "spec" | "web_search" | "cross" | "default";
-      };
-    }
-  >;
+  models: Array<{ model: string; cid: string; meta: ModelInfo }>;
+  /**
+   * 模型级渠道偏好（「这个模型优先走哪家」）。
+   *
+   * `channels` 是该模型的全部候选渠道，`preferred` 为当前偏好（`null` = 自动选路）。
+   * 偏好的渠道在选路里**置顶**，其余渠道仍按剩余额度排在后面；被偏好的渠道
+   * 冷却 / 额度耗尽时自然顺延，不需要额外开关。
+   */
+  model_prefs: Array<{ model: string; channels: string[]; preferred: string | null }>;
   /**
    * 各渠道的能力位（键 = cid）。
    *
@@ -77,9 +82,112 @@ export interface UiSnapshot {
    * 按「免费」显示。**不硬编码渠道名**：再接一个订阅制渠道，前端不用改。
    */
   channel_caps?: Record<string, { billing: boolean }>;
+  /** 各接入目标当前的接入态（键 = target；开关式 UI 的状态源）。 */
+  integrations?: Record<string, boolean>;
+  /**
+   * 各接入目标的「模型有更新」（键 = target；null / 缺省 = 无更新）。
+   * 服务端用标记文件里的写入清单与当前对外清单 diff 好再下发。
+   */
+  integration_updates?: Record<string, IntegrationUpdate | null>;
+  /** 用户选的主题模式：system（跟随系统）/ dark / light（持久化在网关侧）。 */
   theme_mode: string;
-  resolved_theme: string;
+  /** 设置弹窗的渠道开关状态（关闭 = 账号池隐藏 + 不参与选路，不是注销）。 */
+  channel_toggles?: Array<{ cid: string; enabled: boolean }>;
   gateway_error: string;
+}
+
+/** 桌面壳的窗口控制桥（desktop/preload.cjs 经 contextBridge 暴露；浏览器里不存在）。 */
+declare global {
+  interface Window {
+    modelmuxWindow?: {
+      minimize(): Promise<void>;
+      toggleMaximize(): Promise<void>;
+      close(): Promise<void>;
+      isMaximized(): Promise<boolean>;
+      onMaximizeChange(callback: (maximized: boolean) => void): () => void;
+      setTheme(mode: "system" | "dark" | "light"): Promise<void>;
+      getAutostart(): Promise<boolean>;
+      setAutostart(enabled: boolean): Promise<void>;
+    };
+  }
+}
+
+/**
+ * 单个模型的元数据（与共享层 `PoolModelMeta` 对齐）。
+ *
+ * 建模为可选字段是因为上游目录可能不带这些字段；`effort` 为 `null` 表示**渠道未声明**
+ * （界面据此显示「不支持」，而不是编造档位）。
+ */
+export interface ModelInfo {
+  multiplier: number | null;
+  marketing: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+  inputModalities: string[];
+  effort?: { supportedLevels: string[]; defaultLevel: string } | null;
+  /**
+   * 窗口 / 输出 / 档位各自从哪来（与共享层 `PoolModelMeta.sources` 同形）。
+   *
+   * `registry` = 统一模型注册表（`models.json`，与 `/v1/models` 同源）；
+   * `web_search` = 联网补全写入，`cross` = 兄弟渠道同 id 的推断值。
+   */
+  sources?: {
+    contextWindow: "upstream" | "spec" | "web_search" | "cross" | "registry" | "default";
+    maxOutputTokens: "upstream" | "spec" | "web_search" | "cross" | "registry" | "default";
+    effort: "upstream" | "spec" | "web_search" | "cross" | "registry" | "default";
+  };
+}
+
+/**
+ * 一个账号的当日签到记录（后端 `accounts` 命令透出，读的是本地台账）。
+ *
+ * `null` / 缺省 = 该渠道不按账号签到（或没有签到能力）—— 此时签到状态是**渠道级**的，
+ * 见 `ChannelSignin`；不要在这里回落到「未签到」，那会把「不适用」说成「今天没签」。
+ */
+export interface AccountSignin {
+  claimed_today: boolean;
+  /** 领取时刻（ISO）；台账没记时刻为 null。 */
+  at: string | null;
+  /** 今天领到多少额度；渠道报不出数值时为 null。 */
+  reward?: { amount: number; unit: string } | null;
+  /** 额度数值来源；`carry`（跨窗口对比）是估算，界面会标注。 */
+  reward_source?: SigninRewardSource | null;
+  /** 最近一次上游探测结论（当天有效）。 */
+  probe?: SigninProbe | null;
+}
+
+/** 与后端 `SigninRewardSource` 同口：`carry` 最弱（跨窗口对比），只在无其它口径时用。 */
+export type SigninRewardSource = "channel" | "daily" | "delta" | "carry";
+
+/** 一次 `signin.status()` 探测结论（控制台展示用）。 */
+export interface SigninProbe {
+  /** 上游有没有可领的；null = 查不到。 */
+  claimable: boolean | null;
+  /** 上游说今天已签；null = 渠道判断不了。 */
+  claimed_today: boolean | null;
+  /** 渠道自己的说明。 */
+  summary: string;
+  at: string;
+}
+
+/**
+ * 渠道级签到状态（后端 `accounts` 命令透出）。
+ *
+ * `supported=false` = 该渠道没有签到功能（如 workbuddyai 国际版）→ 控制台**不渲染**
+ * 「今日签到」行：写「未签到」会被读成「今天还没签」，与「根本没这项功能」是两回事。
+ */
+export interface ChannelSignin {
+  supported: boolean;
+  /** true = 按账号签到（账号行读账号级台账）；false = 全渠道共用渠道级记录。 */
+  per_account: boolean;
+  claimed_today: boolean;
+  at: string | null;
+  /** 今天领到多少额度；渠道报不出数值时为 null。 */
+  reward?: { amount: number; unit: string } | null;
+  /** 额度数值来源；`carry`（跨窗口对比）是估算，界面会标注。 */
+  reward_source?: SigninRewardSource | null;
+  /** 最近一次上游探测结论（当天有效）。 */
+  probe?: SigninProbe | null;
 }
 
 export interface PoolAccount {
@@ -113,11 +221,20 @@ export interface PoolAccount {
   trip_until?: string | null;
   /** 当前熔断退避长度（ms）。 */
   trip_backoff_ms?: number;
+  /**
+   * 账号级签到（后端 `accounts` 命令透出）。
+   *
+   * `null` / 缺省 = 该渠道不按账号签到（或没有签到能力）—— 此时签到状态是**渠道级**的，
+   * 见 `ChannelSignin`；不要在这里回落到「未签到」，那会把「不适用」说成「今天没签」。
+   */
+  signin?: AccountSignin | null;
 }
 
 export interface ChannelPool {
   cid: string;
   display: string;
+  /** 渠道级签到状态（`supported=false` 时「今日签到」行整行不渲染）。 */
+  signin?: ChannelSignin | null;
   index: {
     version: 1;
     active: string | null;
@@ -171,8 +288,13 @@ export interface CommandResult {
   data?: unknown;
 }
 
-/** 请求结果分桶；`other` = 应答前就断了（连状态码都没给出）。 */
-export type AccessOutcome = "success" | "failure" | "other";
+/**
+ * 一次请求的结果分桶 —— 只有成功与失败。
+ *
+ * 历史第三桶 `other`（「中断」：没拿到状态码就断开）实测恒空，且界面多给一个分段
+ * 只会让人去猜它什么意思；后端读旧 `other.log` 时按 failure 计。
+ */
+export type AccessOutcome = "success" | "failure";
 
 /**
  * 一条访问日志（形状与共享层 `AccessEntry` 一致，字段语义见 docs/LOGGING.md §3.1）。
@@ -215,15 +337,33 @@ export interface AccessLogEntry {
     cache: { hit: number | null; miss: number | null } | null;
   } | null;
   slow: boolean;
+  /** 首字 token 延迟超标（仅流式参与判定，阈值见 `AccessLogPage.slowThresholds`）。 */
+  slowTtfb: boolean;
+  /** 生成速率超标（阈值见 `AccessLogPage.slowThresholds`）。 */
+  slowTps: boolean;
+  /** 选路快照（候选顺序 / 实际尝试 / 剔除原因）；缺省 = 该行没记（历史行）。 */
+  route?: {
+    /** 输入估算（token）；`<= 0` = 没算出来。 */
+    est: number;
+    candidates: string[];
+    attempts: string[];
+    skipped: Array<{ cid: string; why: "auth" | "window" | "unauthorized" | "cooling" }>;
+  };
 }
 
 export interface AccessLogStats {
   requests: number;
   success: number;
   failure: number;
-  other: number;
+  /** 判定为慢的条数（首字延迟或生成速率，口径见 docs/LOGGING.md §3.5）。 */
   slow: number;
+  /** 其中首字延迟超标的条数。 */
+  slowTtfb: number;
+  /** 其中生成速率超标的条数。 */
+  slowTps: number;
   avgDurationMs: number | null;
+  /** 窗口内**成功请求**的平均生成速率（tokens/s）；一条都算不出时为 null（口径见 docs/LOGGING.md §3.5）。 */
+  avgTps: number | null;
   /** 窗口内没有 usage 的条数（不把缺失当 0）。 */
   noUsage: number;
   tokens: { prompt: number; completion: number; total: number };
@@ -240,7 +380,8 @@ export interface AccessLogPage {
   dates: string[];
   /** 窗口内出现过的渠道（未过滤，供下拉用）。 */
   cids: string[];
-  slowMs: number;
+  /** 「慢」判定的两个阈值（展示归因用，与后端 `slowVerdictOf` 同源）。 */
+  slowThresholds: { ttfbMs: number; tps: number };
   scanned: number;
   /** true = 统计只代表读窗口，不代表全天。 */
   truncated: boolean;
@@ -248,44 +389,6 @@ export interface AccessLogPage {
   total: number;
   stats: AccessLogStats;
   entries: AccessLogEntry[];
-}
-
-/** 一条请求正文抓取记录（`phase`：client = 客户端原样体，upstream = 实际上行体）。 */
-export interface PayloadRecord {
-  ts: string;
-  seq: number;
-  id: string;
-  phase: string;
-  attempt?: number;
-  cid?: string;
-  model?: string;
-  stream?: boolean;
-  bytes: number;
-  truncated: boolean;
-  body: string;
-}
-
-export interface PayloadQueryResult {
-  ok: boolean;
-  id: string;
-  /** 请求发生的日期（与列表接口的 `date` 同源）。 */
-  date: string | null;
-  /** 命中该请求的抓取记录（按写入时间排序；正文抓取恒开启，读回不受门控）。 */
-  records: PayloadRecord[];
-}
-
-/** 正文分片（按字节窗口读取；首屏只取一片，其余按需推进）。 */
-export interface PayloadSliceResult {
-  ok: boolean;
-  id: string;
-  date: string | null;
-  /** 本片在正文中的起始偏移。 */
-  offset: number;
-  /** 本片实际长度（到末尾时可能小于请求的 limit）。 */
-  length: number;
-  /** 正文总长度（字符数），用于「已加载 X / Y」。 */
-  total: number;
-  body: string;
 }
 
 /** 日志查询参数（键名与 `/web/api/logs` 的 query 一致）。 */
@@ -296,13 +399,16 @@ export interface LogQuery {
   model?: string;
   stream?: boolean;
   slow?: boolean;
-  q?: string;
   limit?: number;
   offset?: number;
 }
 
-/** 用量统计的区间（对应 `GET /web/api/usage?range=`）。 */
-export type UsageRange = "7d" | "30d" | "90d" | "365d";
+/**
+ * 用量统计的区间（对应 `GET /web/api/usage?range=`）。
+ *
+ * `365d` 只供热力图（日历恒看一年）；`all` = 累计（日志保留期内全量）。
+ */
+export type UsageRange = "today" | "7d" | "30d" | "90d" | "365d" | "all";
 
 /** 某一天的用量（趋势图与热力图的数据点）。 */
 export interface UsageDaily {
@@ -312,34 +418,25 @@ export interface UsageDaily {
   tokensOut: number;
   requests: number;
   messages: number;
-  /** 该日各模型 tokens（键 = `<cid>/<模型>`，空串 = 未知模型）。 */
+  /** 该日各（渠道 × 模型）tokens（键 = `<cid>/<模型>`，空串 = 未知）。 */
   byModel: Record<string, number>;
 }
 
-/**
- * `POST /web/api/ping` 的返回：一次最小 chat 请求的实测结果。
- *
- * `ms` 量到**响应体读完**；`status` 为 0 表示请求压根没发出去（超时 / 连接失败），
- * 此时 `error` 是原因。`ok` 只看 HTTP 是否 2xx，不看内容。
- */
-export interface PingResult {
-  ok: boolean;
-  model: string;
-  ms: number;
-  status: number;
-  error: string;
-}
-
-/** 一个模型在区间内的用量与健康度。 */export interface UsageModelRow {
-  /** 池 id（`<cid>/<模型>`）；空串表示「未知模型」。 */
+/** 一个（渠道 × 模型）在区间内的用量与健康度。 */
+export interface UsageModelRow {
+  /** 聚合键 `<cid>/<模型>`（趋势图按它分序列）。 */
   id: string;
+  /** 纯模型名（对外 deepseek id；空串 = 未知模型）。 */
+  model: string;
+  /** 承接该模型的渠道（空串 = 日志没记渠道）。 */
+  cid: string;
   tokens: number;
   input: number;
   output: number;
   cache: number;
   /** 占区间总 tokens 的比例（0–1）。 */
   share: number;
-  /** 成功请求数（`success.log` 里该模型的条数）。 */
+  /** 成功请求数（`success.log` 里该模型 × 渠道的条数）。 */
   ok: number;
   /** 失败请求数（含中断）。 */
   fail: number;
@@ -347,6 +444,13 @@ export interface PingResult {
   queued: number;
   /** 成功请求的平均生成速率（tokens/s）；一条都算不出时为 null。 */
   avgTps: number | null;
+}
+
+/** 一个账号**今日**的 token 消耗（账号池账号行用，与「今日消耗」同口径）。 */
+export interface UsageAccountRow {
+  key: string;
+  tokens: number;
+  requests: number;
 }
 
 /**
@@ -366,6 +470,11 @@ export interface UsageStats {
     tokensOut: number;
     requests: number;
     messages: number;
+    /** 成功 / 失败条数（与日志页统计条同一口径）；区间 KPI 卡读它。 */
+    success: number;
+    failure: number;
+    /** 判定为慢的条数。 */
+    slow: number;
     durationMs: number;
     /** 加权命中率；区间内无一条带缓存字段时为 null（显示 `—`）。 */
     cacheHitRate: number | null;
@@ -374,6 +483,8 @@ export interface UsageStats {
     cacheTotal: number;
     /** 区间内单请求最长耗时。 */
     longestRequestMs: number | null;
+    /** 区间内**成功请求**的平均生成速率（tokens/s）；一条都算不出时为 null。 */
+    avgTps: number | null;
     /** 上游没回 usage 的请求数（仪表盘用量明细里要露出来）。 */
     noUsage: number;
   };
@@ -381,6 +492,8 @@ export interface UsageStats {
   daily: UsageDaily[];
   /** 按 tokens 降序。 */
   models: UsageModelRow[];
+  /** 每个账号**今日**的 token 消耗（降序）；当天无请求时为空数组。 */
+  accounts: UsageAccountRow[];
   /** 「有请求」的连续天数，今天没请求时 `current` 算到昨天为止。 */
   streak: { current: number; longest: number };
   peak: { date: string; tokens: number; hour: number; hourTokens: number } | null;
@@ -398,12 +511,15 @@ export interface OverviewResponse {
     requests: number;
     success: number;
     failure: number;
-    other: number;
     slow: number;
     avg_duration_ms: number | null;
     tokens: { prompt: number; completion: number; total: number };
   /** 缓存命中（加权 `Σhit / Σ(hit+miss)`）；`hitRate` 为 null = 窗口内无一条带缓存字段。 */
   cache: { hit: number; total: number; hitRate: number | null };
+  /** 尾部扫描窗口被截断：极端量级下统计只代表窗口内（排障用，页面不展示）。 */
+  truncated: boolean;
+  /** 本次统计实际扫描的行数。 */
+  scanned: number;
   };
   channels: Array<{
     cid: string;
@@ -427,5 +543,9 @@ export interface OverviewResponse {
     ttfb_ms?: number;
     upstream_ms?: number;
     tokens: { prompt: number | null; completion: number | null; total: number | null } | null;
+    /** 失败 / 中断的错误码（如 `upstream_timeout`）；成功行缺省。 */
+    error?: string;
+    /** 失败 / 中断的说明文案（控制台直接展示，超长由行内截断）。 */
+    message?: string;
   }>;
 }
