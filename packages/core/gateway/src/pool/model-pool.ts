@@ -1,19 +1,24 @@
 /**
- * 渠道目录里的名字 → 该渠道的上游 slug。
+ * 对外模型名 → 该渠道的上游模型名。
  *
- * 对外 id 与路由在 `pool-targets.ts`：客户端用 `<cid>/<模型>` **显式指定渠道**，
- * 网关据此挑候选（账本不再决定路由去向）；本文件只负责最后一步转换。
- *
- * **大小写**：解析做**大小写不敏感**匹配，但拿**目录里的原始写法**去走渠道自己的
- * `resolveModel()` —— 上游 slug 可能大小写敏感（例如 TRAE 上游认
- * `DeepSeek-V4-Flash`，不认 `deepseek-v4-flash`）。
+ * **优先问渠道目录**（`catalog.resolveModel()`）：上游 id 形态各异
+ * （`gfmodel` / `sn-deepseek-v4-1-flash-1017` / `LongCat-2.5`），渠道自己最清楚。
+ * 目录不认（或原样返回，部分是恒等 stub）时回落**注册表**的逐渠道声明 ——
+ * 注册表仍保留上游 id 作为兜底，不再是候选列表的来源。
  */
 
 import type { Channel } from "../runtime/channel.js";
+import { runInChannel } from "../runtime/channel-context.js";
+import { upstreamIdOf } from "./model-registry.js";
 
-/** 把客户端发来的模型名解析为该渠道的上游模型名（大小写不敏感）。 */
-export function resolvePoolModel(channel: Channel, name: string): string {
-  const wanted = name.toLowerCase();
-  const hit = channel.catalog.exposedIds().find((id) => id.toLowerCase() === wanted);
-  return channel.catalog.resolveModel(hit ?? name);
+/**
+ * 把对外模型名解析为该渠道的上游模型名；该渠道不提供这个模型时返回 `null`。
+ *
+ * `name` 可以是别名（`deepseek-flash`）：目录与注册表内部都会归一到规范名。
+ */
+export function resolvePoolModel(channel: Channel, name: string): string | null {
+  const cid = channel.config.cid;
+  const resolved = runInChannel(cid, () => channel.catalog.resolveModel(name));
+  if (resolved.trim() !== "" && resolved !== name) return resolved;
+  return upstreamIdOf(name, cid) ?? null;
 }

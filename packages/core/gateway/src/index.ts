@@ -14,12 +14,14 @@ export * as gateway from "./http/server.js";
 export * as headless from "./app/lifecycle/headless.js";
 export * as login from "./auth/login.js";
 export * as loginFlow from "./auth/login-flow.js";
-export * as modelFamily from "./pool/model-policy.js";
 // 粘贴兜底的文本识别（授权失败页 / 授权码提取；与渠道无关的字符串启发式）
 export * as pasteDetect from "./auth/paste-detect.js";
 export type { PastedCallback } from "./auth/paste-detect.js";
 // 通用 OpenAI 请求体归一化（与上游无关的形状修复；渠道判据由渠道传入）
 export * as openaiNormalize from "./http/wire/openai-normalize.js";
+// 文本 token 估算（启发式，±20%）：渠道在上游不返 usage 时用它补 completion_tokens，
+// 必须标 `estimated: true`，统计侧据此区分真实值与估算值。
+export { estimateTextTokens } from "./http/protocol/count-tokens.js";
 export * as paths from "./runtime/paths.js";
 export * as portfree from "./http/portfree.js";
 export * as report from "./app/cli/report.js";
@@ -59,6 +61,9 @@ export {
 // 原子写盘（含密文件与上游连接配置共用）
 export { writeSecretFile, writeJsonSecret, writeJsonFile } from "./runtime/secret-file.js";
 
+// 「本渠道承载不了这类输入」信号（渠道在 buildChatBody / prepareChat 里抛，网关据此换候选）
+export { UnsupportedInputError, isUnsupportedInputError } from "./http/chat/errors.js";
+
 // 签到台账（本地记"我们最后一次领到是什么时候"）
 export * as signinLedger from "./auth/signin-ledger.js";
 export type { SigninLedger, ClaimRecord } from "./auth/signin-ledger.js";
@@ -83,6 +88,7 @@ export {
   channelModelsPath,
   channelModelsMeta,
   ensureChannelModels,
+  hiddenModelIds,
   readChannelModels,
   readSeedFrom,
   seedChannelModels,
@@ -93,17 +99,27 @@ export type { ChannelModelEntry, ChannelModelsSource } from "./runtime/channel-m
 // 渠道目录里的名字 → 上游 slug
 export { resolvePoolModel } from "./pool/model-pool.js";
 
-// 公共模型池：`<cid>/<模型>` 池 id + 归一化匹配
+// 统一模型注册表的按渠道查询（渠道 catalog 用它算「本渠道供哪些池模型」）
+export { exposedIdsForChannel, upstreamIdOf } from "./pool/model-registry.js";
+
+// 公共模型池：对外家族裸模型名 + 跨渠道候选（按账号池剩余额度排序）
 export {
   POOL_MODELS,
   canonicalModelId,
-  asPoolModel,
-  parsePoolModel,
-  poolModelId,
   poolCandidates,
+  getChannelModelMeta,
   type PoolModel,
   type PoolCandidate,
 } from "./pool/pool-targets.js";
+
+// 对外模型家族（产品面：卖哪几个模型 + 别名归并 + owned_by）
+export {
+  POOL_MODEL_IDS,
+  POOL_EXPOSED_IDS,
+  canonicalOf,
+  isPoolModel,
+  ownerOf,
+} from "./pool/model-family.js";
 
 // 公共模型池的账本（账单已用量 + 失败冷却；落 <root>/pool-usage.json）
 export * as poolUsage from "./pool/pool-usage.js";
@@ -111,6 +127,15 @@ export type { PoolLedger, ChannelLedger, RefreshResult } from "./pool/pool-usage
 
 // 渠道上下文（调用渠道模块前包一层，让渠道内部的 paths.* 解析到自己的落点）
 export { runInChannel, activeCid } from "./runtime/channel-context.js";
+
+// 版本更新检测（只读、每天一次；结果进控制台顶栏的版本胶囊）
+export {
+  checkForUpdate,
+  isNewer,
+  startUpdateChecks,
+  updateNotice,
+  type UpdateNotice,
+} from "./runtime/update-check.js";
 
 // 默认值（随注册的渠道而变）
 export {
@@ -120,6 +145,9 @@ export {
   REPO_DEFAULT_ADDR,
   REPO_UI_PREFIX,
 } from "./runtime/cli-consts.js";
+
+// 仓库版本常量（全仓唯一版本号，渠道与本层都引用它）
+export { VERSION } from "./version.js";
 
 // 服务身份（池路由入口在 pool-targets.ts）
 export { serviceName, knownServiceNames, IMPLEMENTATION } from "./http/server.js";
@@ -150,8 +178,17 @@ export {
   pidPath,
   prefsPath,
   credentialsPath,
+  accountCredentialsPath,
   upstreamPath,
 } from "./runtime/paths.js";
+
+// 存储端口：fs 是唯一实现（服务形态已移除），测试可注入替代实现
+export type { PoolStore } from "./runtime/pool-store.js";
+export { FsPoolStore, setPoolStore, poolStore } from "./runtime/pool-store.js";
+
+// API key 校验端口：组合根注入，未装配 = 放行（每进程告警一次，见 api-key.ts）
+export type { ApiKeyGuard, ApiKeyRecord } from "./runtime/api-key.js";
+export { setApiKeyGuard, apiKeyGuard } from "./runtime/api-key.js";
 
 // CLI 入口
 export { main, usage } from "./app/cli/index.js";

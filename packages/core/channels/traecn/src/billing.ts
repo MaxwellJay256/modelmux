@@ -169,28 +169,55 @@ async function postJson(
   return env;
 }
 
+/** 一次签到调用的选项（按账号调度时与「生效凭证」路径的差别只有能否回写）。 */
+interface CheckinOptions {
+  /**
+   * 9074 时是否把轮换后的设备代次**写回凭据文件**（默认写）。
+   *
+   * 只有「当前生效凭证」有回写通道（`cred.save()` 固定写 `credentials.json`）。
+   * 按账号调度传进来的是池内某账号的只读凭据副本，写出去会把**生效凭证文件**
+   * 换成该账号的凭据（凭据串号），故这条路径只报错不落盘。
+   */
+  persistDeviceRotation?: boolean;
+}
+
 /**
  * 处理 9074（设备级限流）：轮换签到设备代次后报错。
  *
- * 轮换本身是持久化的（写入凭据的 `checkin_generation`），下一次请求自然换设备桶。
+ * 轮换本身是持久化的（写入凭据的 `checkin_generation`），下一次请求自然换设备桶 ——
+ * 前提是有回写通道，见 `CheckinOptions.persistDeviceRotation`。
  */
-async function handleDeviceRateLimit(c: cred.Credentials, env: Record<string, unknown>): Promise<never> {
+async function handleDeviceRateLimit(
+  c: cred.Credentials,
+  env: Record<string, unknown>,
+  options: CheckinOptions = {},
+): Promise<never> {
   const code = num(env, "code");
   if (code === DEVICE_RATE_LIMIT_CODE) {
-    await cred.rotateCheckinGeneration(c).catch(() => {
-      /* 回写失败不掩盖原始错误 */
-    });
+    if (options.persistDeviceRotation !== false) {
+      await cred.rotateCheckinGeneration(c).catch(() => {
+        /* 回写失败不掩盖原始错误 */
+      });
+    }
     throw new CreditsError(`Too many checkins (9074, device-level rate limit); rotated the checkin device, retry later`);
   }
   throw new CreditsError(`Checkin endpoint returned code=${String(env["code"])} msg=${str(env, "message", "msg")}`);
 }
 
+/** 共享层按账号调度时传进来的是归一化副本（snake_case → camelCase），形状与 `cred.load()` 一致。 */
+function toCredentials(value: Record<string, unknown> | undefined): cred.Credentials | null {
+  if (!value || typeof value !== "object") return null;
+  const token = (value as { accessToken?: unknown }).accessToken;
+  if (typeof token !== "string" || token === "") return null;
+  return value as unknown as cred.Credentials;
+}
+
 /** 查询签到状态。 */
-async function checkinStatus(c?: cred.Credentials): Promise<CheckinState> {
+async function checkinStatus(c?: cred.Credentials, options: CheckinOptions = {}): Promise<CheckinState> {
   const current = c ?? cred.load();
   const env = await postJson(CHECKIN_STATUS_PATH, {}, buildCheckinHeaders(current));
   const code = num(env, "code");
-  if (code !== null && code !== 0) await handleDeviceRateLimit(current, env);
+  if (code !== null && code !== 0) await handleDeviceRateLimit(current, env, options);
   return {
     checked_in: env["checked_in"] === true,
     credits: num(env, "credits") ?? 0,
@@ -207,14 +234,14 @@ async function checkinStatus(c?: cred.Credentials): Promise<CheckinState> {
  * claim 的 body 是 **`{}`**（不是 `{"req_source":2}`）；响应**不含积分数**，
  * 故领取后必须补查一次 `status` 才能拿到 `credits`。
  */
-async function claimDaily(c?: cred.Credentials): Promise<{
+async function claimDaily(c?: cred.Credentials, options: CheckinOptions = {}): Promise<{
   already: boolean;
   credits: number;
   streak_days: number;
   message: string;
 }> {
   const current = c ?? cred.load();
-  const before = await checkinStatus(current);
+  const before = await checkinStatus(current, options);
   if (before.checked_in) {
     return {
       already: true,
@@ -226,10 +253,10 @@ async function claimDaily(c?: cred.Credentials): Promise<{
 
   const claimEnv = await postJson(CHECKIN_CLAIM_PATH, {}, buildCheckinHeaders(current));
   const code = num(claimEnv, "code");
-  if (code !== null && code !== 0) await handleDeviceRateLimit(current, claimEnv);
+  if (code !== null && code !== 0) await handleDeviceRateLimit(current, claimEnv, options);
 
   // 成功响应只有 {"code":0,"message":"success"}：必须补查 status 拿积分
-  const after = await checkinStatus(current);
+  const after = await checkinStatus(current, options);
   return {
     already: false,
     credits: after.credits,
@@ -391,14 +418,52 @@ export async function fetchCredits(
 
 // ── 签到 / 领取能力（共享层 CLI 的 `<cid> checkin` 用；见 SigninModule 契约）─────────
 
-import type { SigninModule } from "@modelmux/gateway";
+import type { QuotaPeriod, SigninModule } from "@modelmux/gateway";
+
+/**
+ * 每日签到发放额（积分）—— **实测常量**（2026-11-07）。
+ *
+ * 依据：领一次签到后 `signin.claim()` 回报 `reward {amount:100, unit:"积分"}`，
+ * 且账单 `remain` 从 2442.85 → 2542.85（+100，同时 size 2500 → 2600，
+ * 即上游新开了一个 100 的权益包）。上游没有「每日额度」字段可查，故用实测常量。
+ */
+const DAILY_CHECKIN_CREDITS = 100;
+
+/** 下一次**本机时区**的 0 点（epoch ms）。 */
+function nextLocalMidnight(now = Date.now()): number {
+  const d = new Date(now);
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
+}
+
+/**
+ * 额度周期：**每天签到送 100 积分**。
+ *
+ * 日界依据：签到状态端点的 `status` 按本机自然日判断（跨天即恢复可签），
+ * 未见上游声明其它窗口 —— 与 loomy 同口径。
+ */
+export function quotaPeriod(): QuotaPeriod {
+  return {
+    label: "每天签到送 100 积分",
+    size: DAILY_CHECKIN_CREDITS,
+    unit: "积分",
+    resets_at: nextLocalMidnight(),
+  };
+}
+
 /**
  * 签到 / 领取能力（`<cid> checkin`）。
  *
  * 上游是「签到领积分」：`checkin_credits/status` 查状态、`.../claim` 领。
  * claim 的响应不含积分数，故实现里会补查一次 status。
+ *
+ * 奖励**按账号独立**：签到设备 id 由账号 uid 派生（`deriveCheckinDeviceId(c.uid, …)`，
+ * 见 PROTOCOL §2.3「同日两账号共用 device_id 会被该设备已签到拦截」），每个账号各自
+ * 一天一领。若只对生效凭证领一次，池里其余账号的当日 100 积分就白丢 —— 故声明
+ * `perAccount`，由共享层逐个账号带凭据调用。
  */
 export const signin: SigninModule = {
+  perAccount: true,
   async status() {
     const s = await checkinStatus();
     const bits = [
@@ -411,16 +476,25 @@ export const signin: SigninModule = {
       summary: `${bits.join("，")}${s.message ? `（${s.message}）` : ""}`,
       // 上游直接给了"今天签没签"→ 交给共享层做「今日是否签到过」的权威判定
       claimedToday: s.checked_in,
+      // 已签时 `credits` 就是今天到账的积分（领取接口不回数字，只有 status 有）——
+      // 调度器据此给「台账已签但没记额度」的旧记录补额度
+      ...(s.checked_in && s.credits > 0 ? { reward: { amount: s.credits, unit: "积分" } } : {}),
       daily: true,
     };
   },
-  async claim() {
-    const r = await claimDaily();
+  async claim(options) {
+    // 共享层按账号调度时传入该账号的凭据（已归一化）；不传则用当前生效凭证
+    const pooled = options?.credential !== undefined;
+    const c = (pooled ? toCredentials(options?.credential) : null) ?? cred.load();
+    const r = await claimDaily(c, { persistDeviceRotation: !pooled });
     return {
       ok: true,
       summary: r.already
         ? `今日已签到（连续 ${r.streak_days} 天）`
         : `签到成功，+${r.credits} 积分（连续 ${r.streak_days} 天）`,
+      // `credits` 是补查 status 得到的本次积分数（上游 claim 响应本身不含数字）。
+      // 「今天已签到」也带这个数（是当天到账的额度），如实报出，不因 already 抹成 0。
+      ...(r.credits > 0 ? { reward: { amount: r.credits, unit: "积分" } } : {}),
       detail: r,
     };
   },

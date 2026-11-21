@@ -19,6 +19,7 @@ import {
   noteUpstreamPayload,
   queryAccessLogs,
   readPayloads,
+  readPayloadSlice,
 } from "../dist/runtime/log-store.js";
 import * as paths from "../dist/runtime/paths.js";
 
@@ -98,6 +99,7 @@ describe("访问日志读回", () => {
     assert.equal(page.total, 0);
     assert.deepEqual(page.entries, []);
     assert.deepEqual(page.dates, []);
+    assert.equal(page.stats.avgTps, null, "没有样本就没有平均速率（不是 0）");
   });
 
   it("指定一个没有数据的日期时回落到最新有数据的日期", () => {
@@ -105,6 +107,86 @@ describe("访问日志读回", () => {
     const page = queryAccessLogs({ date: "1999-01-01" });
     assert.equal(page.date, localDate());
     assert.equal(page.total, 1);
+  });
+
+  it("date=all 跨全部有日志的日期聚合（不只最新一天）", () => {
+    // 夹具只写今天；这里手动铺两个历史日期，验证跨天聚合与倒序
+    const mk = (date: string, id: string): void => {
+      const dir = join(paths.logsDir(), "access", date);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "success.log"),
+        `${JSON.stringify(entry({ id, ts: `${date}T01:00:00.000Z` }))}
+`,
+        "utf8",
+      );
+    };
+    mk("2026-10-01", "req_old");
+    mk("2026-10-02", "req_newer");
+
+    const all = queryAccessLogs({ date: "all", limit: 10 });
+    assert.equal(all.date, "all");
+    const ids = all.entries.map((e) => e.id);
+    assert.deepEqual(ids, ["req_newer", "req_old"], "跨天命中且新的在前");
+    assert.equal(all.stats.requests, 2, "统计也要跨天聚合");
+
+    // 单天查询仍只读那一天（all 没有把单天语义冲掉）
+    assert.deepEqual(
+      queryAccessLogs({ date: "2026-10-01" }).entries.map((e) => e.id),
+      ["req_old"],
+    );
+  });
+
+  it("全部时间的扫描行数上限触发截断时，保留最新日期（不是最旧日期）", () => {
+    // 行数上限 2 万、单文件尾部上限 1MB：铺 7 天 × 3500 行小行（单天不足 1MB，整文件都读）。
+    // 前 6 天就凑满 2 万行，所以正序扫时**最新那天一行都读不到** —— 这正是要防的形态。
+    const days = Array.from({ length: 7 }, (_, i) => `2026-09-0${i + 1}`);
+    const newest = days[days.length - 1]!;
+    for (const day of days) {
+      const dir = join(paths.logsDir(), "access", day);
+      mkdirSync(dir, { recursive: true });
+      const lines: string[] = [];
+      for (let i = 0; i < 3500; i += 1) {
+        lines.push(JSON.stringify(entry({ id: `req_${day}_${i}`, ts: `${day}T00:00:00.000Z` })));
+      }
+      writeFileSync(join(dir, "success.log"), `${lines.join("\n")}\n`, "utf8");
+    }
+    const page = queryAccessLogs({ date: "all", limit: 500 });
+    assert.equal(page.truncated, true, "总量超上限必须如实标注");
+    assert.ok(
+      page.entries.some((e) => e.ts.startsWith(newest)),
+      "截断丢弃的应是最旧日期：默认视图看不到当天是最容易误导人的形态",
+    );
+  });
+
+  it("选路快照按行读回；形状不全的整段丢弃", () => {
+    writeAccess("failure", [
+      entry({
+        id: "req_route",
+        status: 502,
+        outcome: "failure",
+        error: "rate_limit_exceeded_error",
+        route: {
+          est: 812345,
+          candidates: ["loomy", "traecn", "workbuddy"],
+          attempts: ["loomy", "workbuddy"],
+          skipped: [
+            { cid: "traecn", why: "cooling" },
+            { cid: "catpaw", why: "not-a-reason" },
+          ],
+        },
+      }),
+      // candidates 混进数字 → 整段丢弃，不让半份数据进界面
+      entry({ id: "req_route_bad", route: { est: 1, candidates: ["a", 2], attempts: [] } }),
+    ]);
+    const byId = new Map(queryAccessLogs().entries.map((e) => [e.id, e]));
+    assert.deepEqual(byId.get("req_route")?.route, {
+      est: 812345,
+      candidates: ["loomy", "traecn", "workbuddy"],
+      attempts: ["loomy", "workbuddy"],
+      skipped: [{ cid: "traecn", why: "cooling" }],
+    }, "未知 why 的条目被过滤，其余照常读回");
+    assert.equal(byId.get("req_route_bad")?.route, undefined, "形状不全必须丢弃");
   });
 
   it("slow.log 是并行副本，不能造成重复行", () => {
@@ -178,6 +260,57 @@ describe("访问日志读回", () => {
     assert.equal(page.stats.success, 2);
     assert.equal(page.stats.failure, 1);
     assert.equal(page.stats.tokens.total, 90, "三条各 30");
+  });
+
+  it("统计条的平均 TPS 只采成功请求里算得出的样本", () => {
+    writeAccess("success", [
+      // 100 tokens / 1s 生成窗口 = 100 t/s
+      entry({ id: "req_t1", durationMs: 2000, generateMs: 1000, usage: { prompt_tokens: 10, completion_tokens: 100 } }),
+      // 30 tokens / 1s = 30 t/s
+      entry({ id: "req_t2", durationMs: 2000, generateMs: 1000, usage: { prompt_tokens: 10, completion_tokens: 30 } }),
+      // 生成窗口低于下限（50ms）→ 算不出速率，**不进**均值分母
+      entry({ id: "req_t3", durationMs: 2000, generateMs: 20, usage: { prompt_tokens: 10, completion_tokens: 100 } }),
+    ]);
+    // 失败请求的速率不进均值：失败 usage 多为空，混进去会把速率拉成「丑但成功不了」的假象
+    writeAccess("failure", [
+      entry({
+        id: "req_t4",
+        status: 502,
+        outcome: "failure",
+        durationMs: 2000,
+        generateMs: 1000,
+        usage: { prompt_tokens: 10, completion_tokens: 100 },
+      }),
+    ]);
+    const stats = queryAccessLogs().stats;
+    assert.equal(stats.requests, 4, "统计仍覆盖全部 4 条");
+    assert.equal(stats.avgTps, 65, "只按成功样本求均值：(100 + 30) / 2");
+    assert.equal(stats.avgDurationMs, 2000, "平均耗时不受速率口径影响");
+  });
+
+  it("统计只覆盖声明的路径范围：非模型请求不进统计（否则分段计数点进去是空的）", () => {
+    writeAccess("success", [entry({ id: "req_model" })]);
+    // 浏览器探测 / 健康检查的 404 同样落盘，但它永远不出现在日志列表里
+    writeAccess("failure", [
+      entry({
+        id: "req_probe",
+        method: "GET",
+        path: "/.well-known/appspecific/com.chrome.devtools.json",
+        status: 404,
+        outcome: "failure",
+        model: undefined,
+        usage: undefined,
+      }),
+    ]);
+    const page = queryAccessLogs({ paths: ["/v1/chat/completions"] });
+    assert.equal(page.stats.requests, 1, "统计条与列表必须同源（否则「请求 N」比列表多）");
+    assert.equal(page.stats.failure, 0, "分段计数点进去不能是空的");
+    assert.equal(page.total, 1);
+    assert.deepEqual(page.entries.map((e) => e.id), ["req_model"]);
+    // 不传路径时统计覆盖全部：CLI / 排障要看全量
+    const all = queryAccessLogs();
+    assert.equal(all.stats.requests, 2);
+    assert.equal(all.stats.failure, 1);
   });
 
   it("渠道下拉数据来自未过滤窗口，不随筛选消失", () => {
@@ -436,6 +569,24 @@ describe("请求正文抓取（恒开启，读回不受门控）", () => {
     assert.deepEqual(result.map((r) => r.attempt), [undefined, 0, 1]);
     assert.equal(result[0]?.body, '{"model":"loomy/kimi-k2.6","messages":[]}');
     assert.equal(result[2]?.cid, "catpaw");
+  });
+
+  it("写端字节安全：含坏字节的小 body 走压缩分支（不进 plain），invalidBytes 由写入端算出", () => {
+    const { res, id } = attach();
+    // 「只回答一个词:」的 GBK 字节流（真实案例 req_2a0b）：14 字节里 6 个无效
+    const gbk = Buffer.from(
+      [0xd6, 0xbb, 0xbb, 0xd8, 0xb4, 0xf0, 0xd2, 0xbb, 0xb8, 0xf6, 0xb4, 0xca, 0xa3, 0xba],
+    );
+    noteClientPayload(res as never, gbk);
+    const rec = readPayloads(id)[0];
+    assert.equal(rec?.bytes, 14, "bytes 是原始字节长度");
+    assert.equal(rec?.invalidBytes, 6, "写入端标注无效字节数");
+    assert.notEqual(rec?.bodyEnc, "plain", "坏字节不能进 plain 字符串（会被顶成替换符丢掉）");
+    assert.ok(rec!.body.includes("\uFFFD"), "文本呈现按替换符");
+    const slice = readPayloadSlice(id, undefined, "client", 0, 1 << 20);
+    assert.ok(slice);
+    assert.equal(slice.total, 14);
+    assert.ok(Buffer.from(slice.bodyB64, "base64").equals(gbk), "压缩块里的字节逐字节复原");
   });
 
   it("上游还没回就失败时，正文照样读得到（写盘在 fetch 之前）", () => {

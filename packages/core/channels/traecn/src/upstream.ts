@@ -253,7 +253,10 @@ export function classifyError(status: number, body: string): TraeErrorKind {
   const text = (body ?? "").toLowerCase();
   if (text.includes("1005")) return "hard-plan"; // Plan 权益不足
   if (text.includes("4008")) return "quota-exceeded"; // 配额耗尽
-  if (text.includes("4011")) return "soft-rate"; // 频率超限
+  // 3004 与 4011 同为限流：上游把 3004 放在 **HTTP 200** 的流内 `event:error` 帧里
+  // （文案 "exceeded the rate limit"），只有业务码、没有 HTTP 状态码，
+  // 判据必须靠报文内容认，光看 status 会漏掉（实测 2026-11-09 连续 70 次全失败）。
+  if (text.includes("4011") || text.includes("3004")) return "soft-rate"; // 频率超限
   if (status === 401 || status === 403) return "session-dead";
   if (/token invalid|token 失效|session|unauthorized|login/.test(text)) return "session-dead";
   if (status === 429) return "soft-rate";
@@ -261,6 +264,43 @@ export function classifyError(status: number, body: string): TraeErrorKind {
   if (status >= 500) return "server";
   if (status >= 400) return "client";
   return "none";
+}
+
+/**
+ * 声明本渠道的额度信号（`UpstreamModule.quotaSignal`）。
+ *
+ * 为什么必须声明：`classifyError` 早就认得出 `4008`（配额耗尽），但它只在本渠道内部
+ * （目录 / 账单）用，**从没上报给共享层** —— 共享层因此不知道这是额度问题，既不冷却账号
+ * 也不换号，同一个账号被连续打了 6 次（2026-11-08 实测 `09:46:12` 起 traecn 连续 6 条
+ * `4008`，池里另外 6 个渠道一个没试）。
+ *
+ * 判据只放本渠道确认过的业务码：
+ * - `4008` 配额耗尽、`1005` Plan 权益不足 —— 都是「这个账号打不动了」，换号即可继续；
+ * - HTTP 429 同属额度类（上游偶尔不回业务码只给状态码）；
+ * - `3004` 频率超限 —— 上游只说「等会儿再试」、**没给等待时长**，且它包在 HTTP 200 的
+ *   流内错误帧里（光看 status 是认不出的）。账号级冷却对它无效（生效凭据照样被使用、
+ *   其他账号的额度又让渠道保持高优先级），故上报 `rate_limit` 由共享层做**渠道级**短冷却。
+ */
+export function quotaSignal(status: number, body: string): "usage_limit" | "balance" | "rate_limit" | null {
+  const text = (body ?? "").toLowerCase();
+  if (text.includes("4008")) return "balance";
+  if (text.includes("1005")) return "balance";
+  if (text.includes("3004")) return "rate_limit";
+  if (status === 429) return "balance";
+  return null;
+}
+
+/**
+ * 从报文里认出额度重置时刻（`UpstreamModule.quotaResetAt`）。
+ *
+ * 上游文案形如「将在 2026-10-24 23:54:22 UTC+8 重置」，但**实测并非所有 4008 都带**；
+ * 认不出返回 `null`，由共享层回落次日本地 0 点 —— 不为「显得完整」编一个时间。
+ */
+export function quotaResetAt(bodySnippet: string): number | null {
+  const m = /将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(bodySnippet ?? "");
+  if (!m) return null;
+  const at = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+08:00`);
+  return Number.isFinite(at) ? at : null;
 }
 
 // ── 请求体改写：OpenAI → SOLO ───────────────────────────────────────────────

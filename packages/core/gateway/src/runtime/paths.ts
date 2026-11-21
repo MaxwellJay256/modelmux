@@ -3,8 +3,8 @@
  * docs/STORAGE-CONVENTION.md §1，固定文件名见 §3 第 4 条）。
  *
  * 根目录名与分层规则是共享常量，渠道**不得**自行决定（也不得自行拼绝对路径）——
- * 渠道只能给 `cid`。现行布局是 `<root>/channels/<cid>/`；`<root>/<cid>/` 是
- * 0.1.0/0.1.1 的旧布局，**读取时回落兼容**（迁移见 runtime/storage-migrate.ts）。
+ * 渠道只能给 `cid`。渠道层固定为 `<root>/channels/<cid>/`（0.1.x 旧布局的回落与
+ * 迁移已移除：仓库从未分发，旧布局不存在于任何现存安装）。
  */
 
 import { existsSync, mkdirSync } from "node:fs";
@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import { channelFor, getChannel, type ChannelConfig } from "./channel.js";
 import { activeCid } from "./channel-context.js";
+import { credentialPathOverride } from "./credential-scope.js";
 import { enforcePermissions } from "./permissions.js";
 
 /** 存储根目录名（用户主目录下）。 */
@@ -29,6 +30,8 @@ export const FILES = {
   pid: "gateway.pid",
   workerPid: "gateway-worker.pid",
   log: "gateway.log",
+  /** 外层守护的暂停标记（存在 = 只探测不拉起；见 runtime/watchdog-flag.ts）。 */
+  watchdogPause: "watchdog.pause",
 } as const;
 
 /** 渠道层的父目录名（唯一渠道层，见 docs/STORAGE-CONVENTION.md §1）。 */
@@ -39,6 +42,7 @@ export const SUBDIRS = {
   cache: "cache",
   state: "state",
   debug: "debug",
+  accounts: "accounts",
 } as const;
 
 const warned = new Set<string>();
@@ -60,20 +64,11 @@ export function rootDirFor(_config: ChannelConfig): string {
   return resolveRoot();
 }
 
-/**
- * 渠道层目录解析：新布局（`channels/<cid>`）优先；不存在则回落旧布局（`<cid>`，
- * 0.1.0/0.1.1 的落点，迁移后是软链）；两者皆无（全新安装）→ 直接用新布局。
- * **写跟随解析结果** —— 读到哪写到哪，避免新旧两处都有数据（分裂）。
- */
 function resolveChannelDir(root: string, cid: string): string {
-  const fresh = join(root, CHANNELS_DIR, cid);
-  if (existsSync(fresh)) return fresh;
-  const legacy = join(root, cid);
-  if (existsSync(legacy)) return legacy;
-  return fresh;
+  return join(root, CHANNELS_DIR, cid);
 }
 
-/** 渠道层目录（纯函数，**不触发迁移**，供巡检/统计用）。 */
+/** 渠道层目录（纯函数，供巡检/统计用）。 */
 export function channelDirFor(config: ChannelConfig): string {
   return resolveChannelDir(rootDirFor(config), config.cid);
 }
@@ -91,7 +86,7 @@ export function rootDir(cid?: string): string {
   return resolveRoot();
 }
 
-/** 渠道层目录 `<root>/channels/<cid>/`（回落兼容旧布局 `<root>/<cid>/`）。 */
+/** 渠道层目录 `<root>/channels/<cid>/`。 */
 export function channelDir(cid?: string): string {
   const config = configOf(cid);
   return resolveChannelDir(resolveRoot(), config.cid);
@@ -174,9 +169,17 @@ export function logsDir(): string {
   return join(rootDir(), "logs");
 }
 
-/** 凭证文件路径。 */
+/** 凭证文件路径（账号上下文中是该账号自己的文件，见 runtime/credential-scope.ts）。 */
 export function credentialsPath(cid?: string): string {
-  return channelFile(FILES.credentials, cid);
+  return credentialPathOverride() ?? channelFile(FILES.credentials, cid);
+}
+
+/** 账号凭证文件路径（与 live 的 credentials.json 同构，账号池里每个账号一份）。 */
+export function accountCredentialsPath(key: string, cid?: string): string {
+  if (!/^[a-z0-9][a-z0-9.-]*$/.test(key)) {
+    throw new Error(`invalid account key: ${key}`);
+  }
+  return join(channelDir(cid), SUBDIRS.accounts, `${key}.json`);
 }
 
 /** 上游配置文件路径。 */
@@ -225,4 +228,14 @@ export function rootLogPath(): string {
  */
 export function poolUsagePath(): string {
   return rootFile("pool-usage.json");
+}
+
+/** 用户级设置文件（`<root>/setting.json`，目前只有主题；读写见 runtime/user-settings.ts）。 */
+export function rootSettingPath(): string {
+  return rootFile("setting.json");
+}
+
+/** 版本更新检测状态（`<root>/update.json`；读写见 runtime/update-check.ts）。 */
+export function rootUpdatePath(): string {
+  return rootFile("update.json");
 }

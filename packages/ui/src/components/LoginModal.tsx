@@ -11,16 +11,29 @@
  * 用 Radix Dialog：焦点陷阱等行为通用化，内层 JSX 只换最外层容器。
  */
 
-import * as Dialog from "@radix-ui/react-dialog";
-import { Check, Copy, Info, Loader2, QrCode, X } from "lucide-react";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+} from "./ui/dialog";
+import { Check, Copy, Loader2, QrCode, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
+import { Input } from "./ui/input";
+import { Label } from "./ui/label";
+import { Skeleton } from "./ui/skeleton";
 import type { LoginInputRequest } from "../lib/types";
 import { useToast } from "./Toast";
 import { GeetestCaptcha } from "./GeetestCaptcha";
 
 /** 登录态快照（后端 `GET /web/api/state` 的 `ui_state` / `auth_url` / `qr_url` 等字段）。 */
 export interface LoginSnapshot {
+  /** 网关状态（probing / login / running）—— **不再承载登录结果**。 */
   ui_state: string;
+  /** 上一轮登录的一次性结果：`idle` / `done` / `error`。 */
+  login_result?: "idle" | "done" | "error";
   message: string;
   auth_url: string;
   qr_url: string;
@@ -93,32 +106,47 @@ export function LoginModal({
   /** 本轮是否出现过「要手机号」的请求 —— 出现即按手机表单渲染，不再画骨架。 */
   const [phoneStep, setPhoneStep] = useState(false);
   useEffect(() => {
-    if (uiState !== mountState.current || authUrl !== "" || qrUrl !== "" || loginInput) {
+    // 挂载守卫：只要出现任何「本轮有进展」的信号就撤掉骨架。
+    // `login_result` 也要看 —— 登录结果不再改 `ui_state`，只靠后者会漏掉
+    // 「失败/完成」这类终态（弹窗会一直卡在骨架）。
+    if (
+      uiState !== mountState.current ||
+      snapshot?.login_result === "done" ||
+      snapshot?.login_result === "error" ||
+      authUrl !== "" ||
+      qrUrl !== "" ||
+      loginInput
+    ) {
       setPristine(false);
     }
-  }, [uiState, authUrl, qrUrl, loginInput]);
+  }, [uiState, snapshot?.login_result, authUrl, qrUrl, loginInput]);
   useEffect(() => {
     if (loginInput?.kind === "phone") setPhoneStep(true);
   }, [loginInput?.kind]);
-  // 发码失败就让用户能重发（否则按钮卡在「已发送」，只能关掉弹窗重来）
+  // 发码失败就让用户能重发（否则按钮卡在「已发送」，只能关掉弹窗重来）。
+  // 判 `login_result` 而非 `ui_state` —— 后者已不再承载登录结果。
   useEffect(() => {
-    if (uiState === "error") setPhoneSent(false);
-  }, [uiState]);
+    if (snapshot?.login_result === "error") setPhoneSent(false);
+  }, [snapshot?.login_result]);
 
   // 失败提示走 toast（按内容去重：轮询 3s 会反复拿到同一条 message）。
   // 离开错误态即重置 —— 下一轮同样的错误仍要能弹。
   const toast = useToast();
   const lastToastedError = useRef("");
   useEffect(() => {
-    if (uiState !== "error") {
+    if (snapshot?.login_result !== "error") {
       lastToastedError.current = "";
       return;
     }
     const msg = message.trim();
     if (!msg || msg === PREPARING_MESSAGE || msg === lastToastedError.current) return;
+    // 「取消」不是错误：用户主动放弃登录不该弹红色失败提示 —— 页脚的失败态已经说明
+    // 情况，再弹一次等于把「我点了取消」报成「出错了」。
+    if (/取消|cancel/i.test(msg)) return;
+    // 弹窗前剥掉 `Error: ` 前缀：那是内部异常的类名，用户不需要看到。
     lastToastedError.current = msg;
-    toast.error(msg);
-  }, [uiState, message, toast]);
+    toast.error(msg.replace(/^Error:\s*/, ""));
+  }, [snapshot?.login_result, message, toast]);
 
   // 扫码流 2 步、授权链接流 3 步；标题栏据此给步骤提示
   /** 既没有授权链接/二维码，也没有待回答的输入 = 正在处理（准备中或渠道在发码）。 */
@@ -130,8 +158,11 @@ export function LoginModal({
     (phoneStep || loginInput?.kind === "phone" || loginInput?.kind === "code") &&
     !authUrl &&
     !qrUrl;
-  const failed = uiState === "error";
-  const done = uiState === "done";
+  // 登录结果读 `login_result`；`ui_state` 只表示网关状态，不再承载 done/error。
+  // 回落分支兼容还没升级的后端（那时它把结果写进 ui_state）。
+  const loginResult = snapshot?.login_result ?? (uiState === "error" || uiState === "done" ? uiState : "idle");
+  const failed = loginResult === "error";
+  const done = loginResult === "done";
   /**
    * **链接未到手前始终骨架**：授权链接/二维码没拿到、也没有待回答的输入时，
    * 一直画骨架占位（而不是转圈文案或空白）—— 用户明确要求「登录链接未获取到
@@ -141,42 +172,33 @@ export function LoginModal({
   const showSkeleton =
     pristine || (!authUrl && !qrUrl && !loginInput && !failed && !done);
   const totalSteps = qrUrl ? 2 : 3;
-  // 两步登录没有「授权步骤」，侧栏不能写「步骤 1/3 · 浏览器授权」——那会让人
-  // 以为流程走错了（渠道此刻在等用户填手机号/验证码）。
-  const stepLabel = loginInput
-    ? "两步登录"
-    : failed
-      ? "登录失败"
-      : done
-        ? "登录完成"
-        : busy
-          ? "处理中"
-          : `步骤 1 / ${totalSteps}`;
-  // 状态行短词（图 2 布局：渠道行下方一行「步骤 1/3 · 等待授权」）。
-  // 失败/完成时留空 —— 避免「登录失败 · 登录失败」这种重复。
-  const statusWord = loginInput
-    ? "两步登录"
-    : failed || done
-      ? ""
-      : busy
-        ? "等待授权"
-        : qrUrl
-          ? "扫码授权"
-          : "浏览器授权";
-  const stepTone = failed ? "text-danger" : done ? "text-free" : "text-ink";
-
-  /** 点「复制授权链接」：只写剪贴板，**不**打开新窗口。 */
-  const [authCopied, setAuthCopied] = useState(false);
-  const copyAuthUrl = async (): Promise<void> => {
-    if (authUrl === "") return;
-    try {
-      await navigator.clipboard.writeText(authUrl);
-      setAuthCopied(true);
-      setTimeout(() => setAuthCopied(false), 1800);
-    } catch {
-      // 剪贴板不可用（非安全上下文等）：静默失败，用户仍可手动复制下面那一行
-    }
-  };
+  /**
+   * 进度条只在「有明确步数」的流程里出现：两步登录是一条表单、完成与失败是终态，
+   * 都不该画刻度（画了反而让人以为还有后续步骤）。
+   */
+  const showProgress = !loginInput && !failed && !done && (authUrl !== "" || qrUrl !== "");
+  /**
+   * 当前走到第几格（0-based）：链接/二维码到手即第 1 步完成、在做第 2 步。
+   * 骨架期（还没拿到链接）算第 0 步进行中。
+   */
+  const currentStep = 0;
+  /**
+   * 页脚那行字：把「现在该干什么 / 刚发生了什么」说清楚。
+   *
+   * 优先用渠道给的 `message`（它最贴近上游真实状态）；没有就按形态给默认文案。
+   */
+  const footerText =
+    message.trim() !== ""
+      ? message
+      : failed
+        ? "登录未完成，请关闭后重试"
+        : done
+          ? "登录成功，账号已入池并设为生效"
+          : qrUrl
+            ? "等待扫码…"
+            : authUrl
+              ? "等待授权回调，完成后自动继续"
+              : "正在准备授权链接…";
 
   // 扫码流：扫码 → 手机确认 → 自动入池
   const qrSteps: Array<{ title: string; body: ReactNode; state: StepState }> = [
@@ -213,19 +235,9 @@ export function LoginModal({
     {
       title: "复制授权链接",
       body: (
-        <div className="space-y-2">
-          <button
-            type="button"
-            className="inline-flex items-center gap-1.5 rounded-full bg-brand px-4 py-2 text-[13px] font-medium text-[#171717] transition-colors hover:bg-brand-deep disabled:opacity-50"
-            disabled={authUrl === ""}
-            onClick={() => void copyAuthUrl()}
-            aria-label="复制授权链接到剪贴板"
-          >
-            {authCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-            {authCopied ? "已复制，粘到浏览器打开" : "复制授权链接"}
-          </button>
-          <CopyableLink url={authUrl} label="授权链接" />
-        </div>
+        // 只留链接框里那个复制小图标 —— 大按钮与它功能完全重复（都只写剪贴板），
+        // 占一整行还把「复制」这件事说得比实际更重要。
+        <CopyableLink url={authUrl} label="" />
       ),
       state: done ? "done" : failed ? "failed" : "active",
     },
@@ -245,11 +257,13 @@ export function LoginModal({
 
   return (
     // 恒 open：本组件按条件渲染（挂载即打开），关闭只走右上角那个键（见文件头）。
-    <Dialog.Root open>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70" />
-        <Dialog.Content
+    <Dialog open>
+      <DialogPortal>
+        <DialogOverlay className="fixed inset-0 z-50 bg-black/70" />
+        <DialogContent
           aria-label={`添加账号：${cid}`}
+          // 关闭钮是自绘的（头部那枚），不用组件内置角标，避免两枚重叠
+          showCloseButton={false}
           // 与手写版逐条一致：ESC 与「点遮罩之外」都**不**关闭 ——
           // 登录进行中误触会丢流程（需求：仅关闭键可关）。
           onEscapeKeyDown={(e) => e.preventDefault()}
@@ -257,22 +271,40 @@ export function LoginModal({
           onInteractOutside={(e) => e.preventDefault()}
           className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[min(96vw,48rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-line bg-raised shadow-[0_24px_64px_-28px_rgba(0,0,0,0.9)]"
         >
-          {/* 渠道行（标题）：图标 + cid display + 关闭键（紧凑单栏布局，无左右分栏）。
-              标题必须是 `Dialog.Title`：Radix 用它接 `aria-labelledby`，
+          {/* 渠道行：图标 + cid + 展示名 + 一句登录方式。
+              标题必须是 `DialogTitle`：Radix 用它接 `aria-labelledby`，
               少了它屏幕阅读器读不出这个对话框叫什么。 */}
-          <div className="flex items-center gap-2.5 border-b border-line px-5 py-3.5">
-            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-overlay text-ink-soft">
+          <div className="flex items-center gap-3 px-5 pt-5 pb-3.5">
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-[10px] bg-overlay text-ink-soft">
               <QrCode className="h-4 w-4" />
             </span>
-            <Dialog.Title className="min-w-0 flex-1 truncate text-sm">
-              <span className="font-mono font-medium text-ink">{cid}</span>
-              <span className="ml-2 text-xs font-normal text-ink-faint">{display ?? "渠道账号"}</span>
-            </Dialog.Title>
+            <div className="min-w-0 flex-1">
+              <DialogTitle className="flex items-baseline gap-2">
+                <span className="truncate font-mono text-sm font-medium text-ink">{cid}</span>
+                <span className="truncate text-[13px] font-normal text-ink-faint">
+                  {display ?? "渠道账号"}
+                </span>
+              </DialogTitle>
+              {/* 副行只说「哪种登录方式」，不再重复「步骤 x/y · 状态」（进度由下方进度条承担） */}
+              <div className="mt-0.5 text-xs text-ink-faint">
+                {loginInput
+                  ? "短信验证码登录"
+                  : failed
+                    ? "登录未完成"
+                    : done
+                      ? "登录完成"
+                      : qrUrl
+                        ? "扫码授权"
+                        : busy
+                          ? "正在准备授权链接"
+                          : "授权链接 · 自动回调"}
+              </div>
+            </div>
             {/* 唯一的关闭入口：顺带通知后端别再等输入（否则渠道挂到超时） */}
             <button
               type="button"
               aria-label="关闭"
-              className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-ink-faint transition-colors hover:bg-overlay hover:text-ink"
+              className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-faint transition-colors hover:bg-overlay hover:text-ink"
               onClick={() => {
                 onCancelInput();
                 onClose();
@@ -282,16 +314,20 @@ export function LoginModal({
             </button>
           </div>
 
-          {/* 状态行 + 说明文本：一行「步骤 x/y · 状态」，下一行渠道给的说明 */}
-          <div className="px-5 pt-3">
-            <div className={`text-xs ${stepTone}`}>
-              {stepLabel}
-              {statusWord && ` · ${statusWord}`}
+          {/* 进度条：把「走到第几步」从文字变成可读的刻度。
+              两步登录 / 完成 / 失败没有「几步」可言，不画。 */}
+          {showProgress && (
+            <div className="flex gap-1 px-5 pb-4" aria-hidden="true">
+              {Array.from({ length: totalSteps }, (_, i) => (
+                <i
+                  key={i}
+                  className={`h-[3px] flex-1 rounded-full transition-colors duration-300 ${
+                    i < currentStep ? "bg-free" : i === currentStep ? "bg-brand" : "bg-line"
+                  }`}
+                />
+              ))}
             </div>
-            {message.trim() !== "" && (
-              <div className="mt-1.5 text-xs leading-relaxed text-ink-faint">{message}</div>
-            )}
-          </div>
+          )}
 
           {/* 步骤区：授权链接/二维码未到手前始终骨架（见 `showSkeleton`） */}
           <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
@@ -341,23 +377,25 @@ export function LoginModal({
             )}
           </div>
 
-          {/* 温馨提醒：中性底 + 细字，不用黄色警示块（这里不是错误） */}
-          <div className="px-5 pb-5">
-            <div className="rounded-xl bg-raised p-3.5 text-xs leading-relaxed text-ink-faint">
-              <div className="mb-1.5 flex items-center gap-1.5 font-medium text-ink-soft">
-                <Info className="h-3.5 w-3.5" />
-                提醒
-              </div>
-              <ul className="list-disc space-y-1 pl-4">
-                <li>授权链接只会复制到剪贴板，由你自己决定在哪个浏览器打开。</li>
-                <li>授权成功后会自动跳回本地回调完成登录，不需要手动粘贴任何链接。</li>
-                <li>登录成功后账号自动入池并设为生效；失败时会有右下角错误提示。</li>
-              </ul>
-            </div>
+          {/*
+            页脚统一承担「现在是什么状态」：等待 / 成功 / 失败都是「一个状态点 + 一句话」。
+            早先失败原因只弹右下角 toast，关掉就没了；页脚把它留在界面上，用户随时能看。
+            清空 `message` 的情况（如刚发起）不占位，避免一条空行。
+          */}
+          <div className="flex items-center gap-2 border-t border-line bg-surface px-5 py-3">
+            <span
+              className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                failed ? "bg-danger" : done ? "bg-free" : "bg-warn animate-pulse"
+              }`}
+              aria-hidden="true"
+            />
+            <span className={`min-w-0 flex-1 truncate text-xs ${failed ? "text-danger" : "text-ink-faint"}`}>
+              {footerText}
+            </span>
           </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+        </DialogContent>
+      </DialogPortal>
+    </Dialog>
   );
 }
 
@@ -403,7 +441,7 @@ function StepBadge({ state, index }: { state: StepState; index: number }): React
   }
   if (state === "active") {
     return (
-      <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-brand text-xs font-semibold text-[#171717]">
+      <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-brand text-xs font-semibold text-on-brand">
         {index}
       </span>
     );
@@ -447,14 +485,18 @@ function CopyableLink({ url, label }: { url: string; label: string }): ReactElem
     }
   };
   return (
-    <div className="flex items-center gap-2 rounded-lg bg-canvas/60 px-2.5 py-1.5">
-      <span className="shrink-0 text-xs text-ink-faint">{label}</span>
-      <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-soft">{url}</span>
+    <div className="flex items-center gap-2.5 rounded-[10px] border border-line bg-surface py-2 pl-3 pr-2">
+      {/* `label` 为空时不渲染标签位 —— 设计稿里标签由外层步骤标题承担，
+          框内只留「链接 + 复制键」，一行装下不折行。 */}
+      {label !== "" && <span className="shrink-0 text-xs text-ink-faint">{label}</span>}
+      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] leading-relaxed text-ink-soft">
+        {url}
+      </span>
       <button
         type="button"
         onClick={() => void copy()}
-        aria-label={`复制${label}`}
-        className="grid h-6 w-6 shrink-0 place-items-center rounded text-ink-faint transition-colors hover:bg-overlay hover:text-ink"
+        aria-label={label === "" ? "复制链接" : `复制${label}`}
+        className="grid h-[26px] w-[26px] shrink-0 place-items-center rounded-[7px] text-ink-faint transition-colors hover:bg-overlay hover:text-ink"
       >
         {copied ? (
           <Check className="h-3.5 w-3.5 text-free" />
@@ -568,35 +610,42 @@ function PhoneLoginForm({
       }}
     >
       <div className="space-y-1.5">
-        <label htmlFor="login-phone" className="block text-[13px] font-medium text-ink">
-          手机号 (+86)
-        </label>
-        <input
-          id="login-phone"
-          inputMode="tel"
-          autoComplete="tel"
-          autoFocus
-          spellCheck={false}
-          className="w-full rounded-lg border border-line bg-canvas/60 px-3 py-2 font-mono text-sm text-ink placeholder:text-ink-faint focus:border-line-strong focus:outline-none"
-          placeholder="11 位手机号"
-          value={phone}
-          onChange={(e) => onPhone(e.target.value)}
-        />
+        <Label htmlFor="login-phone" className="text-xs text-ink-faint">
+          手机号
+        </Label>
+        {/* `+86` 做成独立前缀块：与输入框同一行、同一视觉高度，
+            比把区号塞进占位文字里更清楚「这里只填 11 位」。 */}
+        <div className="flex items-center gap-2">
+          <span className="grid shrink-0 place-items-center rounded-[10px] border border-line bg-surface px-2.5 py-2.5 font-mono text-xs text-ink-faint">
+            +86
+          </span>
+          <Input
+            id="login-phone"
+            inputMode="tel"
+            autoComplete="tel"
+            autoFocus
+            spellCheck={false}
+            className="flex-1 font-mono focus:border-line-strong"
+            placeholder="11 位手机号"
+            value={phone}
+            onChange={(e) => onPhone(e.target.value)}
+          />
+        </div>
       </div>
 
       <div className="space-y-1.5">
-        <label htmlFor="login-code" className="block text-[13px] font-medium text-ink">
+        <Label htmlFor="login-code" className="text-[13px] font-medium text-ink">
           验证码
-        </label>
+        </Label>
         {/* 第二行：左验证码输入框，右「获取验证码」 */}
         <div className="flex items-center gap-2">
-          <input
+          <Input
             id="login-code"
             inputMode="numeric"
             autoComplete="one-time-code"
             spellCheck={false}
             disabled={!codePending}
-            className="min-w-0 flex-1 rounded-lg border border-line bg-canvas/60 px-3 py-2 font-mono text-sm text-ink placeholder:text-ink-faint focus:border-line-strong focus:outline-none disabled:opacity-50"
+            className="flex-1 rounded-lg bg-canvas/60 py-2 font-mono focus:border-line-strong"
             placeholder={codePending ? "6 位验证码" : "先获取验证码"}
             value={code}
             onChange={(e) => onCode(e.target.value)}
@@ -617,7 +666,7 @@ function PhoneLoginForm({
         <button
           type="submit"
           disabled={!canLogin}
-          className="rounded-full bg-brand px-5 py-2 text-[13px] font-medium text-[#171717] transition-colors hover:bg-brand-deep disabled:opacity-50"
+          className="rounded-full border border-line-strong bg-brand px-5 py-2 text-[13px] font-medium text-on-brand transition-colors hover:bg-brand-deep disabled:opacity-50"
         >
           {sending && codePending ? "登录中…" : "登录"}
         </button>
@@ -644,23 +693,23 @@ function LoginSkeleton(): ReactElement {
   return (
     <div className="space-y-1" aria-hidden="true">
       <div className="flex gap-3">
-        <span className="h-6 w-6 shrink-0 animate-pulse rounded-full bg-overlay" />
+        <Skeleton className="h-6 w-6 shrink-0 rounded-full" />
         <div className="min-w-0 flex-1">
-          <div className="h-4 w-24 animate-pulse rounded bg-overlay" />
-          <div className="mt-2.5 h-8 w-36 animate-pulse rounded-lg bg-overlay" />
-          <div className="mt-2 h-8 w-full animate-pulse rounded-lg bg-canvas/60" />
+          <Skeleton className="h-4 w-24" />
+          <Skeleton className="mt-2.5 h-8 w-36 rounded-lg" />
+          <Skeleton className="mt-2 h-8 w-full rounded-lg bg-canvas/60" />
         </div>
       </div>
       <div className="flex gap-3 pt-3">
-        <span className="h-6 w-6 shrink-0 animate-pulse rounded-full bg-line" />
-        <div className="h-4 w-40 animate-pulse rounded bg-line" />
+        <Skeleton className="h-6 w-6 shrink-0 rounded-full bg-line" />
+        <Skeleton className="h-4 w-40 bg-line" />
       </div>
       <div className="flex gap-3 pt-3">
-        <span className="h-6 w-6 shrink-0 animate-pulse rounded-full bg-line" />
+        <Skeleton className="h-6 w-6 shrink-0 rounded-full bg-line" />
         <div className="min-w-0 flex-1">
-          <div className="h-4 w-32 animate-pulse rounded bg-line" />
-          <div className="mt-2 h-3 w-full animate-pulse rounded bg-line" />
-          <div className="mt-1.5 h-3 w-2/3 animate-pulse rounded bg-line" />
+          <Skeleton className="h-4 w-32 bg-line" />
+          <Skeleton className="mt-2 h-3 w-full bg-line" />
+          <Skeleton className="mt-1.5 h-3 w-2/3 bg-line" />
         </div>
       </div>
     </div>

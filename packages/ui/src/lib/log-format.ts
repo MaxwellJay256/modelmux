@@ -1,24 +1,42 @@
 /**
  * 日志页的展示口径：时间、耗时、字节、计数与 token 单位。
  *
- * 单独成模块是因为页面与上下文弹窗都要用同一套格式 —— 各写一份必然漂移。
+ * 单独成模块是因为日志页与仪表盘都要用同一套格式 —— 各写一份必然漂移。
  * token 换算按「万 / 亿」给单位（大数不再是一长串数字）。
  */
 
 import type { AccessLogEntry, AccessOutcome } from "./types";
 
-/** 结果分桶的展示口径（点色 + 文案 + 文字色），表格与弹窗共用。 */
+/**
+ * 取异常的可读文案。
+ *
+ * `String(err)` 对 `Error` 会带上 `"Error: "` 前缀，直接拼进 toast 就是
+ * 「接入失败：Error: 找不到 …」这种把实现细节漏给用户的句子（2026-11-08 实测）。
+ * 有 `message` 就用它，其余（字符串、未知值）照原样。
+ */
+export function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  if (typeof err === "string") return err;
+  return String(err);
+}
+
+/**
+ * 结果分桶的展示口径（点色 + 文案 + 文字色），表格与弹窗共用。
+ *
+ * 只有成功 / 失败：历史第三桶「中断」（拿不到状态码就断开）实测恒空，
+ * 多给一个分段只会让用户去猜它什么意思（口径见 `log-store.AccessOutcome`）。
+ */
 export const OUTCOME_META: Record<AccessOutcome, { label: string; dot: string; text: string }> = {
   success: { label: "成功", dot: "bg-free", text: "text-free" },
   failure: { label: "失败", dot: "bg-danger", text: "text-danger" },
-  other: { label: "中断", dot: "bg-warn", text: "text-warn" },
 };
 
 const TEN_THOUSAND = 10_000;
 const HUNDRED_MILLION = 100_000_000;
 
 /**
- * 请求时刻 → **本地**时区 `YYYY-MM-DD HH:mm:ss`。
+ * 请求时刻 → **本地**时区 `MM-DD HH:mm:ss`（去年份：列表按「最新日期」筛选，
+ * 年份是冗余信息，窄列里不如把空间让给数字）。
  *
  * 手拼而不走 `toLocaleString`：行内 `ts` 是 UTC、日志目录按本地日期切分，展示必须转本地；
  * 而 `toLocaleString` 的排版随运行环境（locale / ICU）变，表格里会漂。
@@ -32,22 +50,56 @@ export function formatDateTime(ts: string): string {
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return "-";
   return (
+    `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ` +
+    `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+  );
+}
+
+/**
+ * 时间列形态（窄屏下半行）：只有 `HH:MM:SS`。
+ *
+ * 窄屏列宽只有 76px，装不下完整时间戳，所以拆两行：日期（`formatDate`）在上、
+ * 时刻在这里。为什么不一刀裁掉时间列：它是判断「刚才发生了什么」的主线索。
+ */
+export function formatClock(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "-";
+  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+}
+
+/** 仅日期（本地 `YYYY-MM-DD`）：窄屏时间列的上半行。 */
+export function formatDate(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "-";
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+/** `2026-11-15 15:05:22`：宽屏时间列一行的完整时间戳。 */
+export function formatTimestamp(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "-";
+  return (
     `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ` +
     `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
   );
 }
 
 /**
- * 时间列的**窄屏**形态：只有 `HH:MM:SS`。
+ * 恢复时刻（本地时区）：同一天 → `今天 20:46`，跨天 → `11-07 02:10`。
  *
- * 为什么不干脆裁掉时间列：它是判断「刚才发生了什么」的主线索，不能丢；
- * 而完整日期（`formatDateTime`）在窄屏会把时间列撑到 168px、把模型列挤没。
- * 日志页默认按「最新日期」筛选，列表基本同一天，省掉日期段没有歧义。
+ * 只说「2h 后恢复」时用户还得自己在脑子里加一次，而且**跨天**时会误以为是今天
+ * （冷却 / 熔断的恢复点完全可能落在凌晨）。绝对时刻 + 相对时长一起给。
  */
-export function formatClock(ts: string): string {
-  const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) return "-";
-  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+export function formatRecoveryAt(untilMs: number, nowMs: number = Date.now()): string {
+  const until = new Date(untilMs);
+  if (Number.isNaN(until.getTime())) return "";
+  const now = new Date(nowMs);
+  const sameDay =
+    until.getFullYear() === now.getFullYear() &&
+    until.getMonth() === now.getMonth() &&
+    until.getDate() === now.getDate();
+  const hm = `${pad2(until.getHours())}:${pad2(until.getMinutes())}`;
+  return sameDay ? `今天 ${hm}` : `${pad2(until.getMonth() + 1)}-${pad2(until.getDate())} ${hm}`;
 }
 
 /** 毫秒 → `845ms` / `2.9s` / `1m1s`（三段耗时与统计条共用）。 */
@@ -176,18 +228,28 @@ export function formatRate(perSec: number | null): string {
   return `${Math.round(perSec)} t/s`;
 }
 
-/** 访问日志条目的生成速度（token/s）；口径见 `tokensPerSecOf`。 */
+/** 访问日志条目的生成速率（token/s）；算不出可信值时返回 null。 */
+export function tokensPerSecOfEntry(entry: {
+  tokens: { completion: number | null } | null;
+  durationMs?: number;
+  ttfbMs?: number;
+  upstreamMs?: number;
+  generateMs?: number;
+  stream?: boolean;
+}): number | null {
+  return tokensPerSecOf({
+    completion: entry.tokens?.completion,
+    durationMs: entry.durationMs,
+    ttfbMs: entry.ttfbMs,
+    upstreamMs: entry.upstreamMs,
+    generateMs: entry.generateMs,
+    stream: entry.stream,
+  });
+}
+
+/** 访问日志条目的生成速度展示（`—` = 算不出可信速率）；口径见 `tokensPerSecOf`。 */
 export function formatTokensPerSec(entry: AccessLogEntry): string {
-  return formatRate(
-    tokensPerSecOf({
-      completion: entry.tokens?.completion,
-      durationMs: entry.durationMs,
-      ttfbMs: entry.ttfbMs,
-      upstreamMs: entry.upstreamMs,
-      generateMs: entry.generateMs,
-      stream: entry.stream,
-    }),
-  );
+  return formatRate(tokensPerSecOfEntry(entry));
 }
 
 /**
@@ -210,21 +272,37 @@ export function formatPercent(rate: number | null | undefined): string {
 }
 
 /**
- * 缓存命中率展示；**无缓存字段时返回 `—`**（与「命中 0」区分 —— 把「没采集到」显示成
- * 「0%」是错误信息，见 docs/CACHE-HIT-RATE.md §6）。
+ * 缓存命中率的展示：**统一两位小数**（`99.96%` / `100.00%` / `0.00%`），无数据 `—`。
  *
- * 分母恒为 `hit + miss`：`miss` 已由共享层按上游形态归一化
- * （Anthropic 风格下 `input_tokens` 不含缓存读写，用 `prompt_tokens` 当分母会算出假命中率）。
+ * 两位小数让「近似满命中（99.96%）」与「真满命中（100.00%）」依然可区分，且不再
+ * 需要 `>` / `<` 前缀来表达近似（前缀在表格里读起来像杂讯）。
  */
-export function formatCacheRate(
-  cache: { hit: number | null; miss: number | null } | null | undefined,
-): string {
-  if (!cache || cache.hit === null || cache.hit === undefined) return "—";
-  if (cache.miss === null || cache.miss === undefined) return "—";
-  return formatPercent(cache.hit / (cache.hit + cache.miss));
+export function formatCacheHitRate(rate: number | null | undefined): string {
+  if (typeof rate !== "number" || !Number.isFinite(rate)) return "—";
+  return `${(rate * 100).toFixed(2)}%`;
 }
 
-/** 长文本 / 长 JSON 的短预览：避免把 base64 之类整段铺进页面。 */
-export function brief(value: unknown, max = 300): string {  const text = typeof value === "string" ? value : (JSON.stringify(value) ?? String(value));
-  return text.length > max ? `${text.slice(0, max)}…（共 ${text.length} 字符）` : text;
+/**
+ * 缓存命中率展示：**用上游给的命中 / 未命中计数相除，百分比呈现**。
+ *
+ * 上游一律只回计数（`cached_tokens` / `prompt_cache_hit_tokens` / `cache_read_input_tokens`），
+ * 没有任何一家回比率字段 —— 所以比率只能由 `hit / (hit + miss)` 算出。这是**展示层**的
+ * 折算，不改变「上游没给比率」这个事实（口径见 docs/CACHE-HIT-RATE.md §7）。
+ *
+ * 分母为 0（命中与未命中都是 0，如只写了缓存）时返回 `—`：0/0 不是 0%，是「不知道」。
+ * 没有缓存字段时同样 `—`。
+ */
+export function cacheHitRateText(
+  cache: NonNullable<AccessLogEntry["tokens"]>["cache"] | null | undefined,
+): string {
+  if (!cache) return "—";
+  const hit = cache.hit;
+  const miss = cache.miss;
+  if (hit === null && miss === null) return "—";
+  const h = hit ?? 0;
+  const m = miss ?? 0;
+  const total = h + m;
+  // 0/0 不是 0%，是「没有可判定的样本」
+  if (total <= 0) return "—";
+  return formatCacheHitRate(h / total);
 }

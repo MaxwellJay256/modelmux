@@ -6,7 +6,11 @@
  * 会让人白等一个不会自愈的账号）。
  */
 
-import type { PoolAccount } from "./types";
+import type { ChannelSignin, PoolAccount } from "./types";
+import { formatClock } from "./log-format.ts";
+
+/** 签到载荷形状定义在 `types.ts`（与 `AccountSignin` 同处），这里转出给 AccountCard 用。 */
+export type { ChannelSignin };
 
 /** 单账号的额度快照（按账号查询）。 */
 export interface AccountCredits {
@@ -48,13 +52,53 @@ export interface ChannelBilling {
 
 /** 额度周期（与共享层 `QuotaPeriod` 同形）。 */
 export interface QuotaPeriod {
-  /** 人读文案，如「每天送 5000 积分，本地 0 点刷新」。 */
+  /** 人读文案，统一格式「每天签到送 <数额> <单位>」；参考级证据加「约」，刷新时刻不进文案。 */
   label: string;
   /** 本周期总量；null = 上游不公开。 */
   size: number | null;
   unit: string;
   /** 下次刷新时刻（epoch ms）；null = 未知。 */
   resets_at: number | null;
+}
+
+/**
+ * 「今日签到」行（额度详情的最后一行）；`[]` = 该渠道没有签到能力，整行不渲染。
+ *
+ * 只回答「签没签 / 领了多少」：
+ * - 领到了：`已签到 09:12 +1,200 积分`（额度未知时只给时刻，不编 0）；
+ * - 上游明确没有可领活动：`今日无可领`；
+ * - 其余（没探测过 / 探测失败）：`未签到`。
+ *
+ * 两种口径与后端 `signinViewOf` 一一对应：按账号签到的渠道读**该账号**的记录，
+ * 其余渠道的 `claim()` 只作用于生效凭证，值是渠道级的（这里不再标「（渠道）」——
+ * 面板本身就是「这个账号的详情」，标注只会让人以为还有另一份数）。
+ */
+export function signinRows(
+  info: ChannelSignin | null | undefined,
+  account: Pick<PoolAccount, "signin">,
+): Array<{ label: string; value: string }> {
+  if (!info?.supported) return [];
+  const own = info.per_account ? account.signin ?? null : null;
+  const claimed = info.per_account ? own?.claimed_today === true : info.claimed_today;
+  const at = info.per_account ? own?.at ?? null : info.at;
+  const reward = (info.per_account ? own?.reward : info.reward) ?? null;
+  const source = (info.per_account ? own?.reward_source : info.reward_source) ?? null;
+  const probe = (info.per_account ? own?.probe : info.probe) ?? null;
+  if (claimed) {
+    const clock = at === null ? "" : formatClock(at);
+    const amount =
+      reward !== null && reward.amount > 0
+        ? ` +${reward.amount.toLocaleString("en-US")}${reward.unit === "" ? "" : ` ${reward.unit}`}`
+        : "";
+    // 跨窗口对比（carry）是最弱口径：标注「估算」，不把它伪装成渠道自报的准确数字
+    const estimate = source === "carry" && amount !== "" ? "（估算）" : "";
+    return [{ label: "今日签到", value: `${clock === "" || clock === "-" ? "已签到" : `已签到 ${clock}`}${amount}${estimate}` }];
+  }
+  // 上游明确「没有可领的」：如实说「今日无可领」，不冒充「你还没签」
+  if (probe !== null && probe.claimable === false) {
+    return [{ label: "今日签到", value: "今日无可领" }];
+  }
+  return [{ label: "今日签到", value: "未签到" }];
 }
 
 export type AccountStatus = "ok" | "cooldown" | "down" | "broke";

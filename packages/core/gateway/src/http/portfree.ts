@@ -19,6 +19,16 @@ function dedupe(pids: number[]): number[] {
   return [...new Set(pids)];
 }
 
+/**
+ * 子进程输出上限（字节）。
+ *
+ * Node 的 `execFileSync` 默认 `maxBuffer` 只有 1MB，超出直接抛 ENOBUFS —— 本机装了
+ * 代理后 `netstat -ano` 有 1300+ 条连接、输出远超 1MB，端口识别从此恒失败
+ * （表现为「could not identify the owning process」，2026-11-20 实测）。
+ * 64MB 对 netstat / lsof / tasklist 都绰绰有余。
+ */
+const EXEC_MAX_BUFFER = 64 * 1024 * 1024;
+
 /** 返回正在监听指定端口的所有进程 PID。 */
 export function findPortPids(port: number): number[] {
   try {
@@ -28,12 +38,18 @@ export function findPortPids(port: number): number[] {
       const out = execFileSync("netstat", ["-ano", "-p", "tcp"], {
         encoding: "utf8",
         windowsHide: true,
+        maxBuffer: EXEC_MAX_BUFFER,
       });
       const suffix = `:${port}`;
       const pids: number[] = [];
       for (const line of out.split("\n")) {
         const fields = line.trim().split(/\s+/);
-        if (fields.length < 5 || fields[0] !== "TCP" || fields[3] !== "LISTENING") continue;
+        if (fields.length < 5 || fields[0] !== "TCP") continue;
+        // 两种状态都算：LISTENING 是监听 socket；ESTABLISHED 是已接受的连接。
+        // 只认 LISTENING 在部分 Windows 环境下会漏 —— 空闲的监听 socket 可能不出现在
+        // netstat 输出里（实测本机），有连接活动才看得到该端口。
+        const state = fields[3];
+        if (state !== "LISTENING" && state !== "ESTABLISHED") continue;
         if (!fields[1]!.endsWith(suffix)) continue;
         const pid = Number.parseInt(fields[fields.length - 1]!, 10);
         if (Number.isFinite(pid) && pid > 0) pids.push(pid);
@@ -42,6 +58,7 @@ export function findPortPids(port: number): number[] {
     }
     const out = execFileSync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], {
       encoding: "utf8",
+      maxBuffer: EXEC_MAX_BUFFER,
     });
     return dedupe(
       out
@@ -67,6 +84,7 @@ export function procName(pid: number): string {
       const out = execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
         encoding: "utf8",
         windowsHide: true,
+        maxBuffer: EXEC_MAX_BUFFER,
       });
       const line = out.trim();
       const comma = line.indexOf(",");
@@ -75,7 +93,10 @@ export function procName(pid: number): string {
       if (name.toLowerCase().endsWith(".exe")) name = name.slice(0, -4);
       return name.toLowerCase();
     }
-    const out = execFileSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" });
+    const out = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+      encoding: "utf8",
+      maxBuffer: EXEC_MAX_BUFFER,
+    });
     return basename(out.trim());
   } catch {
     return "";
@@ -198,7 +219,9 @@ export function displayBase(addr: string): string {
     const host = addr.slice(1, close);
     const rest = addr.slice(close + 1);
     const port = rest.startsWith(":") ? rest.slice(1) : "";
-    return `${host === "" || host === "::" ? "127.0.0.1" : host}:${port}`;
+    // 方括号必须带回去：`baseUrlOf` 直接拼 `http://${…}`，裸 `::1:4412` 会被
+    // `new URL()` 判成非法地址，状态查询 / 探测全部拿不到自身端点。
+    return `${host === "" || host === "::" ? "127.0.0.1" : `[${host}]`}:${port}`;
   }
   const idx = addr.lastIndexOf(":");
   if (idx < 0) return addr;

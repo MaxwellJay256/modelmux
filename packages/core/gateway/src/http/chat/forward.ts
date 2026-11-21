@@ -12,10 +12,12 @@
 import type { ServerResponse } from "node:http";
 
 import { type Channel, type StreamTranslator } from "../../runtime/channel.js";
+import { noteFailure } from "../../pool/pool-usage.js";
 import { noteFirstByte, noteFirstFrame, noteLastFrame, noteRequestError, noteUsage } from "../../runtime/log-store.js";
 import { inChannel, isCustomWire } from "./channel.js";
-import { writeJson, writeJsonError } from "./errors.js";
-import { collectAsOpenAiSse, relayStream } from "./stream.js";
+import { isContextLengthExceeded, writeJson, writeProtocolError } from "./errors.js";
+import { protocolOf, sinkOf } from "../protocol/types.js";
+import { collectAsOpenAiSse, coolAccountOnQuotaSignal, relayStream } from "./stream.js";
 import type { ProbeFrames } from "./queue.js";
 import type { UpstreamCall } from "./upstream.js";
 import * as dsmlTools from "../wire/dsml-tools.js";
@@ -49,15 +51,31 @@ export interface ForwardOptions {
   logger: (m: string) => void;
   /** 探测层消费掉的帧（按原序先写给客户端）。 */
   pendingFrames?: ProbeFrames;
-  /** 排队等待预算耗尽。 */
-  queuedOut?: boolean;
-  /** 排队放弃文案：探测层填了它，本层就回**正常应答**（劝主人换渠道）而不是错误帧。 */
-  giveUpText?: string | null;
   /** 探测用的翻译器实例（必须与探测层是同一个）。 */
   probeTranslator?: StreamTranslator;
   /** 客户端原始请求体（渠道的翻译器要用）。 */
   request?: Record<string, unknown>;
+  /** 免费（×0）模型：流内业务错误帧只记账、不冷却账号（由尝试层算好传入）。 */
+  freeModel?: boolean;
 }
+
+/**
+ * 转发层的结果。
+ *
+ * `empty-stream` = 上游回了 200 但**一个字节都没交付、响应头也还没写** —— 这条候选
+ * 没接住请求，尝试层可以换下一条。之所以要单独回这个信号而不是就地报错：写头就等于
+ * 向客户端承诺接了，之后换渠道会变成两个响应；而「200 + 空流」交出去只会让客户端
+ * 自己猜（ZCode 报成 provider 业务错误），日志还记 success。
+ */
+export type ForwardResult =
+  | { kind: "done" }
+  /**
+   * 上游回了 200 却零产出，且响应头还没写。
+   *
+   * `reason` 是给人看的说明（进日志与最终错误文案）：流式与聚合两条路径的
+   * 「空」判据不同，文案也就不同 —— 统一在尝试层落地，不在这里重复记账。
+   */
+  | { kind: "empty-stream"; reason: string };
 
 /** 聚合结果是否「什么都没有」：无 content、无 reasoning、无 token 用量。 */
 
@@ -67,49 +85,11 @@ function isEmptyCompletion(completion: ReturnType<typeof sseStream.aggregateChat
   if (choice.message.content) return false;
   if (choice.message.reasoning_content) return false;
   if (choice.message.tool_calls && choice.message.tool_calls.length > 0) return false;
-  const total = (completion.usage as { total_tokens?: unknown }).total_tokens;
+  // usage 可能整个缺席（上游不提供用量，见 aggregateChatSse 的说明）：那不是「空完成」
+  const total = (completion.usage as { total_tokens?: unknown } | undefined)?.total_tokens;
   return !(typeof total === "number" && total > 0);
 }
 
-/**
- * 排队超时后的收尾：把「劝主人换渠道」的文案作为**正常应答**返回。
- *
- * 为什么不回错误帧：排队耗尽时客户端早已等不及，回一个 `upstream_queued` 错误
- * 只会让它显示「上游排队」这种没用的信息；直接告诉主人「别用这家了」才有用。
- * 流式与非流式各按自己的形态给出完整应答（含 `finish_reason` 与 `[DONE]`）。
- */
-function writeQueueGiveUp(res: ServerResponse, model: unknown, text: string, wantStream: boolean): void {
-  const id = `chatcmpl-queue-${Date.now().toString(36)}`;
-  const created = Math.floor(Date.now() / 1000);
-  const chunk = (delta: Record<string, unknown>, finishReason: string | null): string =>
-    `data: ${JSON.stringify({
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model,
-      choices: [{ index: 0, delta, finish_reason: finishReason }],
-    })}\n\n`;
-  if (!wantStream) {
-    writeJson(res, {
-      id,
-      object: "chat.completion",
-      created,
-      model,
-      choices: [
-        { index: 0, message: { role: "assistant", content: `${text}\n\n` }, finish_reason: "stop" },
-      ],
-    });
-    return;
-  }
-  if (!res.headersSent) {
-    res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" });
-    res.write(chunk({ role: "assistant", content: "" }, null));
-  }
-  res.write(chunk({ content: `${text}\n\n` }, null));
-  res.write(chunk({}, "stop"));
-  res.write("data: [DONE]\n\n");
-  res.end();
-}
 
 /**
  * 把胜出候选的上游响应交给客户端：非流式聚合、流式透传。
@@ -127,40 +107,25 @@ export async function relayUpstream(
   cid: string,
   call: UpstreamCall,
   opts: ForwardOptions,
-): Promise<void> {
+): Promise<ForwardResult> {
   const {
     wantStream,
     logger,
     pendingFrames = [],
-    queuedOut = false,
-    giveUpText = null,
     probeTranslator,
     request,
+    freeModel = false,
   } = opts;
   const streamBody = call.body;
   if (!streamBody) {
-    writeJsonError(res, 502, "upstream_error", "upstream returned an empty response body");
-    return;
+    writeProtocolError(res, 502, "upstream_error", "upstream returned an empty response body");
+    return { kind: "done" };
   }
 
   // 非流式：消费完整上游流（必要时先翻译），聚合成一个 chat.completion JSON。
-  // custom 线型且渠道声明了 isQueueError 时，**响应头还没发**——排队帧可以触发
-  // 等待 + 重开上游重试（与流式路径同一套预算）。
+  // 排队在上游层已被拦下（见 `attempt.ts` 的 `switchChannel`：探测到排队即换候选），
+  // 走到这里的请求都拿到了真实内容帧，非流式没有排队分支。
   if (!wantStream) {
-    // 排队预算耗尽的判定必须**排在读流之前**（与流式路径同一口径、同一顺序）：
-    //   排队耗尽时上游是「收下请求后彻底静默」，先读流会把客户端拖到静默超时
-    //   （实测 900s）才拿到 503。判据与流式路径一致：探测层没拿到任何内容帧。
-    if (queuedOut && pendingFrames.length === 0) {
-      // 释放这条已静默的上游流（流式路径同处也释放）
-      await call.body?.cancel().catch(() => {});
-      // 排队太久：回「劝主人换渠道」的正常应答，而不是一个没用的错误信封
-      if (giveUpText) {
-        writeQueueGiveUp(res, request?.["model"], giveUpText, wantStream);
-        return;
-      }
-      writeJsonError(res, 503, "upstream_queued", "upstream is queued and the wait budget was exhausted");
-      return;
-    }
     try {
       // 这里**不再二次探测**：尝试层已用同一条件探测过这条流并推进了它的位置，
       // 再探测会丢掉第一次消费掉的帧（非流式空响应的元凶）。此处只把探测结果（前缀内容帧 /
@@ -194,30 +159,54 @@ export async function relayUpstream(
       if (isEmptyCompletion(aggregated)) {
         const sseError = sseStream.firstSseError(buf);
         if (sseError) {
-          writeJsonError(res, 502, sseError.code ?? "upstream_error", sseError.message ?? "upstream error");
-          return;
+          const rawCode = sseError.code;
+          const code = rawCode === undefined || rawCode === "" ? "upstream_error" : rawCode;
+          const message = sseError.message ?? "upstream error";
+          // 额度类业务错误同样冷却账号 —— 与流式路径同一条判据，否则同一个
+          // `code=112` 在流式下被冷却、非流式下被反复重试
+          coolAccountOnQuotaSignal(channel, cid, logger, code, message, freeModel);
+          // 补一笔账本失败（attempt 层在上游收下请求时已记过 ok，见 `noteStreamError`）
+          try {
+            noteFailure(cid, undefined, 0);
+          } catch (err) {
+            logger(`ledger write failed (channel ${cid}): ${String(err)}`);
+          }
+          // 上下文超限是**客户端问题**（请求体太大），必须回 400 让客户端去压缩历史。
+          // 回 502 会被客户端当成「服务端临时故障」无限重试同一条改不了的请求
+          //（2026-11-08 实测 Claude Code 连撞 36 次）。与 `attempt.ts` 的
+          // 「上游 4xx 业务错原样透传状态码」同一条铁律 —— 流内错误帧路径此前漏了。
+          writeProtocolError(res, isContextLengthExceeded(message) ? 400 : 502, code, message);
+          return { kind: "done" };
         }
-        noteRequestError(
-          res,
-          "upstream_stream_failed",
-          "aggregated upstream stream had no content, tool calls, reasoning or token usage",
-        );
-        writeJsonError(res, 502, "upstream_stream_failed", "upstream returned an empty stream");
-        return;
+        // 交回尝试层换下一条候选：非流式也是「聚合完才 writeJson」，此刻还没写头，
+        // 直接 502 就放弃了「换一家可能有货」的机会。记账与文案由尝试层统一落地。
+        return {
+          kind: "empty-stream",
+          reason: "aggregated upstream stream had no content, tool calls, reasoning or token usage",
+        };
       }
       noteFirstByte(res);
-      writeJson(res, aggregated);
+      // 协议入站在场：聚合体按协议形态回（anthropic message / responses response）
+      const protocol = protocolOf(res);
+      writeJson(res, protocol ? protocol.protocol.encodeCompletion(aggregated, protocol.requestModel) : aggregated);
     } catch (err) {
       logger(`reading upstream response interrupted: ${String(err)}`);
       const timedOut = /timeout/i.test(String(err));
-      writeJsonError(res, 502, timedOut ? "upstream_timeout" : "upstream_error", "upstream request failed; see gateway logs");
+      // 上游读流中断的原因透传给客户端（截断），完整原文仍在本地日志
+      const detail = String(err).replace(/\s+/g, " ").trim().slice(0, 300);
+      writeProtocolError(
+        res,
+        502,
+        timedOut ? "upstream_timeout" : "upstream_error",
+        `upstream stream interrupted [${cid}]: ${detail || "no upstream error details"}`,
+      );
       noteRequestError(res, timedOut ? "upstream_timeout" : "upstream_read_failed", String(err));
     }
-    return;
+    return { kind: "done" };
   }
 
   // 流式：复制上游响应头（剔除 hop-by-hop 与已失效头），状态码透传。
-  // 排队进度帧可能已经把 SSE 头发出去了（`attempt.ts` 的 writeQueueNotice）：
+  // 排队进度帧可能已经把 SSE 头发出去了（`attempt.ts` 的 `writeQueueHeaders`）：
   //   此时不能再 writeHead（会抛 ERR_HTTP_HEADERS_SENT），后续帧直接续写。
   const outHeaders: Record<string, string> = {};
   if (isCustomWire(channel)) {
@@ -229,34 +218,34 @@ export async function relayUpstream(
       if (!STRIP_HEADERS.has(name.toLowerCase())) outHeaders[name] = value;
     }
   }
-  if (!res.headersSent) res.writeHead(call.status, outHeaders);
-  if (queuedOut && pendingFrames.length === 0) {
-    // 排队预算耗尽且没有任何内容：给出明确应答后结束
-    // （与非流式路径同一顺序：先判预算，不再读那条已静默的上游流）
-    await call.body?.cancel().catch(() => {});
-    // 排队太久：回「劝主人换渠道」的正常应答，而不是一个没用的错误帧
-    if (giveUpText) {
-      writeQueueGiveUp(res, request?.["model"], giveUpText, wantStream);
-      return;
-    }
-    res.write(
-      `data: ${JSON.stringify({ error: { code: "upstream_queued", message: "upstream is queued and the wait budget was exhausted" } })}\n\n`,
-    );
-    res.end();
-    return;
-  }
-  await inChannel(channel, () =>
-        relayStream(
-          res,
-          streamBody,
-          call.headers.get("content-type") ?? "",
-          logger,
-          channel,
-          cid,
-          probeTranslator,
-          request,
-          pendingFrames.length > 0,
-          pendingFrames,
-        ),
+  /**
+   * 惰性写头：第一次真要往客户端写东西（含心跳）时才落。
+   *
+   * 排队进度帧可能已经写过头（`attempt.ts` 的探测层），writeHead 因此必须幂等；
+   * 而「上游 200 却零产出」的情况要靠它把换候选的窗口留到写头之前。
+   */
+  const ensureHead = (): void => {
+    if (!res.headersSent) res.writeHead(call.status, outHeaders);
+  };
+  const relayed = await inChannel(channel, () =>
+    relayStream(
+      res,
+      streamBody,
+      call.headers.get("content-type") ?? "",
+      logger,
+      channel,
+      cid,
+      probeTranslator,
+      request,
+      pendingFrames.length > 0,
+      pendingFrames,
+      freeModel,
+      ensureHead,
+    ),
   );
+  // 零产出且一字节未写：交回尝试层换下一条候选（此时客户端什么都没收到，换得干净）
+  if (relayed.produced === 0 && !res.headersSent && !relayed.disconnected) {
+    return { kind: "empty-stream", reason: "upstream returned an empty stream" };
+  }
+  return { kind: "done" };
 }

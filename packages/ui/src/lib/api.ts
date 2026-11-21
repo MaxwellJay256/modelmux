@@ -1,9 +1,8 @@
 /**
- * 控制台 API 客户端：统一封装 `/web/api/*` 的读写（演示模式下换成内存数据）。
+ * 控制台 API 客户端：统一封装 `/web/api/*` 的读写。
  *
- * 关键约束：
- *  - 基址固定为 `<origin>/web`（单端口模式下 UI 与控制台 API 共用网关端口）
- *  - 演示模式由构建期常量 `__DEMO_MODE__` 判定，真实构建里该分支被静态消除
+ * 关键约束：基址固定为 `<origin>/web`（单端口模式下 UI 与控制台 API 共用网关端口）。
+ * API key 管理走命令面（`commands.apiKeys/createApiKey/...`），不单独开路由。
  */
 
 import type {
@@ -13,75 +12,36 @@ import type {
   CommandResult,
   LogQuery,
   OverviewResponse,
-  PayloadQueryResult,
-  PayloadSliceResult,
-  PingResult,
   PoolRow,
   UiSnapshot,
   UsageRange,
   UsageStats,
 } from "./types.ts";
-import {
-  createDemoState,
-  demoAccountPools,
-  demoActivate,
-  demoBilling,
-  demoCompleteLogin,
-  demoEndLogin,
-  demoLogPayload,
-  demoPayloadSlice,
-  demoLogin,
-  demoLogs,
-  demoModels,
-  demoOverview,
-  demoRemove,
-  demoReset,
-  demoSettings,
-  demoStatus,
-  demoSubmitLoginInput,
-  demoUsage,
-  type DemoState,
-} from "./demo.ts";
 
 /**
  * 后端基地址：单端口模式下 UI 挂在网关的 `/web` 前缀下，
  * 控制台 API 相应地位于 `/web/api/*`（见 `core/gateway/src/http/console/console.ts`）。
- *
- * 演示模式（GitHub Pages 静态部署）下不走这里 —— 见 `IS_DEMO`。
  */
 const BASE = typeof window === "undefined" ? "" : window.location.origin;
 const API_BASE = `${BASE}/web`;
 
-/**
- * 是否运行在演示模式。
- *
- * 由构建期注入（`vite.config.ts` 的 `define` 把 `__DEMO_MODE__` 换成字面量），
- * 所以真实构建里这段分支会被静态消除，不产生任何运行时开销。
- *
- * Pages 是纯静态托管，没有 `/web/api/*`，且网关不发 CORS、写命令有同源校验、
- * Chrome 还拦「公网页 → 127.0.0.1」—— 演示模式因此用内存数据替换 fetch。
- */
-declare const __DEMO_MODE__: boolean;
-const IS_DEMO = typeof __DEMO_MODE__ !== "undefined" && __DEMO_MODE__;
-
-/** 演示态（懒创建；生产构建里这段是死代码）。 */
-let demoState: DemoState | null = null;
-function demo(): DemoState {
-  demoState ??= createDemoState();
-  return demoState;
+/** 非 2xx 的报错文案：优先取响应体里的 `error`（服务端给的具体原因），退化到状态码。 */
+async function errorMessage(res: Response): Promise<string> {
+  try {
+    const payload = (await res.json()) as { error?: string };
+    if (payload.error) return payload.error;
+  } catch {
+    // 非 JSON 响应体就按状态码处理
+  }
+  return `HTTP ${res.status}`;
 }
-
-/** 小延迟：让界面上的 loading 态真实可见，而不是瞬间完成。 */
-const DEMO_DELAY_MS = 180;
-function demoLater<T>(value: T): Promise<T> {
-  return new Promise((resolve) => setTimeout(() => resolve(value), DEMO_DELAY_MS));
-}
-
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return await res.json() as T;
+  // GET 的错误体同样要透传：payload not found / not ready 这类具体原因
+  // 比「HTTP 404」对排障有用得多，不能只让 POST/PUT 独享
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
 }
 
 async function post<T>(path: string, body: unknown = {}): Promise<T> {
@@ -90,26 +50,19 @@ async function post<T>(path: string, body: unknown = {}): Promise<T> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const payload = (await res.json()) as { error?: string };
-      if (payload.error) msg = payload.error;
-    } catch {
-      // 非 JSON 响应体就按状态码处理
-    }
-    throw new Error(msg);
-  }
-  return await res.json() as T;
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
 }
 
-/**
- * 演示模式下的状态快照。
- *
- * 模型列表每次现算 —— 「添加账号」把渠道标记为已登录后，模型墙会立刻多出该渠道。
- */
-function demoGetState(): UiSnapshot {
-  return demoSettings(demo());
+/** `PUT` 请求（路由注册表整体写用；错误处理与 post 同口径）。 */
+async function put<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
 }
 
 export interface WebApi {
@@ -128,32 +81,15 @@ export interface WebApi {
    * 服务端逐日聚合 access 日志并缓存历史日期，前端只负责展示；区间见 `UsageRange`。
    */
   usage(range: UsageRange): Promise<UsageStats>;
-  /** 某条请求的正文抓取记录（正文抓取恒开启，此接口只读；默认只回元数据）。 */
-  logPayload(id: string, date?: string): Promise<PayloadQueryResult>;
-  /** 按字节窗口取正文分片（首屏只取一片，避免整段 MB 级明文进首屏）。 */
-  logPayloadBody(
-    id: string,
-    date: string | undefined,
-    phase: string,
-    offset: number,
-    limit: number,
-  ): Promise<PayloadSliceResult>;
   /** 仪表盘聚合视图（`GET /web/api/overview`）：一次拿到 KPI + 渠道 + 模型池 + 最近请求。 */
   overview(): Promise<OverviewResponse>;
-  /**
-   * ping 一个模型（`POST /web/api/ping`）：向网关自身发一次最小 chat 请求并回耗时。
-   *
-   * 服务端只允许回环地址，会真的花掉一次上游请求（约 1 个输出 token），并落一条访问日志。
-   */
-  ping(model: string): Promise<PingResult>;
   readonly commands: {
     /** 各方法返回**已解包 data 的扁平对象**（含 ok / message / error）。 */
     login(cid: string, force: boolean): Promise<CommandData>;
     status(cid?: string): Promise<CommandData>;
-    models(cid?: string): Promise<CommandData>;
     /**
-     * 渠道账单快照；`args.refresh = true` 时后端会先重查一遍各渠道账单
-     * （控制台「刷新」按钮用）。`cid` 限定单渠道。
+     * 渠道账单快照；`args.refresh = true` 时后端会先重查一遍各渠道账单。
+     * `cid` 限定单渠道。重查调用面保留给将来的手动入口，当前 UI 未使用。
      */
     billing(cid?: string, args?: { refresh?: boolean }): Promise<CommandData>;
     accounts(cid?: string): Promise<CommandData>;
@@ -169,6 +105,10 @@ export interface WebApi {
     resetAccount(cid: string, key: string): Promise<CommandData>;
     removeAccount(cid: string, key: string): Promise<CommandData>;
     syncPool(cid: string): Promise<CommandData>;
+    /** 模型级渠道偏好：每个对外模型的候选渠道 + 当前偏好（下拉的数据源）。 */
+    modelChannels(): Promise<CommandData>;
+    /** 设置 / 清除某模型的优先渠道（`cid` 传空串 = 回到自动选路）。 */
+    setModelChannel(model: string, cid: string): Promise<CommandData>;
     /**
      * 提交用户粘回的回调链接（一次性 code 的兜底通道）。
      *
@@ -183,6 +123,36 @@ export interface WebApi {
     submitInput(value: string): Promise<CommandData>;
     /** 用户关掉了登录弹窗：让等待输入的渠道收尾（见 `ControlBridge.cancelInput`）。 */
     cancelInput(): Promise<CommandData>;
+    /**
+     * 一键接入：把本机客户端的模型配置改写成网关的对外模型名。
+     *
+     * 后端写的是各客户端自己的配置文件（写前备份），返回变更说明。
+     */
+    integrate(target: "zcode" | "dsh"): Promise<CommandData>;
+    /**
+     * 一键还原：把目标恢复成**接入前**的配置。
+     *
+     * 取该目标最近一次接入备份；还原前会先把当前状态再备份一份（可反悔）。
+     * `restored` 是写回原内容的文件，`removed` 是接入时新建、还原时删掉的文件。
+     */
+    restore(target: "zcode" | "dsh"): Promise<CommandData>;
+    /** 设置弹窗的渠道开关：关闭 = 账号池隐藏 + 选路跳过（凭据与登录态保留）。 */
+    setChannelEnabled(cid: string, enabled: boolean): Promise<CommandData>;
+    /** API key 列表（不含哈希；明文永不回读）。 */
+    apiKeys(): Promise<CommandData>;
+    /** 新建 key：返回 `plain`（明文，仅此一次）与记录。 */
+    createApiKey(name: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
+    updateApiKey(id: string, name: string, allowedModels: string[], rpmLimit: number): Promise<CommandData>;
+    deleteApiKey(id: string): Promise<CommandData>;
+    regenerateApiKey(id: string): Promise<CommandData>;
+    revealApiKey(id: string): Promise<CommandData>;
+    /**
+     * 手动检查更新（设置页「检查更新」按钮）。
+     *
+     * 忽略每日节流立即请求 GitHub tags；失败如实返回 `error`（不静默回落）。
+     * `available=false` 即当前已是最新。
+     */
+    checkUpdate(): Promise<CommandData>;
   };
 }
 
@@ -201,14 +171,13 @@ export interface CommandData extends Record<string, unknown> {
  *
  * **返回值会自动解包 `data`** —— 后端统一信封是 `{ ok, data?, message?, error? }`，
  * 调用方拿到的就是 `data`。早期版本把整个信封返回，导致各页面按 `res.channels` 读取
- * 而实际在 `res.data.channels`，表现为「（无渠道）」「（无数据）」（实测踩过）。
+ * 而实际在 `res.data.channels`，表现为「（无渠道）」「（无数据）」（实测出现过）。
  */
 async function command(
   action: string,
   cid: string | undefined,
   args: Record<string, unknown> = {},
 ): Promise<CommandData> {
-  if (IS_DEMO) return (await demoCommand(action, cid, args)) as CommandData;
   const body: Record<string, unknown> = { action, args };
   if (cid !== undefined) body["cid"] = cid;
   const envelope = (await post("/api/commands", body)) as {
@@ -223,83 +192,12 @@ async function command(
       ? (data as Record<string, unknown>)
       : {};
   // 保留 ok / message / error，便于调用方按需读取（data 的字段与它们平级）
-  return { ...merged, ok: envelope.ok, ...(envelope.message ? { message: envelope.message } : {}), ...(envelope.error ? { error: envelope.error } : {}) };
-}
-
-/**
- * 演示模式的动作分发：与真实 `/web/api/commands` 同形（解包后的扁平对象）。
- *
- * 每个动作只改内存状态，因此界面上的「添加账号 / 切换 / 删除 / 刷新账单」都能
- * 真实反映出来 —— 演示的是**交互流程**，不是假死截图。
- */
-async function demoCommand(
-  action: string,
-  cid: string | undefined,
-  args: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const st = demo();
-  switch (action) {
-    case "status":
-      return { ...demoStatus(st), ok: true };
-    case "models": {
-      const channels = st.channels.map((ch) => {
-        const ids = demoModels(st)
-          .filter((m) => m.startsWith(`${ch.cid}/`))
-          .map((m) => m.slice(ch.cid.length + 1));
-        return { cid: ch.cid, display: ch.display, catalog: ids, pool: ids, out_of_pool: 0 };
-      });
-      return { channels, ok: true };
-    }
-    case "accounts":
-      return { ...demoAccountPools(st), ok: true };
-    case "billing":
-      return { ...demoBilling(st), ok: true };
-    case "login": {
-      const target = cid ?? "";
-      const res = demoLogin(st, target);
-      return { ...res, ok: res.started, ...(res.started ? {} : { error: res.message }) };
-    }
-    case "activateAccount": {
-      const key = typeof args["key"] === "string" ? args["key"] : "";
-      const ok = demoActivate(st, cid ?? "", key);
-      return ok ? { active: key, ok: true } : { ok: false, error: `账号 ${key} 不在池中` };
-    }
-    case "resetAccount": {
-      const key = typeof args["key"] === "string" ? args["key"] : "";
-      const res = demoReset(st, cid ?? "", key);
-      return res.cleared
-        ? { key, health: res.health, ok: true }
-        : { key, health: res.health, ok: false, error: res.reason ?? "该账号没有需要解除的标记" };
-    }
-    case "removeAccount": {
-      const key = typeof args["key"] === "string" ? args["key"] : "";
-      const ok = demoRemove(st, cid ?? "", key);
-      return ok ? { removed: key, ok: true } : { ok: false, error: `账号 ${key} 不在池中` };
-    }
-    case "syncPool":
-      return { ok: true };
-    case "pasteCallback": {
-      // 演示模式：视为授权完成 —— 把流程真的走完（渠道转已登录 + 账号入池）
-      const res = demoCompleteLogin(st);
-      return { submitted: true, message: res.message, ok: true };
-    }
-    case "submitInput": {
-      // 两步登录的演示：第一次提交是手机号，第二次是验证码 —— 都走完才入池。
-      const res = demoSubmitLoginInput(st, String(args["value"] ?? ""));
-      return { submitted: true, message: res.message, ok: true };
-    }
-    case "cancelInput":
-      // 演示模式：直接结束这轮登录（不造账号）
-      demoEndLogin(st);
-      return { cancelled: true, ok: true };
-    default:
-      return { ok: false, error: `演示模式不支持动作 ${action}` };
-  }
-}
-
-/** 演示模式下 `setTheme` / `retryLogin` 的桩。 */
-async function demoNoop(): Promise<{ ok: boolean }> {
-  return demoLater({ ok: true });
+  return {
+    ...merged,
+    ok: envelope.ok,
+    ...(envelope.message ? { message: envelope.message } : {}),
+    ...(envelope.error ? { error: envelope.error } : {}),
+  };
 }
 
 /** 拼查询串：空串与 `undefined` 一律不带上（服务端按缺省处理）。 */
@@ -314,57 +212,49 @@ function queryString(params: Record<string, string | number | boolean | undefine
 }
 
 export const api: WebApi = {
-  getState: () => (IS_DEMO ? demoLater(demoGetState()) : get("/api/state")),
-  setTheme: (mode) => (IS_DEMO ? demoNoop() : post("/api/theme", { mode })),
-  retryLogin: () => (IS_DEMO ? demoNoop() : post("/api/retry-login")),
+  getState: () => get("/api/state"),
+  setTheme: (mode) => post("/api/theme", { mode }),
+  retryLogin: () => post("/api/retry-login"),
   logs: (query = {}) =>
-    IS_DEMO
-      ? demoLater(demoLogs(demo(), query))
-      : get(
-          `/api/logs${queryString({
-            date: query.date,
-            outcome: query.outcome,
-            cid: query.cid,
-            model: query.model,
-            stream: query.stream,
-            slow: query.slow === true ? 1 : undefined,
-            q: query.q,
-            limit: query.limit,
-            offset: query.offset,
-          })}`,
-        ),
-  logPayload: (id, date) =>
-    IS_DEMO
-      ? demoLater(demoLogPayload(id))
-      : get(`/api/logs/payload${queryString({ id, date })}`),
-  /** 按字节窗口取某条记录的正文分片（首屏只取一片，避免 MB 级明文整段进首屏）。 */
-  logPayloadBody: (id: string, date: string | undefined, phase: string, offset: number, limit: number) =>
-    IS_DEMO
-      ? demoLater( demoPayloadSlice(id, date, phase, offset, limit) )
-      : get(
-          `/api/logs/payload${queryString({ id, date, part: "body", phase, offset, limit })}`,
-        ),
-  usage: (range) => (IS_DEMO ? demoLater(demoUsage(range)) : get(`/api/usage${queryString({ range })}`)),
-  ping: (model) =>
-    IS_DEMO
-      ? demoLater({ ok: true, model, ms: 1_200, status: 200, error: "" })
-      : post("/api/ping", { model }),
-  overview: () =>
-    IS_DEMO ? demoLater(demoOverview(demo())) : get("/api/overview"),
+    get(
+      `/api/logs${queryString({
+        date: query.date,
+        outcome: query.outcome,
+        cid: query.cid,
+        model: query.model,
+        stream: query.stream,
+        slow: query.slow === true ? 1 : undefined,
+        limit: query.limit,
+        offset: query.offset,
+      })}`,
+    ),
+  usage: (range) => get(`/api/usage${queryString({ range })}`),
+  overview: () => get("/api/overview"),
   commands: {
     login: (cid, force) => command("login", cid, { force }),
     status: (cid) => command("status", cid),
-    models: (cid) => command("models", cid),
     billing: (cid, args) => command("billing", cid, args ?? {}),
     accounts: (cid) => command("accounts", cid),
     activateAccount: (cid, key) => command("activateAccount", cid, { key }),
     resetAccount: (cid, key) => command("resetAccount", cid, { key }),
     removeAccount: (cid, key) => command("removeAccount", cid, { key }),
     syncPool: (cid) => command("syncPool", cid),
+    modelChannels: () => command("modelChannels", undefined),
+    setModelChannel: (model, cid) => command("setModelChannel", undefined, { model, cid }),
     pasteCallback: (url) => command("pasteCallback", undefined, { url }),
     /** 两步登录（如 loomy 短信验证码）：把用户在弹窗里填的内容交回去。 */
     submitInput: (value) => command("submitInput", undefined, { value }),
     /** 关闭登录弹窗：让等待输入的渠道立刻收尾，而不是挂到超时。 */
     cancelInput: () => command("cancelInput", undefined),
+    integrate: (target) => command("integrate", undefined, { target }),
+    restore: (target) => command("restore", undefined, { target }),
+    setChannelEnabled: (cid, enabled) => command("setChannelEnabled", cid, { enabled }),
+    apiKeys: () => command("apiKeys", undefined),
+    createApiKey: (name, allowedModels, rpmLimit) => command("createApiKey", undefined, { name, allowedModels, rpmLimit }),
+    updateApiKey: (id, name, allowedModels, rpmLimit) => command("updateApiKey", undefined, { id, name, allowedModels, rpmLimit }),
+    deleteApiKey: (id) => command("deleteApiKey", undefined, { id }),
+    regenerateApiKey: (id) => command("regenerateApiKey", undefined, { id }),
+    revealApiKey: (id) => command("revealApiKey", undefined, { id }),
+    checkUpdate: () => command("checkUpdate", undefined),
   },
 };

@@ -9,9 +9,7 @@
  *    冷却期内渠道得分**当 0**（`scoreOf`）且在路由侧被**硬剔除**（`isCooling`）
  */
 
-import { existsSync, readFileSync } from "node:fs";
-
-import { channelCapabilities, channels, type Channel } from "../runtime/channel.js";
+import { channelCapabilities, channels, getChannel, hasChannel, type Channel } from "../runtime/channel.js";
 import { runInChannel } from "../runtime/channel-context.js";
 import {
   activeAccountCooling,
@@ -19,17 +17,33 @@ import {
   listAccounts,
   noteAccountQuotaExhausted,
   readAccountCredential,
+  readIndex,
+  reviveAfterBilling,
+  runForAccountCredential,
 } from "../runtime/account-pool.js";
 import { normalizeCredentialShape } from "../runtime/credential-shape.js";
-import { noteOnce, poolUsagePath } from "../runtime/paths.js";
-import { localDate } from "../runtime/log-store.js";
-import { writeJsonSecret } from "../runtime/secret-file.js";
+import { noteOnce } from "../runtime/paths.js";
+import { poolStore } from "../runtime/pool-store.js";
+import { aggregateModelTps, listAccessDates, localDate } from "../runtime/log-store.js";
 
 /** 账单缓存有效期：8 小时 ≈ 一天三次。 */
 export const BILLING_TTL_MS = 8 * 60 * 60 * 1000;
 
 /** 失败后的冷却时长（冷却期内得分当 0）。 */
 export const FAIL_COOLDOWN_MS = 60 * 1000;
+
+/** 上一额度窗口结束时的余额快照（跨窗口对比的兜底口径，见 `prevRemainOf`）。 */
+export interface PrevQuota {
+  /** 那一窗口的键（渠道声明的 `resets_at` 或本地日期）。 */
+  window: string;
+  /** 快照时的本地日期。 */
+  date: string;
+  /** 那一窗口最后一次观测到的剩余额度。 */
+  remain: number;
+  unit: string;
+  /** 快照时间（ISO）。 */
+  at: string;
+}
 
 /** 单个渠道的账本条目。 */
 export interface ChannelLedger {
@@ -43,6 +57,14 @@ export interface ChannelLedger {
   unit: string;
   /** 最近一次账单查询的**尝试**时刻（ISO）；成功失败都更新，用它判 TTL。 */
   billing_at: string | null;
+  /**
+   * 渠道级账单查询被**跳过**的时刻（生效账号冷却中，见 `runRefresh`）。
+   *
+   * 与 `billing_at` 分开记：跳过不代表拿到了新数据（`used`/`remain` 还是旧的），
+   * 但**必须**算作「这轮已经问过了」—— 否则冷却期（可到次日本地 0 点）超过 8h TTL 后，
+   * 每个聊天请求都会重新触发一轮全池刷新。
+   */
+  billing_skipped_at?: string | null;
   /** 最近一次账单查询是否成功。 */
   billing_ok: boolean;
   /** 本地成功转发次数（诊断用，**不**参与排序）。 */
@@ -51,6 +73,10 @@ export interface ChannelLedger {
   fail: number;
   /** 冷却截止（epoch ms）；0 = 未冷却。 */
   cooldown_until: number;
+  /** 当前额度窗口键（与 `prev` 配套；见 `windowKeyOf`）。 */
+  window?: string;
+  /** 上一额度窗口的最后余额；窗口切换时写入。 */
+  prev?: PrevQuota | null;
   /**
    * 按**生效账号**拆分的请求计数（ok / fail）。key 是账号池的 account key；
    * 账本主维度仍是渠道（used/冷却），账号维度只做展示与排障。
@@ -85,9 +111,11 @@ export interface AccountCount {
    *     否则回升后的消耗会被 clamp 掩盖。
    *
    * 为什么不用上游的 `size`：各渠道口径不一（loomy 的 `dailyQuota` 只在 first-login
-   * 响应里、workbuddyai 的 size 是月包 credits），拿它当分母会算出「永远 100%」。
+   * 响应里、月包型渠道的 size 是月包 credits），拿它当分母会算出「永远 100%」。
    */
   baseline?: { window: string; date: string; remain: number; at: string } | null;
+  /** 上一额度窗口的最后余额（跨窗口对比兜底用；见 `PrevQuota`）。 */
+  prev?: PrevQuota | null;
 }
 
 export interface PoolLedger {
@@ -161,58 +189,122 @@ function readAccounts(raw: unknown): Record<string, AccountCount> {
             };
           })()
         : null;
+    const prev = readPrev(rec.prev);
     out[key] = {
       ok: num(rec.ok),
       fail: num(rec.fail),
       ...(credits ? { credits } : {}),
       billing_at: typeof rec.billing_at === "string" ? rec.billing_at : null,
       billing_ok: rec.billing_ok === true,
+      ...(typeof rec.billing_skipped_at === "string" ? { billing_skipped_at: rec.billing_skipped_at } : {}),
       ...(baseline ? { baseline } : {}),
+      ...(prev ? { prev } : {}),
     };
   }
   return out;
+}
+
+/** 宽松读上一窗口余额快照（缺窗口键 / 缺余额数字都视为无记录，不阻塞账本加载）。 */
+function readPrev(raw: unknown): PrevQuota | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const window = str(rec.window);
+  if (window === "") return null;
+  const remain = rec.remain;
+  if (typeof remain !== "number" || !Number.isFinite(remain)) return null;
+  return {
+    window,
+    date: str(rec.date),
+    remain,
+    unit: str(rec.unit),
+    at: str(rec.at),
+  };
 }
 
 function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** 读盘结果按路径缓存（测试会切存储根，故缓存键带上路径）。 */
-let cache: { path: string; ledger: PoolLedger } | null = null;
+/**
+ * 账本读回结果按存储 stamp 缓存。
+ *
+ * stamp 一起记：网关与 CLI 是两个进程，都在写同一个账本。只按内容缓存会让
+ * 进程内副本永不失效 —— CLI 跑过 `model usage --refresh` 之后，网关下一次落盘会用
+ * 自己的旧副本把 CLI 写进去的账单**整文件覆盖回滚**（2026-11-08 评审指出）。
+ * 每次 `load()` 都取一次 stamp（fs 形态 = 几微秒的 stat），存储被别的进程改过就重读。
+ */
+let cache: { stamp: number; ledger: PoolLedger } | null = null;
 
-/** 惰性加载账本（文件缺失 / 损坏都退回空账本，**不阻塞**）。 */
-function load(): PoolLedger {
-  const path = poolUsagePath();
-  if (cache && cache.path === path) return cache.ledger;
-  let ledger: PoolLedger = { version: 1, channels: {} };
-  if (existsSync(path)) {
-    try {
-      const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<PoolLedger>;
-      if (raw && typeof raw === "object" && raw.channels && typeof raw.channels === "object") {
-        const merged: Record<string, ChannelLedger> = {};
-        for (const [cid, entry] of Object.entries(raw.channels)) {
-          const base = emptyChannel();
-          const rec = (entry ?? {}) as Partial<ChannelLedger>;
-          merged[cid] = {
-            used: num(rec.used),
-            size: num(rec.size),
-            remain: num(rec.remain),
-            unit: str(rec.unit),
-            billing_at: typeof rec.billing_at === "string" ? rec.billing_at : null,
-            billing_ok: rec.billing_ok === true,
-            ok: num(rec.ok),
-            fail: num(rec.fail),
-            cooldown_until: num(rec.cooldown_until),
-            accounts: readAccounts(rec.accounts),
-          };
-        }
-        ledger = { version: 1, channels: merged };
-      }
-    } catch {
-      ledger = { version: 1, channels: {} };
-    }
+/**
+ * 落盘时**先合并磁盘上的最新内容**，避免整文件覆盖掉别的进程写的条目。
+ *
+ * 合并口径：以本进程的内存副本为准（它刚被本次操作更新过），但磁盘上存在、
+ * 内存里没有的渠道补进来 —— 直接 `writeLedger(load())` 会把它们抹掉。
+ */
+/**
+ * 落盘前剪掉**已不在册**的渠道条目。
+ *
+ * 渠道包下架（如 astudio）或历史实验（`fake` / `aaa`）留下的条目永远不会再进候选，
+ * 留着只会让控制台与 `mx pool` 读到幽灵行（2026-11-15 实测 11 个）。
+ * 只剪写、不剪读：读路径要能读**任何**账本（含旧格式与测试数据）。
+ */
+function pruneUnregistered(ledger: PoolLedger): PoolLedger {
+  // 一个渠道都没注册时**不剪**：注册表还没装配（或装配失败）时照剪会把账本清空
+  if (channels().length === 0) return ledger;
+  const kept: Record<string, ChannelLedger> = {};
+  for (const [cid, entry] of Object.entries(ledger.channels)) {
+    if (hasChannel(cid)) kept[cid] = entry;
   }
-  cache = { path, ledger };
+  return { version: 1, channels: kept };
+}
+
+function loadForWrite(): PoolLedger {
+  const current = load();
+  const onDisk = normalizeLedger(poolStore().readLedger());
+  if (onDisk === null) return current;
+  for (const [cid, entry] of Object.entries(onDisk.channels)) {
+    if (!current.channels[cid]) current.channels[cid] = entry;
+  }
+  return current;
+}
+
+/** 把存储读回的原始账本规范化（不碰缓存）；读不出来返回 null。 */
+function normalizeLedger(parsed: unknown): PoolLedger | null {
+  try {
+    const raw = parsed as Partial<PoolLedger> | null;
+    if (!raw || typeof raw !== "object" || !raw.channels || typeof raw.channels !== "object") return null;
+    const merged: Record<string, ChannelLedger> = {};
+    for (const [cid, entry] of Object.entries(raw.channels)) {
+      const rec = (entry ?? {}) as Partial<ChannelLedger>;
+      const prev = readPrev(rec.prev);
+      merged[cid] = {
+        used: num(rec.used),
+        size: num(rec.size),
+        remain: num(rec.remain),
+        unit: str(rec.unit),
+        billing_at: typeof rec.billing_at === "string" ? rec.billing_at : null,
+        billing_ok: rec.billing_ok === true,
+        ...(typeof rec.billing_skipped_at === "string" ? { billing_skipped_at: rec.billing_skipped_at } : {}),
+        ok: num(rec.ok),
+        fail: num(rec.fail),
+        cooldown_until: num(rec.cooldown_until),
+        ...(typeof rec.window === "string" && rec.window ? { window: rec.window } : {}),
+        ...(prev ? { prev } : {}),
+        accounts: readAccounts(rec.accounts),
+      };
+    }
+    return { version: 1, channels: merged };
+  } catch {
+    return null;
+  }
+}
+
+/** 惰性加载账本（存储缺失 / 损坏都退回空账本，**不阻塞**）。 */
+function load(): PoolLedger {
+  const stamp = poolStore().ledgerStamp();
+  if (cache && cache.stamp === stamp) return cache.ledger;
+  const ledger = normalizeLedger(poolStore().readLedger()) ?? { version: 1, channels: {} };
+  cache = { stamp, ledger };
   return ledger;
 }
 
@@ -236,7 +328,8 @@ export function flushLedger(): void {
     saveTimer = null;
   }
   try {
-    writeJsonSecret(poolUsagePath(), load());
+    // 写前合并存储内容：别的进程（CLI）可能刚写过本进程没有的渠道条目
+    poolStore().writeLedger(pruneUnregistered(loadForWrite()));
   } catch {
     /* 写不进去不该让请求失败：账本丢了只影响排序精度 */
   }
@@ -287,11 +380,18 @@ export function noteSuccess(cid: string, accountKey?: string): void {
   scheduleSave();
 }
 
-/** 一次失败：进冷却（冷却期内得分当 0）；`accountKey` 同上。 */
+/**
+ * 一次失败：进冷却（冷却期内得分当 0）；`accountKey` 同上。
+ *
+ * `cooldownMs = 0` 表示**只记一次 fail、不动已有冷却**。此前无条件写
+ * `Date.now() + cooldownMs`，于是 `noteFailure(cid, undefined, 0)` 会把已有冷却
+ * 重置成「立刻到期」—— 与它那两处调用点（`stream.ts` / `forward.ts` 里「不发任何
+ * 可见文案」的分支）的注释描述正好相反。
+ */
 export function noteFailure(cid: string, accountKey?: string | number, cooldownMs = FAIL_COOLDOWN_MS): void {
   const entry = entryOf(load(), cid);
   entry.fail += 1;
-  entry.cooldown_until = Date.now() + cooldownMs;
+  if (cooldownMs > 0) entry.cooldown_until = Date.now() + cooldownMs;
   const key = typeof accountKey === "string" ? accountKey : undefined;
   if (key) accountEntry(entry, key).fail += 1;
   scheduleSave();
@@ -301,6 +401,7 @@ export function noteFailure(cid: string, accountKey?: string | number, cooldownM
 export function writeBilling(cid: string, credits: unknown): void {
   const total = (credits as { total?: Record<string, unknown> } | null)?.total ?? {};
   const entry = entryOf(load(), cid);
+  noteChannelWindowPrev(entry, windowKeyOf(cid));
   entry.used = num(total["used"]);
   entry.size = num(total["size"]);
   entry.remain = num(total["remain"]);
@@ -308,6 +409,9 @@ export function writeBilling(cid: string, credits: unknown): void {
   entry.billing_at = new Date().toISOString();
   entry.billing_ok = true;
   scheduleSave();
+  // 额度接口能通 = 凭据有效 → 把 `unauthorized` 复活。
+  // 早先只在重新登录时清该标记，token 临时失效（上游抖动 / 别处续期）就永远卡在「异常」。
+  reviveAfterBilling(cid);
 }
 
 /** 标记一次账单查询尝试（失败时只更新时刻，保留上一次的用量数字）。 */
@@ -315,6 +419,17 @@ function noteBillingAttempt(cid: string, ok: boolean): void {
   const entry = entryOf(load(), cid);
   entry.billing_at = new Date().toISOString();
   entry.billing_ok = ok;
+  scheduleSave();
+}
+
+/**
+ * 记下「渠道级账单查询被跳过」（生效账号冷却中）—— 见 `billing_skipped_at` 的 why。
+ *
+ * 不动 `billing_at` / `billing_ok`：这次确实没拿到新数据，把 `billing_ok` 置真会撒谎。
+ */
+function noteBillingSkipped(cid: string): void {
+  const entry = entryOf(load(), cid);
+  entry.billing_skipped_at = new Date().toISOString();
   scheduleSave();
 }
 
@@ -331,6 +446,47 @@ function windowKeyOf(cid: string): string {
     return `w:${resetsAt}`;
   }
   return `d:${localDate()}`;
+}
+
+/**
+ * 渠道级：额度窗口切换时，把**上一窗口的最后余额**留作跨窗口对比的兜底口径。
+ *
+ * 为什么需要：有的渠道上游不回报「这次签到发了多少」，只能拿「上一窗口结束时剩多少」
+ * 与「这一窗口现在剩多少」对比（用户指定的兜底）。不记下来就没有可比。
+ */
+function noteChannelWindowPrev(entry: ChannelLedger, window: string): void {
+  if (entry.window === undefined) {
+    entry.window = window;
+    return;
+  }
+  if (entry.window === window) return;
+  // 只有**上次查询成功**的余额才值得留：查询失败时 `remain` 是前一次的残留（或 0），
+  // 拿它当「上一窗口最后余额」会让跨窗口对比算出虚假奖励
+  if (entry.billing_ok) {
+    entry.prev = {
+      window: entry.window,
+      date: localDate(),
+      remain: entry.remain,
+      unit: entry.unit,
+      at: entry.billing_at ?? new Date().toISOString(),
+    };
+  }
+  entry.window = window;
+}
+
+/** 账号级：同上（账号条目没有独立窗口键，用基线里的窗口）。 */
+function noteAccountWindowPrev(entry: AccountCount, window: string): void {
+  const prevWindow = entry.baseline?.window;
+  if (prevWindow === undefined || prevWindow === window) return;
+  if (entry.billing_ok) {
+    entry.prev = {
+      window: prevWindow,
+      date: entry.baseline?.date ?? localDate(),
+      remain: entry.credits?.remain ?? 0,
+      unit: entry.credits?.unit ?? "",
+      at: entry.billing_at ?? new Date().toISOString(),
+    };
+  }
 }
 
 /**
@@ -362,6 +518,9 @@ function pickBaseline(
 export function writeAccountBilling(cid: string, key: string, credits: unknown): void {
   const total = (credits as { total?: Record<string, unknown> } | null)?.total ?? {};
   const entry = accountEntry(entryOf(load(), cid), key);
+  const window = windowKeyOf(cid);
+  // 先记上一窗口末值（noteAccountWindowPrev 会把当前 credits 搬进 entry.prev）
+  noteAccountWindowPrev(entry, window);
   const remain = num(total["remain"]);
   entry.credits = {
     remain,
@@ -370,7 +529,7 @@ export function writeAccountBilling(cid: string, key: string, credits: unknown):
     unit: str(total["unit"]),
     remain_percent: num(total["remain_percent"]),
   };
-  entry.baseline = pickBaseline(entry.baseline, remain, windowKeyOf(cid));
+  entry.baseline = pickBaseline(entry.baseline, remain, window);
   entry.billing_at = new Date().toISOString();
   entry.billing_ok = true;
   scheduleSave();
@@ -479,13 +638,15 @@ async function refreshAccountCredits(
     const credential = normalizeCredentialShape(raw);
     if (Object.keys(credential).length === 0) continue;
     try {
-      const credits = await runInChannel(cid, () =>
-        channel.billing.fetchCredits({ refreshOn401: false, credential }),
+      // 落点限在该账号自己的文件：凭据过期就地续期并写回这里，不顶掉 live 的生效凭据
+      const credits = await runForAccountCredential(cid, account.key, () =>
+        channel.billing.fetchCredits({ refreshOn401: true, credential }),
       );
       writeAccountBilling(cid, account.key, credits);
+      clearBillingFailure(`${cid}/${account.key}`);
     } catch (err) {
       noteAccountBillingAttempt(cid, account.key, false);
-      logger(`account billing query failed (${cid}/${account.key.slice(0, 8)}…): ${String(err)}`);
+      noteBillingFailure(`${cid}/${account.key}`, String(err), logger);
     }
   }
 }
@@ -540,7 +701,7 @@ export async function queryAccountCredits(cid: string): Promise<AccountCreditsRo
       continue;
     }
     try {
-      const credits: unknown = await runInChannel(cid, () =>
+      const credits: unknown = await runForAccountCredential(cid, account.key, () =>
         channel.billing.fetchCredits({ refreshOn401: false, credential }),
       );
       const total = (credits as { total?: Record<string, unknown> } | null)?.total ?? {};
@@ -607,6 +768,212 @@ export function lastKnownRemain(cid: string, key: string): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+/**
+ * 上一额度窗口结束时的余额（跨窗口对比的兜底口径）；没有则 `null`。
+ *
+ * 用途：渠道不回报「这次签到发了多少」时，用「上一窗口最后剩多少」对比「现在剩多少」
+ * 推算入账额（用户指定的兜底）。只读本地快照，零网络开销。
+ */
+export function prevRemainOf(cid: string, accountKey?: string): PrevQuota | null {
+  const entry = load().channels[cid];
+  if (!entry) return null;
+  if (accountKey !== undefined) return entry.accounts[accountKey]?.prev ?? null;
+  return entry.prev ?? null;
+}
+
+/**
+ * 渠道**账号池**的剩余额度之和 —— 跨渠道选路的排序主键（见 `pool-targets.poolCandidates`）。
+ *
+ * 为什么按「剩余」而不是「总额度」：要的是「谁还有货谁先出」，总额度大但已烧光的渠道
+ * 不该排在前面。为什么能跨渠道相加：各家单位不同（积分 / credits / USD），这个和只是
+ * **近似**的优先级信号 —— 真正的额度判据仍在渠道内（`account-rotate.ts` 的账单核查）。
+ *
+ * 冷却中的账号按 0 计：账本里的 `remain` 是上次账单的快照，额度耗尽时不会立刻改写
+ * （`noteAccountQuotaExhausted` 只标 `cooldown`），直接用会把已烧光的账号算成还有货。
+ *
+ * `null` = 这个渠道没有任何账号查过额度（新登录 / 无额度能力）—— 排序时排最后，
+ * 但**不被剔除**：没查过不等于没货。
+ */
+export function totalRemainOf(cid: string): number | null {
+  const entry = load().channels[cid];
+  if (!entry) return null;
+  let cooling: Set<string> | null = null;
+  let sum = 0;
+  let known = false;
+  for (const [key, account] of Object.entries(entry.accounts)) {
+    const remain = account.credits?.remain;
+    if (typeof remain !== "number" || !Number.isFinite(remain)) continue;
+    known = true;
+    if (cooling === null) {
+      cooling = new Set<string>();
+      try {
+        for (const account of readIndex(cid).accounts) {
+          if (isAccountCooling(account)) cooling.add(account.key);
+        }
+      } catch {
+        // 账号池读不出来（未注册 / 文件损坏）时不过滤，按账本原值算
+      }
+    }
+    sum += cooling.has(key) ? 0 : remain;
+  }
+  if (known) return sum;
+  // 没查过按账号的余额（新登录 / 只刷过渠道级账单）时回落到**渠道级 remain** ——
+  // 渠道级查询查的就是生效账号的额度，量纲一致，可当近似值用。
+  const channelRemain = entry.remain;
+  return Number.isFinite(channelRemain) && channelRemain > 0 ? channelRemain : null;
+}
+
+// ── 渠道速度（路由优先级用）────────────────────────────────────────────────────
+
+/**
+ * 速度采样窗口：**最近 3 个有日志的日期**（今天 + 前两天）。
+ *
+ * 为什么不是「只看今天」：请求量低的渠道一天可能只有 2 条请求（实测 qodercn 11-06 只有 2 条，
+ * 算不出 TPS），而它在前两天有 5 条、速度 85–95 t/s —— 只看当天等于对慢渠道视而不见。
+ * 3 天是「够新又能攒够样本」的折中；更早的日志（如 11-02 那批 glm 请求）已被上游换模型，
+ * 混进来反而会污染当前判断。
+ *
+ * 为什么按天遍历而不是「全局最近 N 条」：忙的渠道一天的量就上千，全局窗口会被它占满，
+ * 慢渠道（一天几条）直接被挤出样本集（实测 qodercn 11-05 的 3 条就被 500 条窗口挡在外面）。
+ * 扫描读的是每天的**尾部 1MB**（与 `queryAccessLogs` 同量），不做排序 / 统计 / 缓存。
+ */
+export const SPEED_WINDOW_DAYS = 3;
+
+/** 速度缓存时长：到期才重扫日志（3 天窗口实测 20–30ms，60s 一次可忽略）。 */
+export const SPEED_TTL_MS = 60_000;
+
+/** 参考速率（tokens/s）：等于它时速度系数为 1，快于它按比例上浮、慢于它下浮。 */
+export const SPEED_REF_TPS = 100;
+
+/** 速度系数下限：再慢也只压到 0.25 —— 渠道慢不代表没货，压太狠会把唯一有货的渠道挤到最后。 */
+export const SPEED_MIN_FACTOR = 0.25;
+
+/**
+ * 少于这个样本数不罚。
+ *
+ * 取 2 而不是 3：请求量低的渠道一天可能只有 2 条请求（实测 qodercn 11-06 只有 2 条），
+ * 门槛 3 会让**最需要被识别的慢渠道**永远进不了样本。速度只是先验、且有 0.25 下限兜底，
+ * 两条的误差不会把排序带偏到不可接受；反过来「测不到就不罚」才是真正的失效。
+ */
+export const SPEED_MIN_SAMPLES = 2;
+
+interface SpeedSample {
+  sum: number;
+  count: number;
+}
+
+/** 一次速度快照：按（渠道 × 模型）与按渠道两个维度聚合。 */
+interface SpeedSnapshot {
+  at: number;
+  /** 键 = `<cid>/<模型>`。 */
+  byModel: Map<string, SpeedSample>;
+  byChannel: Map<string, SpeedSample>;
+}
+
+let speedCache: SpeedSnapshot | null = null;
+
+/**
+ * 扫当天日志建立速度快照（进程内 TTL 缓存）。
+ *
+ * 为什么读日志而不是在请求结束时记账：TPS 要等响应结束（`generateMs` + usage）才拿得到，
+ * 而路由发生在请求**入口** —— 只能拿「最近一段时间的实测」当先验。读日志是唯一
+ * 不侵入转发链路的数据源（`http` 层拿不到 `generateMs`，它在 `runtime/log-store` 里才算得齐）。
+ */
+function speedSnapshot(now = Date.now()): SpeedSnapshot {
+  const hit = speedCache;
+  if (hit !== null && now - hit.at < SPEED_TTL_MS) return hit;
+  const byModel = new Map<string, SpeedSample>();
+  const byChannel = new Map<string, SpeedSample>();
+  try {
+    const aggregate = aggregateModelTps(listAccessDates().slice(0, SPEED_WINDOW_DAYS));
+    for (const [key, sample] of aggregate.byModel) byModel.set(key, sample);
+    for (const [key, sample] of aggregate.byChannel) byChannel.set(key, sample);
+  } catch {
+    // 日志读不出来（权限 / 轮转）→ 当「没有速度数据」，不罚任何渠道
+  }
+  speedCache = { at: now, byModel, byChannel };
+  return speedCache;
+}
+
+/** 测试用：清掉速度缓存（换存储根 / 写日志后必须调，否则读到旧快照）。 */
+export function resetSpeedCacheForTest(): void {
+  speedCache = null;
+}
+
+/**
+ * 某渠道（可选：某模型）的实测平均速率与样本数；样本不足或没数据返回 `null`。
+ *
+ * 优先用**该模型**的样本（同一渠道不同模型速度可能差很多），不足时回落渠道级 ——
+ * 渠道级样本更多、更稳，比直接放过更合理。
+ */
+export function speedOf(cid: string, model?: string): { avgTps: number; samples: number } | null {
+  const snap = speedSnapshot();
+  const pick = (sample: SpeedSample | undefined): { avgTps: number; samples: number } | null =>
+    sample === undefined || sample.count < SPEED_MIN_SAMPLES
+      ? null
+      : { avgTps: sample.sum / sample.count, samples: sample.count };
+  if (model !== undefined) {
+    const specific = pick(snap.byModel.get(`${cid}/${model}`));
+    if (specific !== null) return specific;
+  }
+  return pick(snap.byChannel.get(cid));
+}
+
+/**
+ * 速度系数（1 = 不罚；最低 `SPEED_MIN_FACTOR`）。
+ *
+ * 没有数据 / 样本不足 → 1（**不罚**）：慢的判据要有量，宁可放过一个慢渠道，
+ * 也不要因为「没测到」把有货的渠道压到最后。
+ */
+export function speedFactorOf(cid: string, model?: string): number {
+  const speed = speedOf(cid, model);
+  if (speed === null) return 1;
+  return Math.min(1, Math.max(SPEED_MIN_FACTOR, speed.avgTps / SPEED_REF_TPS));
+}
+
+/**
+ * 可靠性系数（1 = 无样本 / 全成功；越低越不可靠）。
+ *
+ * 口径是成功率的拉普拉斯平滑估计 `(ok + 1) / (ok + fail + 1)`：
+ * - 没有样本 → 1（**不罚**）：新登录的渠道不该因为「还没被用过」就排最后；
+ * - 全成功 → 趋近 1；
+ * - 从未成功（ok=0、fail=4）→ 1/5，把「额度最多」的虚高优先级压下来。
+ *
+ * 为什么必须纳入：`ok/fail` 是**本地实测**，额度只是上游快照 —— 一个只剩额度、
+ * 却从未跑通过的渠道会一直排在首位，每个请求先白撞一次（本地 ok/fail 计数
+ * 正是为暴露这类「额度好看却 fail 连连」的渠道）。
+ */
+export function reliabilityFactorOf(cid: string): number {
+  const entry = load().channels[cid];
+  if (!entry) return 1;
+  return (entry.ok + 1) / (entry.ok + entry.fail + 1);
+}
+
+/**
+ * 渠道**有效优先级** = 剩余额度 × 速度系数 × 可靠性系数 × 渠道权重；没有额度数据返回 `null`
+ * （排序时排最后）。
+ *
+ * 为什么是乘法：额度差异常常是数量级（0 vs 5000），速度差异只有几倍 ——
+ * 相加会让速度几乎不起作用，相除会让慢渠道彻底失去竞争力。乘法让「慢」
+ * 表现为「同样的货，优先级打折」，且只影响同一量级内的排序。
+ * 可靠性同理：`ok/fail` 是最直接的先验，从未跑通的渠道不该压过有实测的。
+ *
+ * `priorityWeight` 由渠道在 `ChannelConfig` 自己声明（共享层不许有渠道知识）：
+ * 额度**每天清零**的渠道声明 >1，好让易失额度先被消耗掉，能攒的额度留到最后。
+ */
+export function priorityOf(cid: string, model?: string): number | null {
+  const remain = totalRemainOf(cid);
+  if (remain === null) return null;
+  return remain * speedFactorOf(cid, model) * reliabilityFactorOf(cid) * weightOf(cid);
+}
+
+/** 渠道声明的选路权重（缺省 1；渠道未注册或没声明都给 1）。 */
+function weightOf(cid: string): number {
+  if (!hasChannel(cid)) return 1;
+  const w = getChannel(cid).config.priorityWeight;
+  return typeof w === "number" && Number.isFinite(w) && w > 0 ? w : 1;
+}
+
 /** 是否需要刷新账单（任一渠道从没查过，或已过 TTL）。 */
 export function needsBillingRefresh(now = Date.now()): boolean {
   const ledger = load();
@@ -614,8 +981,13 @@ export function needsBillingRefresh(now = Date.now()): boolean {
     if (!channelCapabilities(channel.config).billing) continue;
     const cid = channel.config.cid;
     const entry = ledger.channels[cid];
-    if (!entry || !entry.billing_at) return true;
-    const at = Date.parse(entry.billing_at);
+    if (!entry) return true;
+    // 渠道级查询被跳过（生效账号冷却中）也刷新 `billingAt`：否则这个渠道的
+    // `billing_at` 会停在冷却开始那一刻，冷却可长达次日本地 0 点（远超 8h TTL）——
+    // 过 TTL 后**每个聊天请求**都会触发一轮全池账单刷新（2026-11-08 评审指出）。
+    const stamp = entry.billing_at ?? entry.billing_skipped_at ?? null;
+    if (!stamp) return true;
+    const at = Date.parse(stamp);
     if (!Number.isFinite(at) || now - at > BILLING_TTL_MS) return true;
   }
   return false;
@@ -633,6 +1005,24 @@ export interface RefreshResult {
   skipped: string[];
 }
 
+/**
+ * 账单失败的**同因去重**：同一 scope 连续同一条错误只写一次，成功后清账。
+ *
+ * 为什么：未登录 / 凭据失效这类常态原因会持续好几天，每轮（默认 3 分钟）写一行会把
+ * 错误日志淹掉 —— 实测 14 天里 error.log 有 98% 是账单噪音（2026-11-15）。
+ */
+const billingFailureSeen = new Map<string, string>();
+
+function noteBillingFailure(scope: string, error: string, logger: (m: string) => void): void {
+  if (billingFailureSeen.get(scope) === error) return;
+  billingFailureSeen.set(scope, error);
+  logger(`billing query failed (${scope}): ${error}`);
+}
+
+function clearBillingFailure(scope: string): void {
+  billingFailureSeen.delete(scope);
+}
+
 /** 查一轮账单（并行；不抛错，失败只记在返回值与账本里）。 */
 async function runRefresh(logger: (m: string) => void): Promise<RefreshResult> {
   // 无额度能力的渠道没有账单可刷，直接排除（不记成功也不记失败）
@@ -641,6 +1031,19 @@ async function runRefresh(logger: (m: string) => void): Promise<RefreshResult> {
   const settled = await Promise.allSettled(
     list.map(async (channel: Channel) => {
       const cid = channel.config.cid;
+      // 未登录的渠道不刷账单：没账号、或不想走这个渠道，是用户自己的选择 —— 网关不必
+      // 每轮拿一次网络请求加一行失败日志去提醒（谁没登录在控制台账号池里一眼可见）。
+      const loggedIn = runInChannel(cid, () => {
+        // 契约违例（测试桩等没有 cred.load）：不拦，按「已登录」继续查
+        if (typeof channel.cred.load !== "function") return true;
+        try {
+          channel.cred.load();
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (!loggedIn) return { cid, credits: undefined, skipped: true };
       // 生效账号在冷却中：额度要等窗口刷新才会变，渠道级查询（= 查生效账号）跳过；
       // 但**兄弟账号照查**（`refreshAccountCredits` 会逐个跳过冷却中的账号）。
       const cooling = runInChannel(cid, () => activeAccountCooling(cid));
@@ -672,9 +1075,12 @@ async function runRefresh(logger: (m: string) => void): Promise<RefreshResult> {
     if (item.status === "fulfilled") {
       if (item.value.skipped) {
         result.skipped.push(cid);
+        // 跳过也要留「这轮问过了」的痕迹，否则 TTL 判据会一直为真（见 billing_skipped_at）
+        noteBillingSkipped(cid);
         return;
       }
       writeBilling(cid, item.value.credits);
+      clearBillingFailure(cid);
       // 账单显示 0 → 提前进冷却（见 markCooldownIfExhausted 的 why）
       markCooldownIfExhausted(list[index]!, cid, item.value.credits);
       result.refreshed.push(cid);
@@ -682,7 +1088,7 @@ async function runRefresh(logger: (m: string) => void): Promise<RefreshResult> {
       const error = String(item.reason);
       noteBillingAttempt(cid, false);
       result.failed.push({ cid, error });
-      logger(`billing query failed (${cid}): ${error}`);
+      noteBillingFailure(cid, error, logger);
     }
   });
   flushLedger();
@@ -755,8 +1161,10 @@ export function startBillingRefresher(logger: (m: string) => void = () => {}): v
     void refreshBilling(logger)
       .then((result) => {
         if (result.refreshed.length > 0 || result.failed.length > 0) {
+          // `info:` 前缀 = 这行是心跳、不是故障：具体失败原因已由同因去重逐条给出，
+          // 汇总行每轮都写，若进错误日志就又把日志淹了
           logger(
-            `billing refreshed (${result.refreshed.length} ok, ${result.failed.length} failed)` +
+            `info: billing refreshed (${result.refreshed.length} ok, ${result.failed.length} failed)` +
               (result.failed.length > 0
                 ? `: ${result.failed.map((f) => f.cid).join(", ")}`
                 : ""),

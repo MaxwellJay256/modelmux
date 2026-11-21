@@ -5,18 +5,54 @@
 # （CI 用 fetch-depth: 0）、`npm ci` 装平台原生依赖、而开发工作树自带未提交改动与陈旧
 # 产物：直接在工作树上跑，测的就不是「待推的那个提交」。故门禁总是 clone 到干净目录再跑。
 #
-# 用法：bash scripts/gate.sh [--quiet] [分支名]
+# 用法：bash scripts/gate.sh [--quiet] [分支名] [待测提交 sha]
 #   分支名：待测分支（默认 = 当前 HEAD 分支）。pre-push 会显式传入。
-# 环境变量：GATE_DIR（默认 /tmp/modelmux-gate）、GATE_BASE（默认 origin/main）
+#   待测 sha：精确复现「要推的那个提交」——它可能不在任何 ref 上（游离 HEAD 工作树推
+#             `HEAD:<分支>` 时，clone 只带 ref 可达的对象，必须按 sha 单独 fetch）。
+# 环境变量：GATE_DIR（指定门禁落点；缺省每次运行各用独立临时目录）、
+#           GATE_BASE（默认 origin/main）、GATE_KEEP（=1 成功也保留现场，缺省失败才留）
 # 退出码：0 = 通过；非 0 = 未通过（输出里会指出失败步骤）。
 set -euo pipefail
 
+# —— 摘掉 git 给 hook 注入的仓库定位变量 ——
+#
+# `git push` 会把 `GIT_DIR`（指向**当前 worktree** 的 git 目录）等变量注入 pre-push，
+# 它们被 `bash -lc` 起的子 shell 继承，使下面的 `git clone` 用 worktree 的 ref 视图 ——
+# clone 出的仓库**缺少待推的那个分支**，`git checkout origin/<分支>` 于是报
+# `fatal: '...' is not a commit`，门禁在 worktree 里对**本地新建、尚未推送**的分支恒失败
+# （实测：带 GIT_DIR 时 clone 出 10 个 ref，其中没有任何 worktree 当前分支；
+# 隔离后同一 clone 带上了该分支）。
+#
+# 为什么手动 `npm run gate` 发现不了：交互 shell 没有这些变量，同一条命令能通过。
+#
+# 本脚本自己从 cwd 定位仓库（`--git-common-dir`），故这些变量只会误导它。
+# 只摘「仓库/工作树/索引在哪」这一类；`GIT_EXEC_PATH` 等保留（无害且有助于找到子命令）。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
+      GIT_PREFIX GIT_QUARANTINE_PATH GIT_IMPLICIT_WORK_TREE
+
 QUIET=0
 if [ "${1:-}" = "--quiet" ]; then QUIET=1; shift; fi
-# 第一个非 --quiet 的参数是待测分支
+# 第一个非 --quiet 的参数是待测分支，第二个是待测提交 sha（pre-push 传入）
 BRANCH="${1:-}"
+TEST_SHA="${2:-}"
 
-GATE="${GATE_DIR:-/tmp/modelmux-gate}"
+# —— 门禁落点：缺省每次运行各用独立目录 ——
+#
+# 为什么不能固定：多个会话（多个 agent、多次推送）会在同一台机器上并跑门禁，固定路径会
+# 互相 `rm -rf` + clone 覆盖 —— 实测 2026-11-13 两边一起跑：一方 `rm` 报
+# `Device or resource busy`，另一方的 `npm ci` 被抽掉 node_modules 报
+# `TAR_ENTRY_ERROR ENOENT`，双双失败；11-08 也在系统 temp 里留下 9 个手造后缀的
+# `modelmux-gate*` 残留（`modelmux-gate2`…`-push-8629`）。临时目录用完即删，失败时
+# 保留现场便于排查；GATE_DIR 可强制指定固定落点（此时由调用方保证不并发）。
+if [ -n "${GATE_DIR:-}" ]; then
+  GATE="$GATE_DIR"
+  GATE_KEEP=1
+else
+  GATE="$(mktemp -d "${TMPDIR:-/tmp}/modelmux-gate.XXXXXXXX")"
+  GATE_KEEP="${GATE_KEEP:-0}"
+fi
+trap 'if [ "$GATE_KEEP" = "0" ]; then rm -rf "$GATE" 2>/dev/null || true; fi' EXIT INT TERM
 BASE_REF="${GATE_BASE:-origin/main}"
 
 # —— 定位「主工作树」——
@@ -30,9 +66,21 @@ main_repo=$(dirname "$common_dir")
 
 if [ -z "$BRANCH" ]; then
   BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  # 游离 HEAD 解析出来是字面量 "HEAD"——拿去 checkout 只会得到
+  # 「'HEAD' is not a valid branch name」。测不了就明确报错，不猜一个分支。
+  if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+    echo "[gate] 游离 HEAD 且未指定分支——无法确定待测对象" >&2
+    exit 1
+  fi
 fi
 
-[ "$QUIET" = 0 ] && echo "[gate] 克隆 $main_repo → $GATE，切到分支 $BRANCH，然后 npm ci → npm test"
+if [ "$QUIET" = 0 ]; then
+  if [ -n "$TEST_SHA" ]; then
+    echo "[gate] 克隆 $main_repo → $GATE，按提交 $TEST_SHA 精确复现，然后 npm ci → npm test"
+  else
+    echo "[gate] 克隆 $main_repo → $GATE，切到分支 $BRANCH，然后 npm ci → npm test"
+  fi
+fi
 
 # —— 第 1 步：CI 等价的完整测试 ——
 # 固定 UTF-8 locale：clone 出来的子树里同样要能正确输出中文。
@@ -42,15 +90,32 @@ if ! bash -lc "
   rm -rf '$GATE'
   git clone --no-hardlinks -q '$main_repo' '$GATE'
   cd '$GATE'
-  # 测**待推分支**而不是 clone 的默认分支：本地 clone 会把所有分支带成
-  # origin/<branch>，这里切过去 —— 否则推 A 分支却测了 B 分支的内容。
-  git checkout -q -B '$BRANCH' 'origin/$BRANCH'
+  if [ -n '$TEST_SHA' ]; then
+    # 精确复现「要推的那个提交」：它可能不在任何 ref 上（游离 HEAD 工作树推 HEAD:<分支>），
+    # clone 只带 ref 可达的对象，故按 sha 单独 fetch（源仓库需 uploadpack.allowAnySHA1InWant，
+    # 由 scripts/setup-git-hooks.mjs 接线）。
+    git fetch -q origin '$TEST_SHA'
+    git checkout -q '$TEST_SHA'
+  else
+    # 测**待推分支**而不是 clone 的默认分支：本地 clone 会把所有分支带成
+    # origin/<branch>，这里切过去 —— 否则推 A 分支却测了 B 分支的内容。
+    git checkout -q -B '$BRANCH' 'origin/$BRANCH'
+  fi
   npm ci --no-fund --no-audit
   npm test
 "; then
+  # 失败时保留现场，便于排查（自动创建的临时目录缺省用完即删）
+  if [ "$GATE_KEEP" = "0" ]; then
+    GATE_KEEP=1
+    echo "[gate] 现场保留在 $GATE" >&2
+  fi
   echo "[gate] ✗ 测试未全绿 —— 与 CI 等价的门禁拦截（本地修完再推）" >&2
   exit 1
 fi
 [ "$QUIET" = 0 ] && echo "[gate] npm test 通过"
+
+# 门禁回执：记下「刚被证绿的那个 HEAD」，供 scripts/pr-create.mjs 消费 ——
+# PR 入口据此拒绝「没测过 / 测的不是当前 HEAD」的分支，又不重复跑一遍全量门禁。
+printf '%s %s\n' "$(git -C "$GATE" rev-parse HEAD)" "$(date +%s)" > "$common_dir/modelmux-gate-stamp"
 
 echo "[gate] ✓ 全绿，可推送"

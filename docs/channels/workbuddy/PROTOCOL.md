@@ -5,8 +5,8 @@
 > `reference/Sliverkiss_CodeBuddy2api`（Python，下称 **sliver**）、
 > `reference/workbuddy2api-panel`（Go，下称 **panel**）、
 > `reference/dsh-workbuddy-connect`（TypeScript，下称 **dsh**）；
-> 以及 `ardeyouxipianyi_workbuddy2api-hub`（clone 在**国际版** `workbuddyai/reference/` 下，
-> 与 `workbuddyai` 共用一套抓包结论，见 [`workbuddyai/PROTOCOL.md`](../workbuddyai/PROTOCOL.md)）。
+> 以及 `ardeyouxipianyi_workbuddy2api-hub`（与已移除的国际版渠道共用一套抓包结论，
+> 见其协议存档 git 历史；参考实现 clone 目录随渠道移除一并清理）。
 > 国内版桌面端**无独立抓包**：版本号与 UA 维持参考实现原值（5.5.6 / CLI 2.137.1），不凭猜测改。
 > 逐条证据等级见各条标注（`[实测]` / `[代码]` / `[推断]` / `[参考]`）。
 
@@ -22,11 +22,15 @@
 | **登录**的 Origin / Referer | `https://codebuddy.cn`（+`/`）—— 与 chat 侧**不同**（少 `www`），见 §2.1 与 §7.3 V3 |
 | Accept-Language | `zh-CN` |
 
-身分头族、会话头族、链路族与设备指纹口径同 `workbuddyai`（见其 PROTOCOL.md §2-§3），
+身分头族、会话头族、链路族与设备指纹口径见 workbuddyai 协议存档（git 历史，渠道已移除），
 仅端点 / 域 / 版本三元组按上表替换。请求体归一化管线也完全一致（其 §5），
 本包 `src/upstream.ts::buildChatBody` 是同一份实现的两个副本（两渠道共用一套协议）。
 
 ## 1.1 模型目录端点
+
+**对外暴露范围**：随包 `models.json` 给 `glm-5.3-flash` 标了 `hidden` —— 网关里
+glm 已移出对外家族，本渠道只供 `deepseek-v4.1-flash`。隐藏集合由共享层
+`hiddenModelIds()` 并集读用户表与随包快照（读不到即抛错），目录数据照常保留。
 
 | 端点 | 用途 | 实测 |
 | --- | --- | --- |
@@ -44,15 +48,83 @@
   故一律用 `buildChatHeaders()`。
 - 拉到的目录落盘到 `<MODELMUX_HOME>/workbuddy/cache/models.json`。
 - **倍率在 `models[]` 元数据的 `credits` 字段**（形如 `"x0.34 credits"`），
-  与 workbuddyai 同一 `/v3/config` 端点、同一口径；实测 19 条中 18 条有值
+  与国际版（已移除）同一 `/v3/config` 端点、同一口径；实测 19 条中 18 条有值
   （`x0.00` 视为免费）。解析见 `catalog.ts` 的 `parseCreditsRate`，
-  产物经共享层 `model_info.multiplier` 下发前端。
+  产物经共享层 `PoolModelMeta.multiplier` 下发前端。
 - **目录是并发双探 + 合并**：`/v3/config`（主路）与企业窄表（次路）并发发起，
   同 id 以主路为准、次路只补缺（口径抄 go `internal/upstream/client.go:1281-1330`
   与 `:1336-1357`）。`[参考]`
 - **非对话条目不入目录**：`nes-` / `completion-` / `codewise-` 前缀的条目列出来也
   选不中（选中后上游回 `code=11102`），故一律挡掉（go
   `internal/upstream/client.go:1470-1473`）。`[参考]`
+- **`data.models[]` 是完整规格表，不只是名单**（实测 2026-11-14：61 条）。
+  `agents[].models` 只是裸 id 字符串数组（cli agent 17 个），规格全在顶层 `data.models[]`，
+  单条字段：`id` / `name` / `descriptionZh` / `descriptionEn` / `credits` /
+  `maxInputTokens` / `maxOutputTokens` / `maxAllowedSize` /
+  `contextWindow{defaultLength, supportedLengths}` / `reasoning{canDisableThinking,
+  defaultEffort, supportedEfforts}` / `relatedModels` / `supportsImages` /
+  `supportsReasoning` / `supportsToolCall` / `temperature` / `vendor` / `aliases` /
+  `isDefault` / `onlyReasoning` / `iconUrl`。
+- **上下文窗口是分档结构**：`contextWindow.supportedLengths` 实测三档
+  `300000 / 600000 / 1000000`，`defaultLength` 是 `300000`——上游默认按 30 万走，
+  1M 是最大档（`maxAllowedSize`）；对外口径按 1M 报没有错，但请求超 30 万时上游
+  行为取决于档位协商，未实测。
+- **DeepSeek 条目全表**（实测 2026-11-14，`credits` 为积分倍率）：
+
+  | id | credits | maxInput | maxOutput | supportedLengths | efforts |
+  | --- | --- | --- | --- | --- | --- |
+  | `deepseek-v4.1-flash` | x0.11 | 1,000,000 | 128,000 | 300k / 600k / 1M | low/high/max |
+  | `deepseek-v4-pro` | x0.51 | 1,000,000 | 128,000 | 300k / 600k / 1M | high/xhigh |
+  | `deepseek-v4-flash` | x0.17 | 1,000,000 | 50,000 | 300k / 1M | high/xhigh |
+  | `deepseek-v3-2-volc` | x0.29 | 96,000 | 32,000 | - | - |
+  | `deepseek-v3-1-volc` / `-lkeap` / 裸 | x0.52 | 96,000 | 32,000（lkeap 128,000） | - | - |
+  | `deepseek-v3-0324-lkeap` | x0.52 | 112,000 | 16,000 | - | - |
+  | `deepseek-r1-0528(-lkeap)` | - | 96,000 | 16,000 / 8,192 | - | - |
+  | `deepseek-v3-0324` | x0.52 | 96,000 | 8,192 | - | - |
+  | `deepseek-v3-0324-taco-completion` | - | - | 256 | - | - |
+
+- **促销字段**：`data.modelPromotions[]` 携带 DeepSeek 时段折扣（`ds-discount-202608`
+  覆盖 v4 系含未在 cli 名单的 `-ioa` 变体，非高峰 5 折）；`data.modelTiers[]` 的
+  订阅优先集合（`tier-standard-2026q3`）只含 glm / kimi，不含 DeepSeek。
+- **缓存命中率（deepseek-v4.1-flash）**：usage 两套风格全给（`prompt_cache_hit_tokens` +
+  `miss` + `prompt_tokens_details.cached_tokens` + `cache_read_input_tokens` 等），14 天
+  全量加权命中率实测 **96.9%**（4123/4227 条带缓存字段；口径见
+  [CACHE-HIT-RATE.md](../../CACHE-HIT-RATE.md) §5.1 / §6）。
+
+- **glm-5.3-flash 供给实测（2026-11-14）**：目录条目 `maxInputTokens: 1000000` /
+  `maxOutputTokens: 131072` / `credits x0.08`（`/v3/config` 的 `models[]`）。
+  覆盖 v4 系含未在 cli 名单的 `-ioa` 变体，非高峰 5 折）；`data.modelTiers[]` 的
+  订阅优先集合（`tier-standard-2026q3`）只含 glm / kimi，不含 DeepSeek。
+- **响应顶层结构**（实测 2026-11-14，61,600 字节）：`code` / `msg` / `requestId` / `data`。
+  `data` 下 22 块，键树（标量为省略，`(n)` 为数组长度）：
+
+  ```text
+  agents[1]        {commands[], description, instructions, modelTags[], models[](裸 id), name, tags[], tools[](裸 id)}
+  models[61]       规格条目，字段为按条目可选的并集（见上）
+  modelPromotions[6]  {id, kind, modelIds[], badge{color,icon,label}, discount{discountedCredits,displayMode,factor}, enabled, hover{action{labelZh,type},textZh}, priority, schedule{daily[{start,end}],timezone}}
+  modelTiers[1]    {id, tier, modelIds[], requiredUserType, priority, enabled, trackKey, badge{label}, hover{action{labelEn,labelZh,type},textEn,textZh}}
+  completion       {currentFileMaxLines, jumpToHere{instructions, model, models[], userMessageInstruction, variables[]}, maxInputCharacters, maxInputTokens, nesPredictionMaxLines, sensitivity, suffixPercent}
+  config           {InspirationCodeRule, creditPurchaseActions{6004|6005|14018{labelEn,labelZh,showButton,url}}, limitHint, limitHintCN, mcpSchemaUrl, playbookBaseUrl, skillSecurityAppKey, skillhubKey}
+  featureToggles   {SupportHttpsAgentProxy, disabledTerminalCheck}
+  integrations.builtins  {anydev, cloudStudio, eop, lighthouse, supabase, tcb}（布尔）
+  productFeatures  约 100 个布尔特性开关（键集随上游变，不在文档枚举）
+  productFeaturesConfig  {BuddyOnePrompt, KnowledgeSearch{enabledSourceTypes[]}, ModelRateLimitCap{lines[{allowPaidSwitch,displayName,freeId,paidId}]}, ModelTrialBanner{banners[{firstUseTimeKey,modelId,targetModelId,trialDays}]}}
+  telemetry        {report{model{enabled}, standard{enabled, reportCodeSnippet}}, tracing{enabled}}
+  tokenUsageThresholds  {compact{emergency, modelOverrides{deepseek}}, request{emergency}, summary{emergency}}
+  endpoint / enterpriseId / defaultVideoModel / links{helpLink}
+  builtInMarketPlugins[0] / builtInMarketPluginsMerge[0] / builtInMarketplaces / builtInSkillMarketplaces（插件市场 URL 配置）
+  ```
+
+  `models[]` 字段**并集**（按条目可选；`auto` 等路由条目无 `credits` 与
+  `contextWindow`，真模型才有）：`id` / `name` / `descriptionEn` / `descriptionZh` /
+  `credits` / `maxInputTokens` / `maxOutputTokens` / `maxAllowedSize` /
+  `contextWindow{defaultLength, supportedLengths[]}` / `reasoning{canDisableThinking?,
+  defaultEffort, summary, supportedEfforts[]}` / `relatedModels{builtin-lite?, lite,
+  reasoning}` / `supportsImages` / `supportsReasoning` / `supportsToolCall` /
+  `temperature` / `vendor` / `aliases[]` / `isDefault` / `onlyReasoning` / `iconUrl` /
+  `disabledMultimodal` / `tags[]`。
+  `tokenUsageThresholds.compact.modelOverrides.deepseek` 是 DeepSeek 专属的 compact
+  阈值覆盖（上游按模型族给不同 emergency 阈值）。
 
 ### 1.2 图片能力判据（哪个字段说了算）
 
@@ -185,7 +257,7 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
 | 渠道 `LoginOptions.pasteCode`（`packages/core/channels/workbuddy/src/cred.ts:338`） | **声明**该回调（每轮轮询前取一次） |
 | `pollToken`（`packages/core/channels/workbuddy/src/cred.ts:300`） | 认出「授权被拒」措辞 → 立刻收尾报错；否则立即再轮询一次 |
 
-与 `lobsterai` 的形态差别：那两条是**本地回调服务器**收 code，粘贴内容被
+与**本地回调服务器**型渠道的形态差别：那类渠道靠回环收 code，粘贴内容被
 **转交同一个回调处理器**；本渠道**没有回调服务器**，粘贴内容只能驱动**同一个轮询处理器**。
 结论一致：**不是第二条登录路径**。
 
@@ -193,11 +265,16 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
 
 `POST https://copilot.tencent.com/v2/billing/meter/daily-checkin`（body `{}`）。
 
-- 已签到时上游业务码非 0（幂等，按成功回报）。
+- 已签到时上游业务码非 0（幂等，按成功回报）：实测 2026-11-07 回
+  `HTTP 400 + {"code":10001,"msg":"今天已签到，请明天再来"}`。
+- **每日发放额 = 100 credits**：账单里「CodeBuddy个人版国内运营裂变包」每个
+  `CapacitySize` 都是 100（本机实测 21 个包、合计 2100），即每日发放单位。
+  上游**没有**「今日发放额」字段，故 `billing.quotaPeriod()` 用这个常量。`[实测旁证]`
 - 活动起止时间非 RFC3339（形如 `2026-09-29 23:59:59`，按 CST 解释）。
 - `GET` 同路径返回 404（上游只挂 POST），不要改方法。
 - **签到活动状态端点**（`/v2/billing/meter/checkin-activity-status`，回
-  `today_checked_in` / `streak_days` / `end_time`）**当前未实现** —— 它是上游
+  `today_checked_in` / `streak_days` / `end_time`）**当前未实现** —— 实测 2026-11-07
+  该路径回 `404 page not found`（上游已下架或改路径）；它是上游
   「今天还能不能领 / 活动到哪天结束」的权威依据，缺它意味着只能靠 `daily-checkin`
   的幂等拒绝来猜（签到由网关启动时的自动签到链路执行，CLI **没有** `signin` 动词，
   结果见 `mx status workbuddy` 的签到摘要）。列入 §7.2 缺口 8，**不写进规格**。
@@ -278,7 +355,7 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
   本仓实测复用 chat base（`copilot.tencent.com`）可取到额度 → **本渠道不改**，
   列入 §7.3 V8。
 - 国际版把同样的路径挂在 `https://www.workbuddy.ai` 上（两渠道共用协议，
-  见 [`workbuddyai/PROTOCOL.md`](../workbuddyai/PROTOCOL.md)）。
+  见 workbuddyai 协议存档（git 历史，渠道已移除））。
 
 ## 6. 必需请求头清单
 
@@ -389,9 +466,9 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
 （保留仅为兼容共享层 CLI 的签名）。
 
 两者的登录协议、上游约束、SSE 处理**完全一致**（代码有意重复），差别只有域名、
-模型目录与凭证落点 —— 规格见 [`workbuddyai/PROTOCOL.md`](../workbuddyai/PROTOCOL.md)。
+模型目录与凭证落点 —— 规格见 workbuddyai 协议存档（git 历史，渠道已移除）。
 
-`cred.ts` / `upstream.ts` / `catalog.ts` / `billing.ts` 与 `workbuddyai` 高度相似，这是有意的：
+`cred.ts` / `upstream.ts` / `catalog.ts` / `billing.ts` 与国际版渠道高度相似，这是有意的：
 两个产品的端点、模型目录、账单口径都可能各自演进，抽象成共享模块会把「一个改了两边都变」
 变成默认行为。
 
@@ -401,7 +478,7 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
 `credentials.json`（0600）、`accounts.json` + `accounts/<key>.json`、`upstream.json`、
 `prefs.json`、`gateway.pid`，外加 `cache/`、`state/`、`debug/`。
 
-本渠道只读写 `~/.modelmux/workbuddy/`；国际版的数据在 `~/.modelmux/workbuddyai/`，两者不共享。
+本渠道只读写 `~/.modelmux/workbuddy/`；国际版渠道已移除，两者数据不共享。
 详见 [`STORAGE-CONVENTION.md`](../../STORAGE-CONVENTION.md)。
 
 `upstream.json` 里的 `deviceToken` 字段用于启用 `X-Device-Token`（§6.1）。
@@ -493,7 +570,7 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
 - **`6004` 按账户级用量限额处理**（`quotaSignal` 上报 `usage_limit`）。上游文案里
   「您也可以切换其他模型继续使用」**不可信**：国际版同族文案写着同样的话，但 2026-10-23
   真机实测证明连倍率 0 的 `deepseek-v4.1-flash` 也照吃 `6004`
-  （[`workbuddyai/PROTOCOL.md`](../workbuddyai/PROTOCOL.md)「使用与实测」）。
+  （workbuddyai 协议存档（git 历史，渠道已移除）「使用与实测」）。
 - **冷却截止用上游给的滚动重置时刻**（`quotaResetAt` 从 msg 文本解析，含 `UTC+8` 偏移换算），
   不再回落次日本地 0 点。
 - **事故根因在共享层记账**：冷却期间 `http/chat/auth.ts` 把短路报成 `not_authenticated`，
@@ -507,7 +584,7 @@ Rewrite / 命中 11128 时降级为中性提示词重试），**不是**继续�
 ### 已知限制（实测）
 
 - SSE 里空的 `tool_calls: []` 必须剔除，否则思考块会被逐 token 切碎
-  （原因与结论见 [`workbuddyai/PROTOCOL.md`](../workbuddyai/PROTOCOL.md) 的「使用与实测」）。
+  （原因与结论见 workbuddyai 协议存档（git 历史，渠道已移除） 的「使用与实测」）。
 - **上游偶发把工具调用写成 DSML 文本**（`<｜｜DSML｜｜ calls>` 包住 `invoke` / `parameter`），
   落在 `delta.content` 或 `delta.reasoning_content` 而不是 `tool_calls`。网关对所有
   `WIRE === "openai"` 渠道做了响应侧兜底（`http/wire/dsml-tools.ts`）：完整块还原为
@@ -565,6 +642,23 @@ clone 到 `reference/` 的学习材料（不入库）；结论进本文件。
 | [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) | 端点与凭据流程参照（clone 目录 `reference/dsh-workbuddy-connect`）：chat / billing / 前台三套 base 的分离、`/v3/config` 的 UA 与企业账号分流、`X-Conversation-*` 三件套的 11128 结论 |
 
 ## 已知边界
+
+### 7.x 2026-11-20 生态对齐
+
+- **版本三元组升级**：5.11.3 / CLI 2.176.0（misakano headers.go 2026-11 抓包），并补齐
+  5.11.3 追加的 `X-Client-Version/Platform/Product` + `X-Agent-Runtime: local-agent`——
+  只升 UA 不升头集 = 混合指纹（misakano issue #257）。
+- **`X-Private-Data` 按账号形态取值**：CN 个人 false / 企业 true（testdata official_chat_head.txt）；
+  对话恒 true 的旧口径**作废**。
+- **取账号档案切 `/v2/plugin/account`**（dingminhua #267/#268：`login/account` 恒回 12151），
+  旧端点降为兜底。
+- **错误码表扩充**：11129/11133/11152/11155/11158（请求体协议类，换号无用）、11134（供应商
+  过载，soft_rate）、10105（60s 重置，渠道级短冷却）；**11140 双语义**按 displayMsg 细分
+  （含「异常行为/限制使用」才是账号级）。
+- **指纹改写扩充**：`DeepSeekRuntime`（两种写法）与 `workspace root` 句（misakano sanitize.go /
+  Android-AI-gateway #16）。
+- **风险登记**：上游开始禁反代（原主仓停维护、Sliverkiss 删库）；消息条数上限 512
+  （Agent2API #48）——超限在建连前报错（codebuddycn 同款）。
 
 ### 7.1 明确不做（不实现）
 

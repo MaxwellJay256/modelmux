@@ -9,13 +9,23 @@
  * 默认隐藏、悬停账号行才出现，触屏常显。
  */
 
-import { ChevronDown, ChevronUp, Plus, Trash2, UserCheck } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { ArrowLeftRight, ChevronDown, ChevronUp, MoreHorizontal, Plus, Trash2 } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PoolAccount } from "../lib/types";
-import type { ReactElement } from "react";
-import { useNarrow } from "../lib/use-narrow";
-import { EXPANDED_COLUMNS, gridLayoutOf } from "../lib/account-layout";
+import type { ReactElement, ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { formatRecoveryAt, formatTokens } from "../lib/log-format";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { Badge } from "./ui/badge";
+import { Card } from "./ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import { Progress } from "./ui/progress";
+import { Skeleton } from "./ui/skeleton";
 
 /**
  * 账号池卡片的数据形状（直接吃 /api/commands 的宽松 JSON）。
@@ -25,6 +35,8 @@ import { ConfirmDialog } from "./ConfirmDialog";
  */
 export interface AccountPool {
   cid: string;
+  /** 渠道级签到状态（无签到能力的渠道 `supported=false`，「今日签到」行不渲染）。 */
+  signin?: ChannelSignin | null;
   index: {
     active: string | null;
     accounts: PoolAccount[] | Array<Record<string, unknown>>;
@@ -36,29 +48,25 @@ export interface AccountPool {
 import {
   classifyAccount,
   rowOf,
+  signinRows,
   type AccountBilling,
   type AccountCredits,
   type AccountStatus,
   type ChannelBilling,
+  type ChannelSignin,
   type QuotaPeriod,
 } from "../lib/account-status";
 export {
   classifyAccount,
   rowOf,
+  signinRows,
   type AccountBilling,
   type AccountCredits,
   type AccountStatus,
   type ChannelBilling,
+  type ChannelSignin,
   type QuotaPeriod,
 } from "../lib/account-status";
-
-/** 健康度圆点：正常=free / 异常=danger / 冷却=warn / 其余=中性。 */
-function healthDot(health: string): string {
-  if (health === "ok") return "bg-free";
-  if (health === "error" || health === "unauthorized") return "bg-danger";
-  if (health === "cooldown") return "bg-warn";
-  return "bg-ink-faint";
-}
 
 /**
  * 账号展示名：**渠道给什么就显示什么**，不做脱敏。
@@ -68,7 +76,7 @@ function healthDot(health: string): string {
  *
  * **不做脱敏设计**。前端若把「没有 name」的账号
  * 统一打码（`138****0001`、`UID 100****042`），会让同一页面出现两套口径
- * —— astudio 给的是明文手机号、lobsterai 上游只给
+ * —— 有的上游给明文手机号、有的只给
  * 打码手机号，界面上看起来自相矛盾。**要不要脱敏由渠道/上游决定**
  * （拿不到明文就别存），前端不再统一加工。
  */
@@ -131,67 +139,69 @@ function quotaAmount(credits: AccountCredits | null | undefined, unsupported: bo
 /**
  * 账号级状态 pill 的配色与文案（与 `classifyAccount` 一一对应）。
  *
- * 正常态用中性底（DeepSeek 的徽标不铺彩色底）；只有需要人介入的状态才着色。
+ * 四个状态全部用语义色：正常绿 / 冷却黄 / 异常与没钱红 —— 「正常」不着色时，
+ * 一屏里只有坏消息有颜色，反而要多读一遍文字才知道哪个号是好的。
  */
 const STATUS_META: Record<AccountStatus, { text: string; pill: string; dot: string }> = {
-  ok: { text: "正常", pill: "bg-overlay text-ink-soft", dot: "bg-free live-dot" },
+  ok: { text: "正常", pill: "bg-free/12 text-free", dot: "bg-free live-dot" },
   cooldown: { text: "冷却", pill: "bg-warn/12 text-warn", dot: "bg-warn" },
   down: { text: "异常", pill: "bg-danger/12 text-danger", dot: "bg-danger" },
   broke: { text: "没钱", pill: "bg-danger/12 text-danger", dot: "bg-danger" },
 };
 
-/** 剩余时长（粗粒度）：`45s` / `3m` / `2h`。 */
-function shortSpan(ms: number): string {
-  if (ms < 60_000) return `${Math.ceil(ms / 1_000)}s`;
-  if (ms < 3_600_000) return `${Math.ceil(ms / 60_000)}m`;
-  return `${Math.round(ms / 3_600_000)}h`;
-}
-
 /**
  * 状态 pill 文案：**只有状态词本身**（正常 / 冷却 / 异常 / 没钱）。
  *
- * 冷却剩余时间、熔断退避等具体信息一律放第二行（`tripDetailOf`）——
- * 标签只回答「现在是什么状态」，不掺时间，避免 pill 变长、语义混杂。
+ * 冷却剩余时间、熔断退避等具体信息由额度条的悬停面板（`statusNoteOf`）承担 ——
+ * 这个 pill 只回答「现在是什么状态」，不掺时间，避免语义混杂。
  */
 function statusPillText(status: AccountStatus): string {
   return STATUS_META[status].text;
 }
 
 /**
- * 账号的状态详情（第二行）：**时间在前、原因在后**。
+ * 账号的状态说明（详情面板下半段）：只回答「还要等多久 / 要不要人介入」。
  *
- * 单行渲染（超长截断）：卡片最小宽 340px，原因放后面即使被截也不丢「多久后恢复」
- * 这个最有用的信息；固定行高也保证所有卡片逐像素等高。
+ * 行内只留 状态点 + 名称 + 状态 pill + 进度条；冷却倒计时、熔断连败、凭据失效
+ * 这类长文案全部收进悬停面板，`null` = 状态正常。
+ *
+ * 判据必须与 pill 同一套（`classifyAccount` 的 status）—— 只读 `health` 会让
+ * 「账单已耗尽但 health 仍是 ok」的账号显示成「额度充足」（2026-11-05 实测出现过）。
  */
-function tripDetailOf(
+function statusNoteOf(
   account: PoolAccount,
-  /** 当前时刻。由页面的 1s 时钟传入（不传则取当下）—— 这样倒计时会自己走，
-   *  而「多久后恢复」不必等下一次数据轮询才更新。 */
+  status: AccountStatus,
+  /** 当前时刻。由页面的 1s 时钟传入（不传则取当下）—— 倒计时会自己走，不必等数据轮询。 */
   now: number = Date.now(),
-): { label: string; detail: string } | null {
+): { tone: "warn" | "danger"; lines: string[] } | null {
+  if (status === "broke") {
+    return { tone: "danger", lines: ["额度已耗尽 · 等待上游窗口刷新"] };
+  }
   if (account.health === "cooldown") {
     const until = account.cooldown_until ? Date.parse(account.cooldown_until) : Number.NaN;
-    const when = Number.isFinite(until) ? shortSpan(until - now) : "?";
+    // 只给**具体恢复时刻**（绝对 + 本地时区）：「2h 后」是废话，用户要的是「什么时候能用」
     return {
-      label: "冷却中",
-      detail: `${when} 后自动恢复 · ${account.cooldown_reason ?? "额度耗尽，等上游窗口刷新"}`,
+      tone: "warn",
+      lines: [
+        Number.isFinite(until)
+          ? `冷却中 · ${formatRecoveryAt(until, now)} 恢复`
+          : "冷却中 · 等待上游窗口刷新",
+      ],
     };
   }
   if (account.health === "error") {
     const until = account.trip_until ? Date.parse(account.trip_until) : Number.NaN;
-    const backoff = Number(account.trip_backoff_ms ?? 0);
-    const retry = backoff > 0 ? `退避 ${shortSpan(backoff)}` : "退避中";
-    // trip_until 缺失（旧记录）时不渲染 "? 后"——试探时刻未知，但「下次请求会试探」的语义仍在
-    const probe = Number.isFinite(until)
-      ? `${shortSpan(until - now)} 后自动试探 · `
-      : "下次请求自动试探 · ";
     return {
-      label: "熔断中",
-      detail: `${probe}连续失败 ${Number(account.fail_streak ?? 0)} 次 · ${retry}`,
+      tone: "danger",
+      lines: [
+        Number.isFinite(until)
+          ? `熔断中 · ${formatRecoveryAt(until, now)} 自动试探`
+          : "熔断中 · 下次请求自动试探",
+      ],
     };
   }
   if (account.health === "unauthorized") {
-    return { label: "凭据失效", detail: "需要重新登录（自动重试不会成功）" };
+    return { tone: "danger", lines: ["凭据失效 · 需要重新登录"] };
   }
   return null;
 }
@@ -204,7 +214,7 @@ function tripDetailOf(
  *   - N 个账号 → 生效账号 + 卡底「展开剩余 N-1 个账号」；展开后卡底变「收起」
  *
  * 为什么空池也要占一行：账号池是**横向等高**的卡片列，没登录的渠道矮一截，
- * 整片网格就参差（主人要求「必须要保持账号池的账号布局一致」）。
+ * 整片网格就参差 —— 账号池的卡片布局必须逐卡一致。
  *
  * 为什么卡底条恒渲染：它是卡片高度的收口（0 / 1 / N 个账号三种卡都把底边压在
  * 同一条线上），同时承担「还有几个没露」与「收起」两个动作。
@@ -213,14 +223,9 @@ function tripDetailOf(
  * 而账号池页要先回答的是「这个渠道还能不能用」。生效账号恒排首位（见 `sort`），
  * 所以默认露出的那行就是最该看的那个。
  *
- * demo.ts 只放数据，布局完全由本组件决定 —— 数据里放几个账号都不影响布局规则。
+ * 数据里放几个账号都不影响布局规则 —— 布局完全由本组件决定。
  */
 const PREVIEW_ACCOUNTS = 1;
-
-/**
- * 展开态的栅格口径在 `lib/account-layout.ts`（纯逻辑，表驱动测试钉死）——
- * 它决定「哪些行画下边框」，列数与账号个数交织，写错只会静默少一条分隔线。
- */
 
 /**
  * 单渠道账号池卡片。
@@ -232,12 +237,71 @@ const PREVIEW_ACCOUNTS = 1;
  * `catpaw/xxx`），有功能含义；`display`（CatPaw / Raccoon…）只是同一渠道的另一种拼写，
  * 与 cid 并列会把同一信息显示两遍，且把池身份挤成一行里两个等价的徽标。
  */
+
+/** 详情浮层的锚点：触发钮的视口矩形（只用到左边缘与上下缘）。 */
+interface PanelAnchor {
+  left: number;
+  top: number;
+  bottom: number;
+}
+
+/**
+ * 账号详情的悬浮面板：portal 到 `document.body`、按锚点实测定位。
+ *
+ * 为什么 portal：卡片根节点 `overflow-hidden`，不 portal 的绝对定位浮层会被卡底裁掉
+ * （最后一行账号的进度条离卡底只有几像素）。
+ * 配色跟面板层级走 —— `bg-overlay` 比卡片（`bg-raised`）高一档，再叠 `line-strong` 描边
+ * 与投影；不用近黑：深色主题里近黑浮层像另一个应用，和整套「一级灰差」的层次断开。
+ * `ResizeObserver` 兜底换肤 / 文字重排后的重新定位。
+ */
+function AccountDetailPanel({
+  anchor,
+  children,
+}: {
+  anchor: PanelAnchor;
+  children: ReactNode;
+}): ReactElement {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const GAP = 8;
+    const EDGE = 8;
+    const place = (): void => {
+      const r = el.getBoundingClientRect();
+      const left = Math.min(anchor.left, Math.max(EDGE, window.innerWidth - r.width - EDGE));
+      const below = anchor.bottom + GAP;
+      // 翻到触发钮**上方**时按其上缘算，否则浮层会盖住进度条本身
+      setPos({
+        left,
+        top: below + r.height > window.innerHeight - EDGE ? anchor.top - GAP - r.height : below,
+      });
+    };
+    place();
+    const ro = new ResizeObserver(place);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [anchor]);
+  return createPortal(
+    <div
+      ref={ref}
+      role="tooltip"
+      style={pos ?? { visibility: "hidden" }}
+      className="pointer-events-none fixed z-50 w-[300px] max-w-[86vw] divide-y divide-line rounded-xl border border-line-strong bg-overlay px-3 py-2 text-xs leading-relaxed text-ink shadow-xl"
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
 export function AccountCard({
   pool,
   billing,
   billingLoading = false,
   billingError = false,
   now,
+  tokensOf,
   onActivate,
   onRemove,
   onAdd,
@@ -251,6 +315,8 @@ export function AccountCard({
   billingError?: boolean;
   /** 全局时钟（由页面每秒推一次）：新鲜度文案要随时间走。 */
   now?: number;
+  /** 账号 key → 今日 tokens（`usage.accounts[]`）；没有该账号的记录时返回 undefined。 */
+  tokensOf?: (key: string) => number | undefined;
   onActivate: (cid: string, key: string) => void;
   onRemove: (cid: string, key: string) => void;
   onAdd: (cid: string) => void;
@@ -264,8 +330,6 @@ export function AccountCard({
   };
   // 倒计时基准：页面每秒喂一个 `now`（数据轮询是 5s 级，靠它跳秒）；缺省取当下。
   const clock = now ?? Date.now();
-  /** 窄屏判定（与 Tailwind `md` 同口径）：展开态是否分两列跟着它走。 */
-  const narrow = useNarrow();
   // 删除确认：点垃圾桶弹确认框（行内展开会撑高账号行）。
   // 同时只允许一个账号处于待确认态；切换账号/忙碌时清空。
   const [pendingRemove, setPendingRemove] = useState<{
@@ -278,6 +342,20 @@ export function AccountCard({
   useEffect(() => {
     if (busyKey !== null) setPendingRemove(null);
   }, [busyKey]);
+  // 取消/确认后把焦点还给「…」触发键。ConfirmDialog 卸载时 Radix FocusScope 会把焦点
+  // 还给 BODY，且归还发生在 commit 之后的异步帧（rAF 实测压不住，effect 同步 focus 同样被覆盖）；
+  // 150ms 是所有 portal 归还链落定后的窗口。删除成功时触发键随行卸载，focus() 落空无害。
+  const hadPendingRemove = useRef(false);
+  useEffect(() => {
+    if (pendingRemove) {
+      hadPendingRemove.current = true;
+      return;
+    }
+    if (hadPendingRemove.current) {
+      hadPendingRemove.current = false;
+      setTimeout(() => removeTriggerRef.current?.focus?.(), 150);
+    }
+  }, [pendingRemove]);
   const accounts = [...pool.index.accounts]
     .map(rowOf)
     .sort((a, b) => {
@@ -300,6 +378,28 @@ export function AccountCard({
    * 状态留在组件里，数据轮询刷新时保持当前开合 —— 正在排查时被下一轮结果折回去很烦。
    */
   const [expanded, setExpanded] = useState(false);
+  /**
+   * 额度详情浮层：记「锚点 + 哪个账号 + 是否固定」。
+   * 悬停/聚焦即显示、移开消失；点击可固定（触屏没有悬停，也给键盘一个明确入口），
+   * 点别处或按 Esc 关闭。
+   */
+  const [detail, setDetail] = useState<{ anchor: PanelAnchor; key: string; pinned: boolean } | null>(null);
+  useEffect(() => {
+    if (!detail?.pinned) return;
+    const onPointerDown = (e: MouseEvent): void => {
+      if ((e.target as HTMLElement | null)?.closest("[data-quota-meter]")) return;
+      setDetail(null);
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setDetail(null);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [detail?.pinned]);
   /** 没露出来的账号条数（0 = 全露或本来就没得折；空池也归 0，用 `empty` 单独判）。 */
   const hiddenCount = Math.max(0, accounts.length - PREVIEW_ACCOUNTS);
   const needsFold = !expanded && hiddenCount > 0;
@@ -308,30 +408,43 @@ export function AccountCard({
   const empty = accounts.length === 0;
   /** 有可折叠内容且已展开 —— 卡底条的左键这时是「收起」。 */
   const collapsedBack = expanded && hiddenCount > 0;
-  /** 展开态且不窄屏：两列铺账号（判定与 CSS 的 `md:grid-cols-2` 同源）。 */
-  const twoCol = collapsedBack && !narrow;
-  const { lastRowStart, spanLast } = gridLayoutOf(shownAccounts.length, twoCol ? EXPANDED_COLUMNS : 1);
+  /** 悬停面板对应的账号（收起后自然失效，面板随之消失）。 */
+  const detailAccount = detail ? shownAccounts.find((a) => a.key === detail.key) : undefined;
+  const detailBill = detailAccount ? billingByKey.get(detailAccount.key) : undefined;
+  const detailStatus = detailAccount ? classifyAccount(detailAccount, billing) : null;
+  const detailNote =
+    detailAccount && detailStatus ? statusNoteOf(detailAccount, detailStatus, clock) : null;
 
   return (
-    // `@container`：账号行的额度区按**卡片宽度**（而非视口宽度）决定露出多少。
-    // 展开态 `col-span-full`：网格行高取行内最高的卡，展开的卡会把同行两个单账号卡
-    // 下方各留出 200px 空白（实测 371 vs 164）—— 让展开的卡独占一行，其余卡片顺延。
-    <div
-      className={`panel @container flex flex-col overflow-hidden transition-colors ${
-        expanded && hiddenCount > 0 ? "col-span-full" : ""
-      }`}
-    >
-      {/* 卡头：cid + 账号数 + 添加按钮（状态在各自的账号行上，渠道不显示状态） */}
+    // 展开**不跨列**：卡片只在自己那一格里长高，同行右侧的渠道保持原位、不被挤到下一行。
+    // 早期用 `col-span-full` 独占整行（当时是为了避免同行卡片下方留白），代价是
+    // 「展开一个渠道 → 右侧渠道全部下移、本卡占满整行」，整块布局跳一下。
+    // 现在仍会有行内留白（`items-start` 只让卡片不被拉伸，**行轨道高度仍由该行最高的卡决定**），
+    // 但留白落在网格背景上，比整行重排安静得多 —— 这是刻意接受的取舍。
+    <>
+    <Card className="gap-0 overflow-hidden transition-colors">
+      {/* 卡头：cid + 账号数（同一行，紧跟渠道名） + 添加按钮；额度周期另起一行。
+          状态在各自的账号行上，渠道不显示状态。 */}
       <div className="flex items-center gap-3 px-4 py-3">
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
             <span className="shrink-0 font-mono text-[13px] font-medium text-ink">{pool.cid}</span>
+            <span className="shrink-0 text-xs text-ink-faint">{`${accounts.length} 个账号`}</span>
           </div>
-          <div className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-ink-faint">
-            <span>{`${accounts.length} 个账号`}</span>
-            {/* 额度周期（渠道声明；没声明就不显示，避免编造周期） */}
-            {billing?.quota?.label && (
-              <span className="text-ink-faint/70">· {billing.quota.label}</span>
+          {/* 额度周期：单行，按内容高度走。
+              为什么不再固定两行（`min-h-8`）：绝大多数渠道的文案只有一行（「每天签到送 100 积分」），
+              固定两行会在每张卡上多出一行空白，视觉上像卡头缺内容 —— 卡与卡之间的等高由网格
+              `items-start` 之外的行轨道保证，不需要靠卡头硬撑。
+              账单查询失败要**显式说明** —— 留空白会把「接口挂了」显示成「这个渠道没有周期」。
+              没声明额度周期的渠道一律写「暂无签到」：上游没有每日签到就是没有，不编
+              「签到无固定额度」这类说法 —— catpaw 只有一次性注册奖励、qoder 没有签到活动、
+              workbuddyai / qwenworkcn 连签到能力位都没有，对用户都是「这渠道没签到」。
+              详情浮层的「今日签到」行仍按能力位渲染，两处口径一致。 */}
+          <div className="mt-1 truncate text-xs leading-4 text-ink-faint">
+            {billingError && billing === undefined ? (
+              <span className="text-warn">额度周期未知（账单查询失败）</span>
+            ) : (
+              (billing?.quota?.label?.trim() ?? "") || "暂无签到"
             )}
           </div>
         </div>
@@ -349,16 +462,16 @@ export function AccountCard({
       {/*
         账号列表：只铺 `shownAccounts`（默认 1 个，口径见上方「账号卡片的布局铁律」）；
         空池铺一个空位行，卡片高度与有账号的卡一致。
-        展开态在 `≥ md` 改两列（见 `EXPANDED_COLUMNS`）：行仍是行优先，读序与折叠态一致。
+        展开态**恒一列**（一行一个账号竖向排开）：两列会把每行压成半宽、账号名与进度条
+        互相挤，读序也变成「左右左右」。
       */}
-      <ul className={`grid border-t border-line ${twoCol ? "md:grid-cols-2" : ""}`}>
+      <ul className="grid border-t border-line">
         {empty && (
-          // 空位行：结构与真实账号行同高（44px 主行 + 24px 详情行），内容留空 ——
+          // 空位行：结构与真实账号行同高（单行 44px），内容留空 ——
           // 「暂无账号」由卡底条说明，这里只负责把卡撑到与别的卡一样高。
           // 不加 `border-b`：它是唯一的行，多一条边会让空卡比单账号卡高 1px（实测）。
           <li className="list-none" aria-hidden="true">
             <div className="h-11 px-4 max-md:px-3" />
-            <div className="h-6" />
           </li>
         )}
         {shownAccounts.map((account, index) => {
@@ -366,115 +479,147 @@ export function AccountCard({
           const bill = billingByKey.get(account.key);
           const status = classifyAccount(account, billing);
           const meta = STATUS_META[status];
-          const health = account.health;
-          const failStreak = Number(account.fail_streak ?? 0);
-          // 账号级状态详情（冷却原因 / 熔断退避）：挂在**该账号自己**的行下，
-          // 不是卡头 —— 状态属于账号，多个账号可能各不相同。
-          // 熔断/冷却都会自动恢复（半开试探 / 到期惰性恢复），界面不设手动解除入口。
-          const detail = tripDetailOf(account, clock);
-          const detailTone = account.health === "cooldown" ? "text-warn" : "text-danger";
-          // 最后一行不画下边框（否则与卡底条的上边框叠成双线）；两列时按下标判定，见 `gridLayoutOf`
-          const rowBorder = index >= lastRowStart ? "" : "border-b border-line/60";
-          const span = twoCol && spanLast && index === shownAccounts.length - 1 ? "md:col-span-2" : "";
-            return (
-              <li
-                key={account.key}
-                className={`group relative transition-colors hover:bg-overlay/40 ${rowBorder} ${span} ${
-                  active ? "bg-overlay/25" : ""
-                }`}
-              >
+          // 末行不画下边框（否则与卡底条的上边框叠成双线）。
+          return (
+            <li
+              key={account.key}
+              /*
+                行底必须是不透明实色（与卡底同为 bg-raised），分隔画在**行框内**
+                （inset 投影，末行不加）——不用跨行元素的 border-b：行间任何亚像素
+                缝隙都会瞬时透出卡底（浅色主题 = 纯白），展开/滚动重合成时表现为
+                一闪而过的白线，截图与录屏都抓不到（2026-11-14 实测；#426、#429
+                两轮 border 方案均在此复发）。投影落在行自己的实底上，行外不存在
+                可透的第三层颜色，机制上杜绝闪白。
+              */
+              className={`group relative bg-raised transition-colors ${
+                index >= shownAccounts.length - 1
+                  ? ""
+                  : "shadow-[inset_0_-1px_0_var(--color-line)]"
+              }`}
+            >
                 {/* 生效账号：左侧高亮条 */}
-                {active && <span className="absolute inset-y-0 left-0 w-0.5 bg-brand" aria-hidden />}
+                {active && <span className="absolute inset-y-0 left-0 w-0.5 bg-ink" aria-hidden />}
                 {/*
-                  账号行 = 主行（44px）+ 可选的状态详情行：
-                    主行：状态点 + 名称 + 短状态 pill + 连败计数 | 额度 | 操作
-                  详情行只在冷却 / 熔断 / 凭据失效时出现（原因 + 恢复时刻，可换行）。
+                  账号行 = 单行（44px），左右两块等分：
+                    左：状态点 + 名称（超长截断）
+                    右：状态 pill（与额度条一体）+ 额度条 | 操作
                 */}
                 <div className="flex h-11 items-center gap-2 px-4 max-md:gap-1.5 max-md:px-3">
                   <span
-                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${healthDot(account.health)}`}
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`}
                     aria-label={meta.text}
                   />
-                  {/* 名称区：弹性，超长截断；pill 与操作按钮**不压缩**（它们在 44px 单行里必须完整可见） */}
-                  <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+                  {/* 名称区：弹性，超长截断 —— 状态 pill 已并入右侧额度模块（标签与
+                      额度条一体，位置不随用户名长度漂移；名称过长在此截断即可） */}
+                  <div className="flex min-w-0 flex-1 items-center overflow-hidden">
                     <span className="min-w-0 truncate text-[13px] font-medium text-ink">{displayName(account)}</span>
-                    <span className={`pill shrink-0 whitespace-nowrap ${meta.pill}`}>{statusPillText(status)}</span>
-                    {failStreak > 0 && (health === "ok" || health === "unknown") && (
-                      <span className="pill shrink-0 bg-warn/12 text-warn">连败 {failStreak}</span>
-                    )}
                   </div>
-                  {/*
-                    额度区：**按卡片宽度逐级露出**（容器查询，不用视口断点 ——
-                    同一视口下卡片可能整行、也可能只是两列里的半行）：
-                      窄 → 只留剩余额度数值；`@min-[420px]` → + 标签；`@min-[480px]` → + 今日消耗。
-                    账单还没拿到数据时画骨架条，不画 `-`：
-                    「-」与「未查到」看起来像「查过了但没有」，会把等待与失败伪装成结果。 */}
-                  <div className="flex shrink-0 items-center gap-2">
-                    {billingLoading ? (
-                      <>
-                        <span className="hidden h-1 w-14 animate-pulse rounded-full bg-overlay @min-[420px]:block" />
-                        <span className="h-2 w-8 animate-pulse rounded bg-overlay" />
-                      </>
-                    ) : billingError && !bill?.billing_at ? (
-                      <>
-                        <span className="font-mono text-xs tabular-nums text-warn">—</span>
-                        <span className="hidden text-xs text-warn @min-[420px]:inline">账单失败</span>
-                      </>
+                  {/* 状态 + 额度模块：状态 pill 贴着进度条，与名称的分界恒定（两个
+                      flex-1 平分一行），视觉上是一组而不是「名称的附件」 */}
+                  <div className="flex min-w-0 flex-1 items-center gap-2">
+                    <Badge className={`shrink-0 whitespace-nowrap ${meta.pill}`}>{statusPillText(status)}</Badge>
+                    {billing?.unsupported === true ? (
+                      <span className="shrink-0 text-xs text-ink-faint">订阅制 · 无额度概念</span>
                     ) : (
-                      <QuotaMeter
-                        credits={bill?.credits}
-                        baseline={bill?.baseline}
-                        unsupported={billing?.unsupported === true}
-                      />
-                    )}
+                    <button
+                      type="button"
+                      data-quota-meter
+                      aria-label={`${displayName(account)} 的额度详情`}
+                      aria-expanded={detail?.key === account.key}
+                      onMouseEnter={(e) => {
+                        if (detail?.pinned) return;
+                        const r = e.currentTarget.getBoundingClientRect();
+                        setDetail({
+                          anchor: { left: r.left, top: r.top, bottom: r.bottom },
+                          key: account.key,
+                          pinned: false,
+                        });
+                      }}
+                      onMouseLeave={() =>
+                        setDetail((cur) => (cur?.key === account.key && !cur.pinned ? null : cur))
+                      }
+                      onFocus={(e) => {
+                        if (detail?.pinned) return;
+                        const r = e.currentTarget.getBoundingClientRect();
+                        setDetail({
+                          anchor: { left: r.left, top: r.top, bottom: r.bottom },
+                          key: account.key,
+                          pinned: false,
+                        });
+                      }}
+                      onBlur={() =>
+                        setDetail((cur) => (cur?.key === account.key && !cur.pinned ? null : cur))
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const r = e.currentTarget.getBoundingClientRect();
+                        setDetail((cur) =>
+                          cur?.key === account.key && cur.pinned
+                            ? null
+                            : {
+                                anchor: { left: r.left, top: r.top, bottom: r.bottom },
+                                key: account.key,
+                                pinned: true,
+                              },
+                        );
+                      }}
+                      className="tap flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-overlay/40"
+                    >
+                      {billingLoading ? (
+                        <>
+                          <Skeleton className="h-1.5 min-w-0 flex-1 rounded-full" />
+                          <Skeleton className="h-2 w-8 shrink-0" />
+                        </>
+                      ) : billingError && !bill?.billing_at ? (
+                        <span className="shrink-0 text-xs text-warn">账单失败</span>
+                      ) : (
+                        <QuotaBar credits={bill?.credits} baseline={bill?.baseline} />
+                      )}
+                    </button>
+                  )}
                   </div>
                   {/*
-                    操作区：`≥ md` 固定 52px（切换 + 删除两个图标键）；`< md` 放宽到 92px ——
-                    两个键各自撑到 44px 的触控下限后，52px 装不下。
-                    **默认隐藏，鼠标悬停该账号行才出现**（删除/切换不常使用）；
-                    键盘聚焦（`group-focus-within`）时也出现；触屏设备（`pointer-coarse`）常显 ——
-                    触屏没有悬停。
+                    操作区：单枚「…」DropdownMenu，恒可见 —— 旧的两枚行内键靠
+                    `pointer-fine` 悬停显形 + 触屏常显两条路径，菜单版点击展开、
+                    不依赖 hover（更贴「正文信息不得只靠 hover」铁律），行右侧也更干净。
+                    宽度 32px（旧 52/76 是两枚键的占位）。删除仍走 ConfirmDialog，
+                    取消后焦点还给打开菜单的那枚「…」。
                   */}
-                  <div className="flex w-[52px] shrink-0 items-center justify-end gap-0.5 opacity-100 transition-opacity max-md:w-[92px] pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-fine:group-focus-within:opacity-100">
-                    {!active && (
-                      <button
-                        className="tap-square shrink-0 rounded p-1 text-ink-faint transition-colors hover:bg-overlay hover:text-brand disabled:opacity-40"
+                  <div className="flex w-8 shrink-0 items-center justify-end">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        className="tap-square shrink-0 rounded p-1 text-ink-faint transition-colors hover:bg-overlay hover:text-ink data-[state=open]:bg-overlay data-[state=open]:text-ink disabled:opacity-40"
                         disabled={busyKey !== null}
-                        onClick={() => onActivate(pool.cid, account.key)}
-                        aria-label="切换为生效账号"
+                        aria-label={`${displayName(account)} 的操作`}
+                        onPointerDown={(e) => {
+                          // 记下本行触发键：取消确认时焦点要还到这里（见 ConfirmDialog 注释）。
+                          // 不能用 onClick —— Radix 在 pointerdown 就打开菜单并 preventDefault，
+                          // click 不派发（实测 ref 恒 null，归还全落空）；onPointerDown 是 React
+                          // 合成事件，不受 preventDefault 影响，且此刻焦点尚未被菜单 FocusScope 接管。
+                          removeTriggerRef.current = e.currentTarget;
+                        }}
                       >
-                        <UserCheck className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                    <button
-                      className="tap-square shrink-0 rounded p-1 text-ink-faint transition-colors hover:bg-danger/12 hover:text-danger disabled:opacity-40"
-                      disabled={busyKey !== null}
-                      onClick={(e) => {
-                        // 记下触发键：取消确认时焦点要还到这里（见 ConfirmDialog 注释）
-                        removeTriggerRef.current = e.currentTarget;
-                        setPendingRemove({ key: account.key, name: displayName(account), active });
-                      }}
-                      aria-label={active ? "删除生效账号（同时登出）" : "从池中删除"}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                        <MoreHorizontal className="h-3.5 w-3.5" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {!active && (
+                          <DropdownMenuItem onSelect={() => onActivate(pool.cid, account.key)}>
+                            <ArrowLeftRight />
+                            切换为生效账号
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onSelect={() => setPendingRemove({ key: account.key, name: displayName(account), active })}
+                        >
+                          <Trash2 />
+                          {active ? "删除生效账号（同时登出）" : "从池中删除"}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 </div>
-                {/*
-                  状态详情行：恒占 h-6（无状态时留空）——
-                  行内只有 44px，长原因塞不进去；放这里直接可见（不靠 hover）。
-                  单行渲染（`truncate`）：卡片最小宽 340px 时换行会溢出固定行高，
-                  反而让卡片看起来不等高 —— 时间放最前，原因超长截断即可。
-                */}
-                <div className="flex h-6 min-w-0 items-center gap-x-1.5 px-4 pl-7 text-xs leading-snug max-md:px-3 max-md:pl-6">
-                  {detail && (
-                    <>
-                      <span className={`shrink-0 font-medium ${detailTone}`}>{detail.label}</span>
-                      <span className="min-w-0 truncate text-ink-faint">{detail.detail}</span>
-                    </>
-                  )}
-                </div>
-              </li>
+                </li>
             );
           })}
         </ul>
@@ -489,10 +634,10 @@ export function AccountCard({
           - 全露     → 静态「已展示全部」
 
         恒渲染的理由是卡片高度收口：0 / 1 / N 个账号三种卡都要把底边压在同一条线上，
-        整片网格才不参差（主人要求「必须要保持账号池的账号布局一致」）。
+        整片网格才不参差 —— 账号池的卡片布局逐卡一致。
       */}
       {empty ? (
-        <div className="flex items-center border-t border-line px-4 py-1.5 text-xs text-ink-faint/70">
+        <div className="flex items-center border-t border-line px-4 py-1.5 text-xs text-ink-faint">
           暂无账号
         </div>
       ) : hiddenCount > 0 ? (
@@ -510,7 +655,7 @@ export function AccountCard({
           {collapsedBack ? "收起" : `展开剩余 ${hiddenCount} 个账号`}
         </button>
       ) : (
-        <div className="flex items-center border-t border-line px-4 py-1.5 text-xs text-ink-faint/70">
+        <div className="flex items-center border-t border-line px-4 py-1.5 text-xs text-ink-faint">
           已展示全部
         </div>
       )}
@@ -538,68 +683,108 @@ export function AccountCard({
           }
         />
       )}
-    </div>
+    </Card>
+      {/* 额度详情浮层（portal 到 body）：数值逐行 + 状态说明；悬停/聚焦显示、点击固定 */}
+      {detail && detailAccount && (
+        <AccountDetailPanel anchor={detail.anchor}>
+          <dl className="space-y-1 pb-2">
+            {[
+              ...quotaDetailRows(
+                detailBill?.credits,
+                detailBill?.baseline,
+                billing?.unsupported === true,
+                tokensOf?.(detailAccount.key),
+              ),
+              // 今日签到：渠道没有签到能力时这里是空数组（整行不渲染）
+              ...signinRows(pool.signin, detailAccount),
+            ].map((row) => (
+              <div key={row.label} className="flex items-baseline justify-between gap-4">
+                <dt className="text-ink-faint">{row.label}</dt>
+                <dd className="font-mono tabular-nums text-ink">{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+          <div className="space-y-0.5 pt-2">
+            {detailNote ? (
+              detailNote.lines.map((line, index) => (
+                <div
+                  key={`${index}-${line}`}
+                  className={
+                    index === 0
+                      ? `font-medium ${detailNote.tone === "warn" ? "text-warn" : "text-danger"}`
+                      : "text-ink-faint"
+                  }
+                >
+                  {line}
+                </div>
+              ))
+            ) : quotaTone(detailBill?.credits, detailBill?.baseline) === "warn" ? (
+              // 剩余不足 10%：还够用但「额度充足」会让人放松警惕
+              <div className="text-warn">额度紧张 · 剩余不足 10%</div>
+            ) : (
+              <div className="text-free">状态正常 · 额度充足</div>
+            )}
+          </div>
+        </AccountDetailPanel>
+      )}
+    </>
   );
 }
 
 /**
- * 额度区：两个带标签的数值 —— **剩余额度**（当前 remain）与**今日消耗**
- * （当日基线 remain − 当前 remain，与旧百分比同口径）。
- *
- * 进度条与百分比已移除：数字本身已是完整信息，条会随窗口刷新跳变反而误导。
- * 消耗算不出（无基线）时显示 `-`，不猜。
- *
- * 耗尽（remain ≤ 0）数值染 danger、紧张（< 10%）染 warn，其余中性 ——
- * 与状态 pill 的「没钱」呼应。
- *
- * ## 窄卡片下的取舍（容器查询，不是视口断点）
- *
- * `< md` 的账号行要同时装下「账号标识 + 状态 pill + 额度 + 两个 44px 操作键」，
- * 一行放不下；此时**只留剩余额度数值**（标签与今日消耗先砍）——
- * 占比最小、最该保住的是账号标识本身（折叠后只剩 3 个字符就没法认人了）。
- * 卡片宽度回到 ~420px 以上，标签与今日消耗逐级恢复。
+ * 额度详情（悬停面板的内容）：全部取上游账单字段 —— 剩余额度、今日消耗、今日 tokens、
+ * 今日首次账单（即进度条的 100% 基准）。推不出的显示 `-`，不猜。
  */
-function QuotaMeter({
-  credits,
-  baseline,
-  unsupported,
-}: {
-  credits: AccountCredits | null | undefined;
-  baseline?: { window?: string; date: string; remain: number; at?: string } | null;
-  unsupported: boolean;
-}): ReactElement {
-  const tone = quotaTone(credits, baseline);
-  // 订阅制渠道：明确写「无额度概念」，而不是一个孤零零的 `-`
-  if (unsupported) {
-    return (
-      <span className="shrink-0 text-xs text-ink-faint/70">
-        订阅制
-        <span className="hidden @min-[440px]:inline"> · 无额度概念</span>
-      </span>
-    );
-  }
-  const valueClass =
-    tone === "danger" ? "text-danger" : tone === "warn" ? "text-warn" : "text-ink-soft";
-  // 今日消耗 = 当日基线 remain − 当前 remain；没有基线就不猜
+function quotaDetailRows(
+  credits: AccountCredits | null | undefined,
+  baseline: { window?: string; date: string; remain: number; at?: string } | null | undefined,
+  unsupported: boolean,
+  tokens: number | undefined,
+): Array<{ label: string; value: string }> {
   let used: number | null = null;
   if (credits && baseline) {
     const base = Number(baseline.remain);
     const remain = Number(credits.remain);
     if (Number.isFinite(base) && Number.isFinite(remain)) used = Math.max(0, base - remain);
   }
-  const usedText =
-    used === null ? "-" : used.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const fmt = (value: number): string => value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const firstBill = baseline ? fmt(Number(baseline.remain)) : "-";
+  return [
+    { label: "剩余额度", value: quotaAmount(credits, unsupported) },
+    { label: "今日消耗", value: used === null ? "-" : fmt(used) },
+    { label: "今日 tokens", value: tokens === undefined ? "-" : formatTokens(tokens) },
+    { label: "今日首次账单", value: firstBill },
+  ];
+}
+
+/**
+ * 额度条：以**今日首次账单**（`baseline.remain`）为 100%，画当前 `remain` 的占比。
+ *
+ * 行里只留「条 + 百分比」，具体数值全部进悬停面板 —— 四个数值并排会把账号标识挤没，
+ * 而「还剩几成」一眼就能读完。订阅制渠道没有额度概念，由调用方写文字（不画恒满的条）。
+ */
+function QuotaBar({
+  credits,
+  baseline,
+}: {
+  credits: AccountCredits | null | undefined;
+  baseline?: { window?: string; date: string; remain: number; at?: string } | null;
+}): ReactElement {
+  const tone = quotaTone(credits, baseline);
+  const pct = quotaPercent(credits, baseline);
+  const fill =
+    tone === "danger" ? "bg-danger" : tone === "warn" ? "bg-warn" : tone === "free" ? "bg-free" : "bg-line-strong";
   return (
     <>
-      <span className="flex items-center gap-1">
-        <span className="hidden shrink-0 text-xs text-ink-faint @min-[420px]:inline">剩余额度</span>
-        <span className={`shrink-0 font-mono text-xs tabular-nums ${valueClass}`}>
-          {quotaAmount(credits, unsupported)}
-        </span>
-      </span>
-      <span className="hidden items-center gap-1 @min-[480px]:flex">
-        <span className="shrink-0 text-xs text-ink-faint">今日消耗</span>
-        <span className="shrink-0 font-mono text-xs tabular-nums text-ink-soft">{usedText}</span>
+      <Progress value={pct ?? 0} className="h-2 min-w-0 flex-1" indicatorClassName={fill} />
+      {/*
+        百分比在窄卡片上也保留：账号池页首先要回答的是「这个渠道还剩多少」，
+        只有一条无刻度的进度条读不出具体数字（`docs/WEB-CONSOLE.md` 的窄屏口径
+        本来就是「先保剩余额度数值」）。字号守 12px 下限（项目硬规则），
+        空间靠加宽 1 档（w-9 / md:w-10）而不是压字号。
+      */}
+      <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-ink-faint md:w-10">
+        {pct === null ? "—" : `${Math.round(pct)}%`}
       </span>
     </>
   );

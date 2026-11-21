@@ -5,12 +5,13 @@
 ```
 docs/channels/<cid>/
   PROTOCOL.md     协议规格（实现依据）+ 使用与实测（推荐模型 / 已知限制 / 端到端实测）+ 参考实现
-  FINDINGS.md     逆向结论汇总（可选）：逐条标注证据等级
-  FLOW.md         端到端数据流（可选）：登录态怎么落盘、怎么加密、怎么被解出来
+  FINDINGS.md     逆向结论汇总（按需）：逐条标注证据等级 + 来源；含方法论 / 实跑记录 / 缺口清单
 ```
 
-> 落点与登记红线见根 [`AGENTS.md`](../../AGENTS.md) 的「文档」；分层与写作规则见
-> [docs/AGENTS.md](../AGENTS.md)。渠道包（`packages/core/channels/<cid>/`）只放实现与包配置，
+> **每个渠道至多两份 md**：`PROTOCOL.md` 必有；`FINDINGS.md` 只在有逆向结论时写。
+
+> 落点与登记红线、分层与写作规则见根 [`AGENTS.md`](../../AGENTS.md) 的「文档」。
+> 渠道包（`packages/core/channels/<cid>/`）只放实现与包配置，
 > **不再带 `docs/`**；落点由 `scripts/verify-docs.mjs` 在 `npm test` 里强制检查。
 
 ## 怎么用（所有渠道一致）
@@ -33,16 +34,14 @@ docs/channels/<cid>/
 | 文件 | 回答的问题 | 写什么 | 不写什么 |
 | --- | --- | --- | --- |
 | `PROTOCOL.md` | 「上游长什么样 + 这条渠道怎么用」 | 端点、请求头约束、请求体、环境变量（`src/` 读的运维面变量，`verify-docs` 强制）、实测结论、推荐模型、已知限制、端到端实测、参考实现清单 | why（why 跟代码走） |
-| `FINDINGS.md` | 「逆向出了什么」 | 逐条结论 + 证据等级（`[实测]` / `[代码]` / `[推断]` / `[参考]`）+ 来源文件 | 推断写成实测（禁止） |
-| `FLOW.md` | 「数据怎么流动」 | 端到端链路图（凭据落盘 → 加密 → 解密 → 注入请求） | 与链路无关的旁支 |
+| `FINDINGS.md` | 「逆向出了什么 + 有多可信」 | 逐条结论 + 证据等级（`[实测]` / `[代码]` / `[推断]` / `[参考]`）+ 来源文件；逆向方法论、完整实跑记录、渠道缺口清单 | 推断写成实测（禁止）；推理过程 / 变更史 |
 
 > **许可证与出处**：各渠道 `PROTOCOL.md` 的 `## 参考实现` 只写「从哪个仓库学到了什么」；
 > **仓库、许可证、使用边界统一登记在 [REFERENCES.md](../REFERENCES.md)**（唯一事实源）。
 > 借鉴前先看那里的使用原则：只借鉴协议事实与思路，不复制代码。
 
-当前落地：`PROTOCOL.md` 10 份（每个渠道一份）、`FINDINGS.md` 3 份
-（`catpaw` / `loomy` / `raccoon`）、`FLOW.md` 1 份（`catpaw`）——
-后两者是**按需**的逆向结论层，不是每个渠道都有。
+当前落地：**每个渠道一份 `PROTOCOL.md`**；另有 `FINDINGS.md` 的渠道是**按需**的逆向结论层
+（实际清单以 `docs/channels/` 目录为准，不在此处手抄数量）。
 
 **唯一事实源**：协议事实只在 `PROTOCOL.md`；代码注释里出现同一事实的副本，协议一改就要改两处。
 注释的三层分工见 [`MODULE-COMMENTS.md`](../MODULE-COMMENTS.md)。
@@ -68,16 +67,13 @@ docs/channels/<cid>/
 
 | cid | 产品 | 一句话说明 | 文档 |
 | --- | --- | --- | --- |
-| `astudio` | AStudio（讯飞桌面 Agent） | 登录两条路：Web 控制台手机号 + 短信验证码云端直连，CLI 无界面时回落读桌面应用落盘的会话文件；渠道用 `modelBearerToken` 直连模型网关；支持 `mx logout` 本地登出 | [PROTOCOL](./astudio/PROTOCOL.md) + [METHODOLOGY](./astudio/METHODOLOGY.md) / [WALKTHROUGH](./astudio/WALKTHROUGH.md) + [ROADMAP](./astudio/ROADMAP.md)（缺口清单） |
-| `catpaw` | CatPaw（美团妙手） | 凭据加密落盘，逆向链路结论拆成三份文档 | [PROTOCOL](./catpaw/PROTOCOL.md) + [FINDINGS](./catpaw/FINDINGS.md) / [FLOW](./catpaw/FLOW.md) |
-| `lobsterai` | LobsterAI（有道） | 有每日签到（签到分三步），错误分类按上游 `Classify()` 移植 | [PROTOCOL](./lobsterai/PROTOCOL.md) |
+| `catpaw` | CatPaw（美团妙手） | 凭据加密落盘（AES-256-GCM，密钥由机器码派生）；上游对话三段式 | [PROTOCOL](./catpaw/PROTOCOL.md) + [FINDINGS](./catpaw/FINDINGS.md) |
 | `loomy` | Loomy（讯飞） | 微信扫码登录；账户积分与签到积分是**两个池** | [PROTOCOL](./loomy/PROTOCOL.md) + [FINDINGS](./loomy/FINDINGS.md) |
-| `qoder` | Qoder（国际版 `qoder.com`） | COSY 签名 + 请求体**自定义 Base64 编码**（直发字符串） | [PROTOCOL](./qoder/PROTOCOL.md) |
-| `qodercn` | Qoder 国内版（`qoder.com.cn`） | 与 `qoder` **同一套协议**，仅域名 / 身份 / 模型目录不同 | [PROTOCOL](./qodercn/PROTOCOL.md) |
+| `qwenworkcn` | 千问办公（QwenWorkCN，`gateway.qwenwork.cn`） | **COSY 协议的一个部署**（同族实现的存档见 git 历史）：域名 / client_id（`e883ade2…`）/ 深链（`qwenwork-cn://`）/ 模型命名空间（`qwork`）/ 额度端点（`/api/v1/adapter/user/*`）全不同；上游 2026-11 起目录扩到 13 档（含 qwen4-max、deepseek-flash 等第三方档，1M 上下文）；**上游无签到接口** | [PROTOCOL](./qwenworkcn/PROTOCOL.md) |
+| `codebuddycn` | CodeBuddy 国内版（`copilot.tencent.com`） | OAuth 授权页 + 轮询取令牌（无本机回环）；对话体 **gzip 压缩**；伪装官方 CLI 头族；模型目录仅个人账号可取；**国内版无签到入口** | [PROTOCOL](./codebuddycn/PROTOCOL.md) |
 | `raccoon` | Raccoon（商汤） | 模型 id 藏在远端 `name` 字段里，不在 `id` | [PROTOCOL](./raccoon/PROTOCOL.md) |
 | `traecn` | TRAE（字节，中国版） | 「对话可用余额」与签到是**两套口径**，不能混用 | [PROTOCOL](./traecn/PROTOCOL.md) |
 | `workbuddy` | WorkBuddy（国内版 CodeBuddy） | 与国际版同一套端点协议；realm 换域名 | [PROTOCOL](./workbuddy/PROTOCOL.md) |
-| `workbuddyai` | WorkBuddyAI（国际版） | 官方桌面端**身分头族**（缺任一可能触发渠道校验）；realm 换域名 | [PROTOCOL](./workbuddyai/PROTOCOL.md) |
 
 > 跨渠道的规范（契约、池化、存储、进程、日志、注释）不在本层，在 [`docs/` 根](../README.md)。
 
@@ -90,23 +86,20 @@ docs/channels/<cid>/
 
 | 渠道 | 测的模型 | 结果 | 备注 |
 | --- | --- | --- | --- |
-| `astudio` | 全部 7 个模型 | 通过 | 免费档（倍率 `-`）；7/7 落盘一致、`messageCount` 递增、无新增错误 |
 | `catpaw` | `longcat-2.0`（倍率 0） | 通过 | |
-| `lobsterai` | `deepseek-flash`（倍率 0.05） | 通过 | 扣费与倍率相符 |
+| `lobsterai` | `deepseek-flash`（倍率 0.05） | 通过 | 扣费与倍率相符（账号被上游封停） |
 | `loomy` | `spark-x`（倍率 0） | 通过 | 工具往返通过、零扣费；冷启动首字较慢 |
-| `qoder` | `qwen3.8-flash`（倍率 0） | **受限** | 上游排队饱和：单请求 TTFB 极长，模型不再推进 |
 | `qodercn` | `qwen3.8-flash`（倍率 0） | **受限** | 同 qoder（上游排队） |
 | `raccoon` | `glm-5.3-flash`（倍率 0.2） | 通过 | 扣费与倍率相符 |
 | `traecn` | `doubao-seed-code`（倍率 0.06） | 通过 | 扣费与倍率相符 |
 | `workbuddy` | `hy3`（倍率 0） | 通过 | |
-| `workbuddyai` | `hy3`（倍率 0） | 功能通过，**错误日志有新增** | 上游 429「模型繁忙」，属账号侧限流 |
 
 **已知问题**（下一轮跟进）：
 
-1. **上游限流与账号侧风控**：workbuddyai 上游 429「模型繁忙」、raccoon / loomy 的
+1. **上游限流与账号侧风控**：raccoon / loomy 的
    `not_authenticated`（token 失效后需用户手动 `mx acct <cid> use <key>` 切号）——
    都是账号侧约束，不是协议缺陷。
-2. **qoder / qodercn 上游排队饱和**：单请求 TTFB 极长后模型不再推进（见上表「受限」）。
+2. **qoder 系上游排队饱和**：单请求 TTFB 极长后模型不再推进（同族上游的历史实测见上表「受限」；该族现已只剩 `qwenworkcn`）。
 
 ## 新增渠道要动的文档
 

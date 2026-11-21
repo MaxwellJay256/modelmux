@@ -12,7 +12,13 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { canonicalModelId, ensureChannelModels, readCatalogCache, writeCatalogCache } from "@modelmux/gateway";
+import {
+  canonicalModelId,
+  ensureChannelModels,
+  hiddenModelIds,
+  readCatalogCache,
+  writeCatalogCache,
+} from "@modelmux/gateway";
 import { bundledSnapshotPath, packageSnapshotPath } from "@modelmux/gateway/snapshot";
 
 /**
@@ -42,7 +48,7 @@ interface ModelEntry {
   supports_image?: boolean;
   /** 倍率展示文案（如 `"x0.34"`）；上游 `credits` 字段为空时缺省。 */
   rate?: string;
-  /** 倍率数值（由 `rate` 解析）；供共享层 `model_info.multiplier` 使用。 */
+  /** 倍率数值（由 `rate` 解析）；供共享层 `PoolModelMeta.multiplier` 使用。 */
   multiplier?: number;
   source: "fallback" | "snapshot" | "remote";
 }
@@ -123,7 +129,7 @@ function num(value: unknown): number | undefined {
 }
 
 /**
- * 解析上游 `credits` 字段得到倍率（与 workbuddyai 同一 `/v3/config` 端点、同一口径）。
+ * 解析上游 `credits` 字段得到倍率（`/v3/config` 端点）。
  *
  * 形如 `"x0.34 credits"`；`x0.00` 视为免费（0）；Auto 这类不给倍率的条目是空串。
  * 取不到数字就返回 null（不猜）。
@@ -343,21 +349,38 @@ export async function refresh(): Promise<void> {
   await upstream.fetchCatalog(cred.load());
 }
 
-/** 对外暴露的模型 ID 列表（全模型池）。 */
+/** 对外隐藏的模型 id（数据是 `models.json` 的 `hidden` 标记；机制见共享层 `hiddenModelIds`）。 */
+function hiddenIds(): Set<string> {
+  return hiddenModelIds(import.meta.url, ["exposed"]);
+}
+
+/** 对外暴露的模型 ID 列表（`hidden` 的不暴露；对外名是 `exposed`，与上游 id 双匹配防改名绕过）。 */
 export function exposedIds(): string[] {
-  return entries().map((entry) => entry.exposed);
+  const hidden = hiddenIds();
+  return entries()
+    .filter(
+      (entry) =>
+        !hidden.has(entry.id.toLowerCase()) &&
+        !hidden.has(entry.exposed.toLowerCase()) &&
+        !hidden.has(canonicalModelId(entry.id)),
+    )
+    .map((entry) => entry.exposed);
 }
 
 /**
  * 把客户端请求里的模型名解析为上游名。
  *
  * 顺序：目录命中（对外名 → slug）→ 历史短名（`LEGACY_ALIASES`）→ 原样透传。
+ *
+ * 查表用 `hasOwn`：`LEGACY_ALIASES` 是普通对象，`constructor` / `toString` /
+ * `valueOf` / `__proto__` 这类模型名会沿原型链命中 `Object.prototype`，
+ * 真值判断通过、函数或对象被当成上游模型名返回（声明类型是 `string`）。
  */
 export function resolveModel(name: string): string {
   for (const entry of entries()) {
     if (entry.exposed === name) return entry.id;
   }
-  const legacy = LEGACY_ALIASES[name];
-  if (legacy) return legacy;
+  const legacy = Object.hasOwn(LEGACY_ALIASES, name) ? LEGACY_ALIASES[name] : undefined;
+  if (typeof legacy === "string") return legacy;
   return name;
 }

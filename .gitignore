@@ -6,6 +6,10 @@ dist/
 # 发布包里的许可证副本（由 packages/cli 的 prepack 从仓库根复制，属构建产物）
 packages/cli/LICENSE
 
+# 桌面壳构建 payload（打包时生成）与用户便携数据（凭据，绝不入库）
+desktop/app/
+desktop/data/
+
 # agent 运行时状态（本机私有）
 .box-agent/
 .box-agent-scratch/
@@ -34,9 +38,18 @@ __pycache__/
 # 规划过程文件（planning-with-files；结项即删）
 .planning/
 
+# plan-with-files 插件的过程文件：每次会话固定写到仓库根（插件无落点配置），
+# 由 verify-docs 经 gitignore 跳过（过程文件不入库、不按文档规则校验）
+/task_plan.md
+/findings.md
+/progress.md
+
 # ZCode 会话产物（计划/exec 缓存等），不入库
 .zcode/
 .claude/
+
+# DSH 自带工作树落 .agents/worktrees/（.agents/skills 是入库资产，只忽略工作树）
+.agents/worktrees/
 
 # 浏览器自动化产物（playwright MCP：截图 / 快照 / console 日志）
 .playwright-mcp/
@@ -75,3 +88,4 @@ pnpm-debug.log*
 
 # 外部工具在 cwd 留下的标记（video2code 插件会写 .v2c/plugin_root）
 .v2c/
+.dsh/

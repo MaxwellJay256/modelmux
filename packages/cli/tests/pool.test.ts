@@ -1,12 +1,12 @@
 /**
- * 仓库级入口冒烟：注册全部渠道 → 一个网关对外暴露**两个公共模型**。
+ * 仓库级入口冒烟：注册全部渠道 → 一个网关对外暴露**模型家族**的裸模型名。
  *
  * 存储根指向临时目录：注册全部渠道后，任何 `paths.*` 调用都会解析到
  * `<root>/<cid>/`，本测试绝不碰真实主目录。
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,9 @@ process.env["MODELMUX_HOME"] = HOME;
  *
  * 刻意**不写死数量** —— 写死就要求「每加一个渠道都回来改测试」，而这里真正要
  * 断言的是「目录里的渠道都注册上了」，数量本身不是被测对象。
+ *
+ * 下架渠道（包保留、不再注册，见 `channels.ts` 的 `RETIRED_CIDS`）要从这条等式里减去：
+ * 等式升级成「渠道目录 == 注册清单 ∪ 下架声明」，下架必须显式声明，不能悄悄不注册。
  */
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const CHANNELS_DIR = join(REPO_ROOT, "packages", "core", "channels");
@@ -29,7 +32,10 @@ const EXPECTED_CIDS = readdirSync(CHANNELS_DIR)
   .sort();
 
 const gw = await import("@modelmux/gateway");
-await import("../dist/channels.js");
+const { RETIRED_CIDS } = await import("../dist/channels.js");
+
+/** 目录里有包、且**在注册清单里**的渠道（下架的那些从等式里减去）。 */
+const ACTIVE_CIDS = EXPECTED_CIDS.filter((cid) => !RETIRED_CIDS.includes(cid));
 
 describe("仓库级模型池", () => {
   let running: Awaited<ReturnType<typeof gw.gateway.start>>;
@@ -43,12 +49,27 @@ describe("仓库级模型池", () => {
     rmSync(HOME, { recursive: true, force: true });
   });
 
-  it("注册了 packages/core/channels/ 下的全部渠道（数量由目录推导）", () => {
+  it("注册清单 == 渠道目录减去下架声明（下架必须显式登记）", () => {
     const cids = gw.channels().map((c) => c.config.cid).sort();
-    assert.deepEqual(cids, EXPECTED_CIDS, "注册清单与 packages/core/channels/ 目录不一致");
+    assert.deepEqual(cids, ACTIVE_CIDS, "注册清单与 packages/core/channels/ 目录不一致");
+    assert.deepEqual(
+      RETIRED_CIDS.filter((cid) => !EXPECTED_CIDS.includes(cid)),
+      [],
+      "下架声明必须对应真实存在的渠道包（包删了就该从 RETIRED_CIDS 划掉）",
+    );
+    assert.deepEqual(
+      RETIRED_CIDS.filter((cid) => cids.includes(cid)),
+      [],
+      "下架渠道不得仍在注册清单里",
+    );
     assert.ok(!cids.includes("cline"), "cline 渠道已移除");
-    assert.ok(!cids.includes("zcode"), "zcode 渠道已移除");
     assert.ok(!cids.includes("orcaterm"), "orcaterm 渠道已移除");
+    assert.ok(!cids.includes("zcode"), "zcode 渠道已移除");
+    // 本轮移除的渠道：具名断言，防止渠道包目录残留或注册悄悄回来
+    for (const cid of ["qoder", "workbuddyai", "codearts", "doubaowork", "todayai", "marvis", "autoclaw", "astudio", "qodercn", "lobsterai"]) {
+      assert.ok(!cids.includes(cid), `${cid} 已移除，不得出现在注册清单里`);
+      assert.ok(!RETIRED_CIDS.includes(cid), `${cid} 已移除，不得留在 RETIRED_CIDS`);
+    }
   });
 
   it("服务身份是仓库级 modelmux（不是某个渠道）", async () => {
@@ -56,77 +77,105 @@ describe("仓库级模型池", () => {
     assert.equal(health["ok"], true);
     assert.equal(health["service"], "modelmux");
     const per = health["channels"] as Array<{ cid: string }>;
-    assert.equal(per.length, EXPECTED_CIDS.length, "逐渠道报告");
+    assert.equal(per.length, ACTIVE_CIDS.length, "逐渠道报告");
   });
 
-  it("/v1/models 动态返回全模型池，id 为 <cid>/<模型> 形态", async () => {
+  it("/v1/models 只返回对外家族的裸模型名", async () => {
     const resp = await fetch(`http://${running.addr}/v1/models`);
     assert.equal(resp.status, 200);
     const payload = (await resp.json()) as { data: Array<{ id: string; owned_by: string }> };
     const ids = payload.data.map((m) => m.id).sort();
-    // 全模型池：各渠道能提供的全部模型，按渠道挂前缀（同名模型各归各家）
-    assert.ok(ids.includes("workbuddyai/deepseek-v4.1-flash"), "应包含 workbuddyai/deepseek-v4.1-flash");
-    assert.ok(ids.includes("catpaw/glm-5.3-flash"), "应包含 catpaw/glm-5.3-flash");
-    assert.ok(ids.length > 2, `应多于 2 个模型，实际 ${ids.length}`);
+    assert.ok(ids.includes("deepseek-v4.1-flash"), `应包含 deepseek-v4.1-flash（实际 ${ids.join(", ")}）`);
+    assert.ok(!ids.includes("glm-5.3-flash"), "glm 已移出对外家族");
     assert.ok(
-      payload.data.every((m) => /^[a-z0-9-]+\/.+$/.test(m.id)),
-      "全部对外 id 都是 <cid>/<模型> 形态",
+      payload.data.every((m) => gw.isPoolModel(m.id)),
+      "对外 id 全部属于对外家族",
     );
     assert.ok(
-      payload.data.every((m) => m.owned_by === m.id.split("/")[0]),
-      "owned_by 即 id 前缀里的渠道",
+      payload.data.every((m) => gw.canonicalOf(m.id) === m.id),
+      "对外只列 canonical（别名不单独出现）",
     );
+    const ownerOf = (id: string): string => payload.data.find((m) => m.id === id)!.owned_by;
+    assert.equal(ownerOf("deepseek-v4.1-flash"), "deepseek");
+    assert.ok(ids.includes("kimi-k3.1-pro"), `应包含 kimi-k3.1-pro（实际 ${ids.join(", ")}）`);
+    assert.equal(ownerOf("kimi-k3.1-pro"), "moonshot");
+    assert.ok(!ids.includes("qwen3.8-flash"), "qwen3.8-flash 已移出对外家族");
   });
 
-  it("每个池 id 的候选渠道就是它的前缀（渠道由请求方指定）", () => {
+  it("同一个模型的候选是**多家**渠道（按剩余额度降序，渠道由网关挑）", () => {
     const candsOf = (model: string) => gw.poolCandidates(model).map((c) => c.cid);
-    assert.deepEqual(candsOf("workbuddyai/deepseek-v4.1-flash"), ["workbuddyai"]);
-    assert.deepEqual(candsOf("catpaw/glm-5.3-flash"), ["catpaw"]);
+    const ds = candsOf("deepseek-v4.1-flash");
+    assert.ok(ds.includes("workbuddy"), `workbuddy 应能供给 deepseek-v4.1-flash（实际 ${ds.join(", ")}）`);
+    assert.ok(ds.length >= 2, `同一模型应有多家候选（实际 ${ds.join(", ")}）`);
+    // 别名请求命中同一批渠道
+    assert.deepEqual(candsOf("deepseek-flash"), ds);
+    assert.deepEqual(candsOf("glm-5.3-flash"), [], "glm 已移出对外家族");
+  });
 
-    // 池 id 的前缀必须是**已注册渠道**，且候选恰好是它自己 —— 这是「渠道由请求方指定」
-    // 的判据，也是这段测试真正要守住的不变量。
-    //
-    // 这里**只断言前缀契约**，不断言「池 id 集合 == 各渠道 exposedIds 的并集」：
-    //    后者要读两次目录（本地算一次、`POOL_MODELS` 的 Proxy 内部再算一次），
-    //    而 loomy / raccoon / lobsterai 的目录带**异步刷新**（首次访问触发后台拉取），
-    //    两次读之间目录可能已经变了 —— 那是测试自身的竞态，不是产品缺陷
-    //    （2026-10-26 实测：`lobsterai/MiniMax-M3.1-Flash-Preview` 在两次读之间进出）。
-    //    写死数量（「>= 3」「>= 渠道数的一半」）同样不可行：同一份代码在不同环境下
-    //    看到的渠道数可能不同（2026-10-26 实测：本机 2 个渠道，干净克隆下 4 个）。
-    const known = new Set(EXPECTED_CIDS);
+  it("家族模型的候选来自渠道目录：kimi-k3.1-pro 为多渠道供给，qwen3.8-flash 已移出家族", () => {
+    // 候选 = 渠道目录现算 ∪ 注册表兜底。kimi-k3.1-pro 2026-11-20 放开，六家在册渠道都应能供；
+    // qwen3.8-flash 移出家族后池层候选恒为空（canonicalOf 不再命中）。
+    const mustHave: Array<[model: string, cid: string]> = [
+      ["deepseek-v4.1-flash", "traecn"],
+      ["deepseek-v4.1-flash", "catpaw"],
+      ["kimi-k3.1-pro", "qwenworkcn"],
+      ["kimi-k3.1-pro", "traecn"],
+    ];
+    for (const [model, cid] of mustHave) {
+      assert.ok(
+        gw.poolCandidates(model).some((c) => c.cid === cid),
+        `${cid} 的目录声明供 ${model}，应出现在候选里`,
+      );
+    }
+    // 移出家族：任何渠道都不再供给（注册表条目已删）
+    assert.deepEqual(gw.poolCandidates("qwen3.8-flash"), [], "qwen3.8-flash 已移出对外家族");
+  });
+
+  it("候选来自渠道目录 ∪ 注册表兜底（不再以注册表为唯一口径）", () => {
+    // 家族外型号一律不进候选（家族表是硬边界）
+    for (const model of ["longcat-2.5", "deepseek-v4-pro", "glm-5.3-flash"]) {
+      assert.deepEqual(gw.poolCandidates(model), [], `${model} 不在家族表内，候选应为空`);
+    }
+    // 千问办公只卖「标准」档：其余两档与具体型号名都不进家族表
+    assert.deepEqual(gw.poolCandidates("qwork-pro"), [], "高级档未放行");
+    assert.deepEqual(gw.poolCandidates("qwen3.8-max"), [], "最强档未放行");
+  });
+
+  it("池 id 与候选渠道的一致性（家族内 / 有货 / 候选都是已注册渠道）", () => {
+    const known = new Set(ACTIVE_CIDS);
     // POOL_MODELS 是 Proxy（每次属性访问都重建快照），先落一份本地快照再遍历
     const pooled = [...gw.POOL_MODELS];
     assert.ok(pooled.length > 0, "POOL_MODELS 不应为空");
     for (const id of pooled) {
-      const sep = id.indexOf("/");
-      assert.ok(sep > 0, `池 id 不是 <cid>/<模型> 形态：${id}`);
-      const cid = id.slice(0, sep);
-      assert.ok(known.has(cid), `池 id 的前缀不是已注册渠道：${id}`);
-      assert.deepEqual(candsOf(id), [cid], `池 id 的候选渠道应恰好是它自己：${id}`);
+      assert.ok(gw.isPoolModel(id), `池 id 必须是对外家族名：${id}`);
+      assert.equal(gw.canonicalOf(id), id, `池 id 必须是 canonical：${id}`);
+      const cands = gw.poolCandidates(id);
+      assert.ok(cands.length > 0, `池 id 至少有一个候选渠道：${id}`);
+      for (const c of cands) {
+        assert.ok(known.has(c.cid), `候选渠道必须是已注册渠道：${id} → ${c.cid}`);
+      }
     }
   });
 
-  it("裸模型名与未知渠道 → 400 unknown_model", async () => {
+  it("家族外模型名 → 400 unknown_model", async () => {
     const post = (model: string) =>
       fetch(`http://${running.addr}/v1/chat/completions`, {
         method: "POST",
         body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
         headers: { "Content-Type": "application/json" },
       });
-    // 裸模型名（无渠道前缀）：渠道必须由请求方指定
-    const bare = await post("deepseek-v4.1-flash");
+    const bare = await post("no-such-model-anywhere-xyz");
     assert.equal(bare.status, 400);
     assert.equal(((await bare.json()) as { error: { code: string } }).error.code, "unknown_model");
-    // 未注册的渠道前缀
-    const unknownChan = await post("nonexistent/deepseek-v4.1-flash");
-    assert.equal(unknownChan.status, 400);
-    assert.equal(
-      ((await unknownChan.json()) as { error: { code: string } }).error.code,
-      "unknown_model",
-    );
+    // 非家族模型（网关不代理家族外的模型名）
+    for (const model of ["longcat-2.5", "deepseek-v4-flash", "deepseek-v4-pro"]) {
+      const other = await post(model);
+      assert.equal(other.status, 400, model);
+      assert.equal(((await other.json()) as { error: { code: string } }).error.code, "unknown_model");
+    }
   });
 
-  it("有效的 <cid>/<模型> 请求：测试环境无凭据 → 503 not_authenticated", async () => {
+  it("有效的家族名请求：测试环境无凭据 → 503 not_authenticated", async () => {
     const model = gw.POOL_MODELS[0];
     assert.ok(model, "池里有模型");
     const resp = await fetch(`http://${running.addr}/v1/chat/completions`, {
@@ -137,47 +186,4 @@ describe("仓库级模型池", () => {
     assert.equal(resp.status, 503);
   });
 
-  it("渠道一览：池 id 与渠道目录一一对应", () => {
-    const rows = gw.channels().map((c) => {
-      // 与 CLI 同样的容错：目录读取抛错的渠道 → 视为空
-      let exposed: string[] = [];
-      try {
-        exposed = gw.runInChannel(c.config.cid, () => c.catalog.exposedIds());
-      } catch {
-        exposed = [];
-      }
-      return { cid: c.config.cid, exposed };
-    });
-    assert.equal(rows.length, EXPECTED_CIDS.length);
-
-    const contributed = (cid: string) =>
-      [...gw.POOL_MODELS].filter((model) => model.split("/")[0] === cid);
-
-    assert.ok(
-      contributed("workbuddyai").includes("workbuddyai/deepseek-v4.1-flash"),
-      "workbuddyai 应贡献 deepseek-v4.1-flash",
-    );
-    // qoder 的上游 key 是短名（gfmodel），由渠道自己映射成池内名
-    assert.ok(
-      contributed("qoder").includes("qoder/glm-5.3-flash"),
-      "qoder 应贡献 glm-5.3-flash",
-    );
-
-    // 阈值随已注册渠道数走，**不写死数字**（同 4.1-flash 那处的理由）：
-    //    每个注册渠道都该至少暴露一个模型，故下界就是渠道总数。
-    const contributing = gw.channels().filter((c) => contributed(c.config.cid).length > 0);
-    assert.ok(
-      contributing.length >= EXPECTED_CIDS.length,
-      `每个渠道都应有贡献（下界 ${EXPECTED_CIDS.length}），实际 ${contributing.length}`,
-    );
-
-    // 每个目录条目都应出现在该渠道的对外池 id 里（规范名形态，不在这里重写归一化）
-    for (const row of rows) {
-      const listed = contributed(row.cid);
-      for (const id of row.exposed) {
-        const poolId = gw.poolModelId(row.cid, id);
-        assert.ok(listed.includes(poolId), `${row.cid} 的 ${id} 应对外为 ${poolId}`);
-      }
-    }
-  });
 });

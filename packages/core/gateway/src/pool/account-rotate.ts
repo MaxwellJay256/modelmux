@@ -19,7 +19,9 @@ import {
   noteAccountQuotaExhausted,
   readAccountCredential,
   readIndex,
+  runForAccountCredential,
   type PoolAccount,
+  type PoolIndex,
 } from "../runtime/account-pool.js";
 import { normalizeCredentialShape } from "../runtime/credential-shape.js";
 import { lastKnownRemain, writeAccountBilling } from "./pool-usage.js";
@@ -27,7 +29,7 @@ import { lastKnownRemain, writeAccountBilling } from "./pool-usage.js";
 /** 视为「额度耗尽」的余额上限。
  *
  * 为什么不是 0：上游的额度结算有延迟（实时余额可能停在 0 而请求已经能跑），
- * 且各家单位不同（积分 / credits）。<100 是主人给的实测口径，留一点余量避免
+ * 且各家单位不同（积分 / credits）。<100 是实测口径，留一点余量避免
  * 「余额 3 但已经打不动」的边缘账号继续吃掉请求。
  */
 export const LOW_CREDIT_THRESHOLD = 100;
@@ -80,7 +82,7 @@ async function refreshOne(channel: Channel, cid: string, key: string): Promise<n
   const raw = runInChannel(cid, () => readAccountCredential(key, cid));
   const credential = normalizeCredentialShape(raw);
   if (Object.keys(credential).length === 0) return null;
-  const credits: unknown = await runInChannel(cid, () =>
+  const credits: unknown = await runForAccountCredential(cid, key, () =>
     channel.billing.fetchCredits({ refreshOn401: false, credential }),
   );
   writeAccountBilling(cid, key, credits);
@@ -94,13 +96,47 @@ async function refreshOne(channel: Channel, cid: string, key: string): Promise<n
  * 排除正在冷却的（额度没刷新，换过去一样失败；而且 `activateAccount` 会顺手清掉
  * `cooldown_until` —— 等于假装它有额度）与凭据失效的（重试永远无效）。
  *
+ * **也必须排除 `health === "error"`（连败熔断）**：`activateAccount` 内部会
+ * `clearTrippedState()` 把 `trip_until` / `trip_backoff_ms` / `fail_streak` 清零并恢复
+ * `ok`，所以一旦选中熔断中的账号，换号就绕过了熔断 —— 那个账号本来该被指数退避隔离
+ * 一段时间，结果每次额度耗尽都把整个池轮一遍（2026-11-08 评审指出）。
+ *
  * 排序分三档、档内按额度降序：① **已知够用**（`≥ LOW_CREDIT_THRESHOLD`）最可靠；
  * ② **未知额度** —— 「没查过」比「查过很少」有希望；③ **已知不够用**，凑数用。
  * ①必须压过②：换到一个已经确认没钱的账号会立刻再撞额度耗尽，比「可能有钱」更糟。
  */
-function pickAlternative(accounts: PoolAccount[], excludeKey: string, cid: string): PoolAccount | null {
+/**
+ * 账号凭据是否可用（渠道自己说了算，共享层不解析字段）。
+ *
+ * 为什么需要：`health` 是**行为**标记（最近请求成败），空壳凭据文件（登出写成 `{}`、
+ * 轮转/裁剪留下的半状态）行为上从没被拒绝过 → `health === "ok"` → 被选为换号目标，
+ * 换过去当场 `NotLoggedInError`，把一次 504 放大成整条请求失败
+ * （2026-11-11 渠道日志实证：504 → 换号 → 空壳账号 → not logged in）。
+ * 判据 = 在该账号的凭据落点上下文里跑 `cred.load()`，任何抛错都算不可用：
+ * `NotLoggedInError` 是「确定没用」，真故障（损坏 / 权限）是「此刻说不清」——
+ * 换号的目的是找一个**现在**能用的账号，两种都不该换过去。
+ */
+function accountCredentialUsable(channel: Channel, cid: string, key: string): boolean {
+  try {
+    return runForAccountCredential(cid, key, () => channel.cred.load()) != null;
+  } catch {
+    return false;
+  }
+}
+
+function pickAlternative(
+  accounts: PoolAccount[],
+  excludeKey: string,
+  cid: string,
+  channel: Channel,
+): PoolAccount | null {
   const usable = accounts.filter(
-    (a) => a.key !== excludeKey && a.health !== "unauthorized" && !isAccountCooling(a),
+    (a) =>
+      a.key !== excludeKey &&
+      a.health !== "unauthorized" &&
+      a.health !== "error" &&
+      !isAccountCooling(a) &&
+      accountCredentialUsable(channel, cid, a.key),
   );
   if (usable.length === 0) return null;
   const known = (a: PoolAccount): number | null => lastKnownRemain(cid, a.key);
@@ -128,14 +164,49 @@ export async function rotateExhaustedAccount(
   opts: { code?: string } = {},
 ): Promise<RotateResult> {
   const channel = channels().find((c) => c.config.cid === cid);
-  if (!channel || !channelCapabilities(channel.config).billing) {
-    return { switched: false, remain: null, reason: "渠道没有额度能力，不按额度换号" };
+  if (!channel) {
+    return { switched: false, remain: null, reason: "渠道未注册" };
   }
+  const hasBilling = channelCapabilities(channel.config).billing;
+  // 无额度能力的渠道：只认「凭据失效」类换号（账号被上游拒绝就切下一个健康账号），
+  // 额度换号无意义 —— 判据不能走账单核查（fetchCredits 对这类渠道直接抛错）
+  const authSwap = !hasBilling && opts.code === "upstream_unauthenticated";
   const index = runInChannel(cid, () => readIndex(cid));
   if (!index.active) return { switched: false, remain: null, reason: "当前没有生效账号" };
   const activeKey = index.active;
   if (index.accounts.length < 2) {
     return { switched: false, remain: null, reason: "池内只有一个账号，没有可切换的目标" };
+  }
+
+  if (authSwap) {
+    return swapWithoutBilling(cid, index, activeKey, channel, logger);
+  }
+
+  // **瞬时故障快速换号**（不查账单）：上游 5xx / 断流 / 超时是这一台账号这一次的问题，
+  // 池里还有别的账号就该立刻换，而不是先花一次额度查询去证明「不是额度问题」再换。
+  //
+  // 为什么不等账单：两段式判定（先读快照、再实时重查）是为「额度耗尽」服务的 ——
+  // 而瞬时故障的诉求是**尽快换到还能用的账号**。2026-11-08 实测：一次失败后同渠道
+  // 还要干等 45s（15s + 30s 两轮探测重试）才轮到下一个候选。
+  // 判据刻意不含额度码（那种要走账单证据）与鉴权码（换了会掩盖凭据真因）。
+  if (opts.code === "upstream_error" || opts.code === "upstream_timeout") {
+    const target = pickAlternative(index.accounts, activeKey, cid, channel);
+    if (target) {
+      runInChannel(cid, () => activateAccount(target.key, cid));
+      logger(
+        `account rotated (${cid}): ${short(activeKey)} → ${short(target.key)} (transient upstream failure)`,
+      );
+      return {
+        switched: true,
+        from: short(activeKey),
+        to: short(target.key),
+        remain: null,
+        reason: `上游瞬时故障（${opts.code}），直接换到 ${short(target.key)}`,
+      };
+    }
+  }
+  if (!hasBilling) {
+    return { switched: false, remain: null, reason: "渠道没有额度能力，不按额度换号" };
   }
 
   // ① 最近一次账单（本地快照，零网络开销）：还有额度就不该怀疑额度。
@@ -180,7 +251,7 @@ export async function rotateExhaustedAccount(
     }),
   );
 
-  const target = pickAlternative(index.accounts, activeKey, cid);
+  const target = pickAlternative(index.accounts, activeKey, cid, channel);
   if (!target) {
     return {
       switched: false,
@@ -199,6 +270,34 @@ export async function rotateExhaustedAccount(
     to: short(target.key),
     remain,
     reason: `额度不足（${remain} < ${LOW_CREDIT_THRESHOLD}），已切到 ${short(target.key)}`,
+  };
+}
+
+/**
+ * 无额度能力渠道的凭据失效换号：账号被上游拒绝时切到下一个健康账号。
+ *
+ * 不查账单（这类渠道没有 fetchCredits）；旧账号的 unauthorized 标记由调用链
+ * （attempt 的 auth 失败分支 `markActiveHealth`）写入，这里只负责选下一个并切换。
+ */
+function swapWithoutBilling(
+  cid: string,
+  index: PoolIndex,
+  activeKey: string,
+  channel: Channel,
+  logger: (m: string) => void,
+): RotateResult {
+  const target = pickAlternative(index.accounts, activeKey, cid, channel);
+  if (!target) {
+    return { switched: false, remain: null, reason: "池内其它账号都不可用（凭据失效/冷却）" };
+  }
+  runInChannel(cid, () => activateAccount(target.key, cid));
+  logger(`account rotated (${cid}): ${short(activeKey)} → ${short(target.key)} (credential rejected)`);
+  return {
+    switched: true,
+    from: short(activeKey),
+    to: short(target.key),
+    remain: null,
+    reason: `凭据被上游拒绝，已切到 ${short(target.key)}`,
   };
 }
 
@@ -228,7 +327,7 @@ export function switchOffCoolingAccount(
   if (!active || !isAccountCooling(active)) {
     return { switched: false, remain: null, reason: "生效账号不在冷却中" };
   }
-  const target = pickAlternative(index.accounts, activeKey, cid);
+  const target = pickAlternative(index.accounts, activeKey, cid, channel);
   if (!target) {
     return {
       switched: false,

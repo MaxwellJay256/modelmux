@@ -12,14 +12,16 @@
 
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { clearChannels, setChannel, type ChannelConfig, type Channel } from "../dist/runtime/channel.js";
+import { registerChannelSupply } from "./registry-seed.ts";
 import * as gateway from "../dist/http/server.js";
 import * as paths from "../dist/runtime/paths.js";
+import { localDate } from "../dist/runtime/log-store.js";
 
 const CID = "emptystream";
 
@@ -117,7 +119,7 @@ function makeChannel(): Channel {
       fetchModels: async () => ({}),
       resolveConfig: () => ({ baseUrl: "http://127.0.0.1:1" }),
     },
-    catalog: { exposedIds: () => ["glm-5.3-flash"], resolveModel: (n: string) => n },
+    catalog: { exposedIds: () => ["deepseek-v4.1-flash"], resolveModel: (n: string) => n },
     billing: {
       CreditsError: class CreditsError extends Error {},
       fetchCredits: async () => ({ ok: true, total: {}, packages: [] }),
@@ -130,7 +132,7 @@ async function chat(addr: string, stream: boolean): Promise<{ status: number; te
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: `${CID}/glm-5.3-flash`,
+      model: "deepseek-v4.1-flash",
       messages: [{ role: "user", content: "hi" }],
       stream,
     }),
@@ -147,6 +149,8 @@ describe("上游 200 + 完全空的流", () => {
   before(async () => {
     root = mkdtempSync(join(tmpdir(), "modelmux-empty-stream-"));
     process.env["MODELMUX_HOME"] = root;
+  registerChannelSupply("emptystream", ["deepseek-v4.1-flash"]);
+
     upstream = await fakeUpstream();
     process.env["MB_TEST_UPSTREAM"] = upstream.url;
 
@@ -198,5 +202,25 @@ describe("上游 200 + 完全空的流", () => {
     };
     assert.equal(payload.choices?.[0]?.message?.content, "hello");
     assert.equal(payload.usage?.total_tokens, 4);
+  });
+
+  it("零帧（流式）：唯一候选也如实终局 502，绝不回 200 空响应", async () => {
+    // 2026-11-16 实测：loomy 一次 10.3s 的空流被静默 end，客户端（ZCode）只看到
+    // 「200 + 空响应」，报成 "Provider returned a business error"，而访问日志记 success。
+    upstream.setMode("empty");
+    upstream.setBody("");
+    const { status, text } = await chat(gw.addr, true);
+    // 写头挪到首次写出之后，空流已能换候选；本用例只有一条候选，故由编排层终局 502
+    // （跨候选换人由 empty-stream-retry.test.ts 锁）
+    assert.equal(status, 502, `空流必须报错，不能把 200 空响应递给客户端（实际 ${status}: ${text.slice(0, 200)}）`);
+    const payload = JSON.parse(text) as { error?: { code?: string } };
+    assert.equal(payload.error?.code, "upstream_stream_failed", text);
+    const failureLog = join(root, "logs", "access", localDate(), "failure.log");
+    const lines = existsSync(failureLog) ? readFileSync(failureLog, "utf8").trim().split("\n") : [];
+    const last =
+      lines.length > 0
+        ? (JSON.parse(lines[lines.length - 1] ?? "{}") as { error?: string; outcome?: string })
+        : null;
+    assert.equal(last?.error, "upstream_stream_failed", "空流必须落进失败日志，否则成功率与可靠性系数被污染");
   });
 });

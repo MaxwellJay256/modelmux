@@ -17,15 +17,13 @@ import { fileURLToPath } from "node:url";
 import { serviceName } from "../server.js";
 import type { LoginInputRequest } from "../../runtime/channel.js";
 import {
-  MODEL_REQUEST_PATH,
-  PAYLOAD_SLICE_BYTES,
+  MODEL_REQUEST_PATHS,
   appendGateway,
   queryAccessLogs,
-  readPayloads,
-  readPayloadSlice,
   type AccessOutcome,
 } from "../../runtime/log-store.js";
 import { computeUsageStats, type UsageRange } from "../../runtime/usage-stats.js";
+import { refreshCatalog } from "../../pool/catalog-snapshot.js";
 
 export type { LoginInputRequest };
 
@@ -92,9 +90,18 @@ export interface ChannelCaps {
   billing: boolean;
 }
 
-/** 状态快照；`ui_state` 取值 probing / login / error / running。 */
+/**
+ * 状态快照。
+ *
+ * `ui_state` 只表示**网关状态**（probing / login / running），不承载登录结果；
+ * 上一轮登录的结果在 `login_result`（idle / done / error），是一次性事件。
+ * 早先 `error` / `done` 直接写进 `ui_state`，一次登录失败就让右上角永久显示
+ * 「登录失败」，直到下次登录成功才被覆盖。
+ */
 export interface UiSnapshot {
   ui_state: string;
+  /** 上一轮登录的结果：`idle`（无结果）/ `done` / `error`。 */
+  login_result: "idle" | "done" | "error";
   message: string;
   /** 授权页 URL。**不要在这里扫码**（每次加载都是新的二维码会话）。 */
   auth_url: string;
@@ -108,7 +115,33 @@ export interface UiSnapshot {
   base_url: string;
   chat_url: string;
   endpoints: string[];
-  models: string[];
+  /** 网关自身版本（仓库 `VERSION` 常量），给控制台顶栏显示当前版本。 */
+  version: string;
+  /** 版本更新提示（后台每天检测一次；无提示为 null）。 */
+  update: import("../../runtime/update-check.js").UpdateNotice | null;
+  /**
+   * 对外模型池的**「模型 × 渠道」矩阵**：一个模型可能由多个渠道供给。
+   *
+   * 模型 id 是 deepseek 裸名（不再有 `<cid>/` 前缀）；渠道凭 `cid` 列展示，
+   * 元数据取**该渠道**的值（同一模型在不同渠道倍率/规格可能不同）。
+   */
+  models: Array<{
+    model: string;
+    cid: string;
+    meta: import("../../pool/pool-targets.js").PoolModelMeta;
+  }>;
+  /**
+   * 模型级渠道偏好：每个对外模型「优先走哪家」。
+   *
+   * `channels` 是该模型的全部候选渠道（下拉的选项来源），`preferred` 为当前偏好
+   * （`null` = 自动选路）。偏好的渠道在候选里**置顶**，其余仍按剩余额度排在后面 ——
+   * 被偏好的渠道冷却 / 额度耗尽时自然顺延，不需要额外开关。
+   */
+  model_prefs: Array<{
+    model: string;
+    channels: string[];
+    preferred: string | null;
+  }>;
   /**
    * 待回答的输入请求（渠道两步登录，如 loomy 的短信验证码）；`null` = 当前没有。
    *
@@ -117,38 +150,65 @@ export interface UiSnapshot {
    */
   login_input: LoginInputRequest | null;
   /**
-   * 每模型附加信息（键 = 池模型 id）：消耗倍率与营销角标。
-   *
-   * 倍率为 null 表示该渠道目录没有提供；前端据此不渲染倍率标签。
-   */
-  model_info: Record<string, import("../../pool/pool-targets.js").PoolModelMeta>;
-  /**
    * 各渠道的能力位（键 = cid）。
    *
    * 为什么要下发：前端要区分「该渠道没有倍率概念（订阅制）」。靠**能力位**而不是
    * 前端硬编码渠道名 —— 否则每接一个订阅制渠道，前端就得跟着改一次。
    */
   channel_caps: Record<string, ChannelCaps>;
+  /**
+   * 各接入目标（zcode / dsh）当前的接入态（键 = target）。
+   *
+   * 开关式 UI 的状态源：true = 已接入（客户端配置已指向网关），false = 未接入。
+   * 由接入备份清单 + 标记文件推导（见 `app/integrate.ts` 的 `integrationStatus`）。
+   */
+  integrations: Record<string, boolean>;
+  /**
+   * 各接入目标的「模型有更新」（键 = target；null = 无更新）。
+   *
+   * 服务端算好差集再下发：前端没有「接入那一刻写入了哪些模型」这个基准，
+   * 自己 diff 不出来（见 `app/integrate.ts` 的 `integrationUpdates`）。
+   * 类型就地同构声明 —— http 层不许向上依赖 app 层。
+   */
+  integration_updates: Record<string, { added: string[]; removed: string[]; at: string } | null>;
+  /**
+   * 用户选的主题模式：`system`（跟随系统）/ `dark` / `light`。
+   *
+   * `system` 的解析（prefers-color-scheme）在**前端**做 —— 服务端不知道显示器设置。
+   * 持久化在 `~/.modelmux/setting.json`（写走 POST /api/theme）。
+   */
   theme_mode: string;
-  resolved_theme: string;
+  /**
+   * 设置弹窗的渠道开关：`enabled=false` 的渠道从账号池隐藏、不参与选路。
+   *
+   * 只给 `cid`（渠道包名，小写）—— 设置页展示的就是 `packages/core/channels/<cid>`
+   * 里的那个标识，不附展示名，避免多一层映射对不上号。
+   * 关闭 ≠ 注销：凭据与登录态都在，勾回来即恢复（存 setting.json 的 disabled_channels）。
+   */
+  channel_toggles: Array<{ cid: string; enabled: boolean }>;
   gateway_error: string;
 }
 
 export function emptySnapshot(): UiSnapshot {
   return {
     ui_state: "probing",
+    login_result: "idle",
     message: "",
     auth_url: "",
     qr_url: "",
     base_url: "",
     chat_url: "",
-    endpoints: ["/v1/chat/completions", "/v1/models", "/health"],
+    endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/v1/models", "/health"],
+    version: "",
+    update: null,
     models: [],
+    model_prefs: [],
     login_input: null,
-    model_info: {},
     channel_caps: {},
+    integrations: {},
+    integration_updates: {},
     theme_mode: "system",
-    resolved_theme: "dark",
+    channel_toggles: [],
     gateway_error: "",
   };
 }
@@ -187,6 +247,32 @@ export interface ControlBridge {
    * 既不算成功也不算失败，界面上也没法再回答它。
    */
   cancelInput?: () => void;
+  /**
+   * 一键接入：把本机 harness 的模型配置改写成网关的对外模型名。
+   *
+   * 同 `triggerLogin`：写的是**客户端**配置（`~/.zcode` / `~/.dsh`），
+   * 实现放 app 层（`app/integrate.ts`），控制台只转交用户点的那一下。
+   */
+  integrate?: (target: "zcode" | "dsh") => {
+    ok: boolean;
+    error?: string;
+    /** 变更说明（人读，控制台作展示）。 */
+    notes?: string[];
+    /** 需要用户处置的警告（备份清单读不出 / 备份未登记 等）；不透出会被当噪音忽略。 */
+    warnings?: string[];
+  };
+  /**
+   * 一键还原：把目标恢复成接入前状态（取该目标最新一次备份）。
+   * 实现同为 `app/integrate.ts` 的 `restoreClient`。
+   */
+  restore?: (target: "zcode" | "dsh") => {
+    ok: boolean;
+    error?: string;
+    restored: string[];
+    removed: string[];
+    /** 跳过条目 / 备份缺失等需要让用户知道的说明（不透出会伪装成「已还原」）。 */
+    notes: string[];
+  };
 }
 
 export interface ConsoleServer {
@@ -246,6 +332,38 @@ function serveStatic(res: import("node:http").ServerResponse, relPath: string): 
   res.end(readFileSync(file));
 }
 
+/**
+ * 是否本机直连（非公共命令的唯一放行条件）。
+ *
+ * 用 socket 远端地址而不是 Origin/Host 头：头可由客户端伪造，socket 对端不能。
+ *
+ * **明确假设：网关不支持前置反向代理**（含同机 nginx/caddy）。若将来引入代理，
+ * 所有外部请求的对端都会变成 127.0.0.1，这个判定会整体失效 —— 届时必须改为
+ * 「显式配置 trustedProxy + 校验代理注入的源地址头」，不能沿用本实现。
+ * 当前形态（单机自建网关、只监听回环）下不存在该风险。
+ */
+function isLocalDirect(req: import("node:http").IncomingMessage): boolean {
+  const remote = req.socket.remoteAddress ?? "";
+  return LOOPBACK_HOSTS.has(remote) || LOOPBACK_HOSTS.has(remote.replace(/^::ffff:/, ""));
+}
+
+/**
+ * 请求的 Host / Origin 是否指向**本机**。
+ *
+ * 为什么不能只信 socket 回环：DNS rebinding 下浏览器把攻击者域名解析到 127.0.0.1，
+ * 对端地址必然是回环、`isLocalDirect` 恒真；而请求的 `Host` 与 `Origin` 仍是攻击者
+ * 域名 —— 它们只能由客户端提供，无法被 rebinding 抹掉。用它们做判据，rebinding 页面
+ * 会以 `Host: evil.com` 被拒（它没法把 Host 改成 127.0.0.1，改了就不是那个源了）。
+ *
+ * `Host` 缺失时按非本机处理（Node 对 HTTP/1.1 会补默认值，正常浏览器必带）。
+ */
+function isLoopbackHostHeader(req: import("node:http").IncomingMessage): boolean {
+  const raw = req.headers["host"];
+  if (typeof raw !== "string" || raw === "") return false;
+  const hostname = raw.split(":")[0]?.toLowerCase() ?? "";
+  return LOOPBACK_HOSTS.has(hostname) || LOOPBACK_HOSTS.has(`[${hostname}]`);
+}
+
 /** 写操作同源校验（比对 host:port，避免只比 hostname 时跨端口请求被放行）。 */
 function isSameOrigin(req: import("node:http").IncomingMessage, host: string): boolean {
   const origin = req.headers["origin"];
@@ -261,65 +379,27 @@ function isSameOrigin(req: import("node:http").IncomingMessage, host: string): b
   }
 }
 
-/** ping 的等待上限（毫秒）：比客户端常见的 60s 超时早一步收手，好把「超时」当结果返回。 */
-const PING_TIMEOUT_MS = 45_000;
-
-/** 回环地址名单：ping 只能打回本机，Host 头是客户端给的，不校验就是 SSRF 跳板。 */
+/** 回环地址名单：本机直连判定与 Host / Origin 校验共用。 */
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
-/**
- * ping 一个模型：向**本进程**发一次最小 chat 请求并计时。
- *
- * 为什么走 HTTP 自请求、不做内部直调：只有走完整链路才算 ping —— 候选选择、自动换号、
- * 排队重试、响应归一化、护栏都在链路上，绕过它们测出的「成功」不代表客户端会成功。
- *
- * 请求形态取最小：单条 user 消息 + `max_tokens: 1` + 非流式 —— 计费最小；非流式还能拿到
- * 确定的状态码（流式要读完流才知道成败）。`ms` 量到**响应体读完**为止，不是只到响应头。
- */
-async function pingModel(
-  req: import("node:http").IncomingMessage,
-  model: string,
-): Promise<{ ok: boolean; model: string; ms: number; status: number; error: string }> {
-  const target = new URL(`http://${req.headers.host ?? ""}/v1/chat/completions`);
-  if (!LOOPBACK_HOSTS.has(target.hostname)) {
-    return { ok: false, model, ms: 0, status: 0, error: "ping 只能发往本机回环地址" };
-  }
-  const started = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
-  try {
-    const upstream = await fetch(target, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-        stream: false,
-      }),
-      signal: controller.signal,
-    });
-    const status = upstream.status;
-    const text = await upstream.text().catch(() => "");
-    const ms = Date.now() - started;
-    if (!upstream.ok) {
-      // 错误体是网关自己的 JSON（`{error:{message}}`），截断后原样回给界面，别自己编原因
-      return { ok: false, model, ms, status, error: text.slice(0, 300) || `HTTP ${status}` };
+/** 总览里已留痕过「账号读取失败」的渠道（进程生命周期内一次）：防止 5s 轮询刷屏。 */
+const overviewAccountFailures = new Set<string>();
+
+/** 读一次 JSON 请求体（供 /api/providers 的 POST 用；超限按截断处理）。 */
+function readBody(req: import("node:http").IncomingMessage, onBody: (body: Record<string, unknown>) => void): void {
+  let body = "";
+  req.on("data", (chunk) => {
+    body += String(chunk);
+  });
+  req.on("end", () => {
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = JSON.parse(body || "{}") as Record<string, unknown>;
+    } catch {
+      appendGateway("console body parse failed");
     }
-    return { ok: true, model, ms, status, error: "" };
-  } catch (err) {
-    const ms = Date.now() - started;
-    const aborted = err instanceof Error && err.name === "AbortError";
-    return {
-      ok: false,
-      model,
-      ms,
-      status: 0,
-      error: aborted ? `超时（> ${Math.round(PING_TIMEOUT_MS / 1000)}s）` : String(err),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
+    onBody(parsed);
+  });
 }
 
 /**
@@ -335,8 +415,32 @@ export function createConsoleHandler(
   host = DEFAULT_UI_HOST,
 ): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void {
   return (req, res) => {
-    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    // `new URL()` 对畸形 request-target 抛 `ERR_INVALID_URL`（与 http/server.ts 同因）：
+    // 这里是同步 handler，异常会直接冒到 server 的 request 事件并杀进程，所以自己兜住。
+    let path: string;
+    try {
+      path = new URL(req.url ?? "/", "http://localhost").pathname;
+    } catch {
+      if (!res.headersSent) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid request target" }));
+      }
+      return;
+    }
     const p = (suffix: string): string => `${prefix}${suffix}`;
+
+    // —— API 前置：Host 必须是本机 ——
+    //
+    // 挡的是 DNS rebinding：浏览器把攻击者域名解析到 127.0.0.1 后，socket 对端必然是
+    // 回环（`isLocalDirect` 恒真），只有 Host / Origin 还保留着攻击者域名。所有 API
+    // （含只读的 state）都走这条；静态资源与 SPA 页面不校验，它们不含敏感数据。
+    if (path.startsWith(p("/api/"))) {
+      if (!isLoopbackHostHeader(req)) {
+        appendGateway(`console api rejected non-loopback Host: ${String(req.headers["host"] ?? "(none)")}`);
+        json(res, { ok: false, error: "请求来源主机被拒绝" }, 403);
+        return;
+      }
+    }
 
     // —— 静态（GET） ——
     if (path === p("/") && (req.method === "GET" || req.method === "HEAD")) {
@@ -400,15 +504,14 @@ export function createConsoleHandler(
       }
       const q = new URL(req.url ?? "/", "http://localhost").searchParams;
       const outcomeRaw = q.get("outcome");
+      // 只有 success / failure 两个桶（历史上的 `other` 已并入 failure，见 log-store）
       const outcome: AccessOutcome | undefined =
-        outcomeRaw === "success" || outcomeRaw === "failure" || outcomeRaw === "other"
-          ? outcomeRaw
-          : undefined;
+        outcomeRaw === "success" || outcomeRaw === "failure" ? outcomeRaw : undefined;
       const streamRaw = q.get("stream");
       const page = queryAccessLogs({
-        // 日志页只展示**模型请求**：`/health` 等非模型请求也在 access 日志里，
-        // 但主人要的是「请求日志」，混进来只会稀释列表。
-        path: MODEL_REQUEST_PATH,
+        // 日志页只展示**模型请求**（三种入站协议）：`/health` 等非模型请求也在
+        // access 日志里，但这一页要的是「模型请求」，混进来只会稀释列表。
+        paths: MODEL_REQUEST_PATHS,
         date: q.get("date") ?? undefined,
         outcome,
         cid: q.get("cid") ?? undefined,
@@ -420,38 +523,6 @@ export function createConsoleHandler(
         offset: intParam(q.get("offset"), 0),
       });
       json(res, { ok: true, ...page });
-      return;
-    }
-
-    if (path === p("/api/logs/payload")) {
-      if (req.method !== "GET") {
-        json(res, { ok: false, error: "use GET" }, 405);
-        return;
-      }
-      if (!isSameOrigin(req, host)) {
-        json(res, { ok: false, error: "跨源请求已拒绝" }, 403);
-        return;
-      }
-      const q = new URL(req.url ?? "/", "http://localhost").searchParams;
-      const id = q.get("id") ?? "";
-      const date = q.get("date") ?? undefined;
-      // 分片读取：弹窗首屏只要元数据，正文按片取（整段返回会把 MB 级明文塞进首屏）。
-      const part = q.get("part");
-      if (part === "body") {
-        const offset = intParam(q.get("offset"), 0);
-        const limit = intParam(q.get("limit"), PAYLOAD_SLICE_BYTES);
-        const slice = readPayloadSlice(id, date, q.get("phase") ?? undefined, offset, limit);
-        if (!slice) {
-          json(res, { ok: false, error: "payload not found", id }, 404);
-          return;
-        }
-        json(res, { ok: true, id, date: date ?? null, ...slice });
-        return;
-      }
-      // 默认只回元数据；`full=1` 才带整段正文（兼容旧前端与排障，受上限保护）。
-      const withBody = q.get("full") === "1";
-      const records = readPayloads(id, date, { withBody });
-      json(res, { ok: true, id, date: date ?? null, records });
       return;
     }
 
@@ -467,48 +538,12 @@ export function createConsoleHandler(
       }
       const q = new URL(req.url ?? "/", "http://localhost").searchParams;
       const raw = q.get("range");
-      // `365d` 供热力图用（52 周一年）；实际有数据的天数受日志保留期限制
-      const range: UsageRange = raw === "7d" || raw === "30d" || raw === "90d" || raw === "365d" ? raw : "30d";
+      // `365d` 供热力图用（52 周一年）；`all` = 累计（保留期内全量）；其余为区间天数
+      const range: UsageRange =
+        raw === "today" || raw === "7d" || raw === "30d" || raw === "90d" || raw === "365d" || raw === "all"
+          ? raw
+          : "30d";
       json(res, { ok: true, ...computeUsageStats(range) });
-      return;
-    }
-
-    if (path === p("/api/ping")) {
-      if (req.method !== "POST") {
-        json(res, { ok: false, error: "use POST" }, 405);
-        return;
-      }
-      // 会真的花掉一次上游请求（1 个输出 token），按写操作对待：必须同源。
-      if (!isSameOrigin(req, host)) {
-        json(res, { ok: false, error: "跨源请求已拒绝" }, 403);
-        return;
-      }
-      let body = "";
-      req.on("data", (chunk) => {
-        body += String(chunk);
-      });
-      req.on("end", () => {
-        void (async () => {
-          let parsed: { model?: unknown };
-          try {
-            parsed = JSON.parse(body || "{}") as { model?: unknown };
-          } catch {
-            json(res, { ok: false, error: "invalid json" }, 400);
-            return;
-          }
-          const model = typeof parsed.model === "string" ? parsed.model.trim() : "";
-          if (!model) {
-            json(res, { ok: false, error: "参数 model 必填" }, 400);
-            return;
-          }
-          const result = await pingModel(req, model);
-          json(res, result, 200);
-        })().catch((err) => {
-          // 与 `/api/commands` 同待遇：意外 rejection 不能变成 unhandledRejection
-          appendGateway(`console /api/ping failed: ${String(err)}`);
-          if (!res.headersSent) json(res, { ok: false, error: `ping failed: ${String(err)}` }, 500);
-        });
-      });
       return;
     }
 
@@ -595,11 +630,15 @@ export function createConsoleHandler(
             ...(bridge.submitCallback ? { submitCallback: bridge.submitCallback } : {}),
             ...(bridge.submitInput ? { submitInput: bridge.submitInput } : {}),
             ...(bridge.cancelInput ? { cancelInput: bridge.cancelInput } : {}),
+            ...(bridge.integrate ? { integrate: bridge.integrate } : {}),
+            ...(bridge.restore ? { restore: bridge.restore } : {}),
           });
           const result = await handle({
             action,
             ...(typeof cid === "string" ? { cid } : {}),
             args: typeof args === "object" && args !== null ? args as Record<string, unknown> : {},
+            // 来源标记由路由层注入，覆盖客户端可能自带的同名字段
+            admin: isLocalDirect(req),
           });
           json(res, result, result.ok ? 200 : 400);
         })().catch((err) => {
@@ -622,7 +661,7 @@ export function createConsoleHandler(
         return;
       }
       void (async () => {
-        const [{ poolModels, poolModelMetas }, { listAccounts }, { channels }, { runInChannel }] =
+        const [{ poolModels, poolModelMetas, poolCandidates }, { listAccounts }, { channels }, { runInChannel }] =
           await Promise.all([
             import("../../pool/pool-targets.js"),
             import("../../runtime/account-pool.js"),
@@ -641,19 +680,21 @@ export function createConsoleHandler(
           gateway = { ui_state: "unknown", gateway_error: String(err) };
         }
 
-        // 只算**模型请求**：控制台里「请求」恒指 `/v1/chat/completions`，
+        // 只算**模型请求**（三种入站协议）：控制台里「请求」恒指模型调用，
         // 与请求日志页、用量区块同一口径（`/health` 等混进来会让成功率与 tokens 失真）。
-        const logPage = queryAccessLogs({ path: MODEL_REQUEST_PATH, limit: 100 });
+        const logPage = queryAccessLogs({ paths: MODEL_REQUEST_PATHS, limit: 100 });
         const usage = {
           date: logPage.date,
           requests: logPage.stats.requests,
           success: logPage.stats.success,
           failure: logPage.stats.failure,
-          other: logPage.stats.other,
           slow: logPage.stats.slow,
           avg_duration_ms: logPage.stats.avgDurationMs,
           tokens: logPage.stats.tokens,
           cache: logPage.stats.cache,
+          // 扫描窗口元数据：极端量级下统计只代表窗口内，前端与排障都要能看出来
+          truncated: logPage.truncated,
+          scanned: logPage.scanned,
         };
 
         const perChannelLogs = new Map<string, { success: number; failure: number }>();
@@ -677,11 +718,12 @@ export function createConsoleHandler(
           if (meta.effort !== null && meta.effort !== undefined) thinking++;
         }
 
-        const allModels = poolModels();
+        // 每个渠道供给几个对外模型（控制台的渠道卡用）
         const cidModelCounts = new Map<string, number>();
-        for (const model of allModels) {
-          const cid = model.slice(0, model.indexOf("/"));
-          cidModelCounts.set(cid, (cidModelCounts.get(cid) ?? 0) + 1);
+        for (const model of poolModels()) {
+          for (const candidate of poolCandidates(model)) {
+            cidModelCounts.set(candidate.cid, (cidModelCounts.get(candidate.cid) ?? 0) + 1);
+          }
         }
 
         const channelList = await Promise.all(
@@ -697,8 +739,14 @@ export function createConsoleHandler(
                 else if (acc.health === "error") statuses.error++;
                 else if (acc.health === "unauthorized") statuses.unauthenticated++;
               }
-            } catch {
-              // 渠道未加载或无账号
+            } catch (err) {
+              // 渠道未加载或无账号：单渠道失败不拖垮总览。UI 侧无从区分「读不到」
+              // 与「真的是零」（状态同样全零），按 cid 首次失败留痕一次 —— 总览每
+              // 5 秒被轮询，逐次记录会把 gateway.log 刷成单一错误的流水账
+              if (!overviewAccountFailures.has(cid)) {
+                overviewAccountFailures.add(cid);
+                appendGateway(`console overview: channel ${cid} accounts failed: ${String(err)}`);
+              }
             }
             return {
               cid,
@@ -724,6 +772,9 @@ export function createConsoleHandler(
           ttfb_ms: entry.ttfbMs,
           upstream_ms: entry.upstreamMs,
           tokens: entry.tokens,
+          // 失败 / 中断的原因：控制台「最近请求」的非成功行直接显示（排障第一入口）
+          error: entry.error,
+          message: entry.message,
         }));
 
         json(res, {

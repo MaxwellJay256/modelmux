@@ -89,7 +89,7 @@ export interface LoginInputRequest {
    *
    * 这个字段是**通用**形态（不绑定任何厂商）：它只描述「一个需要浏览器
    * 完成的挑战」，具体怎么解由界面决定。渠道拿不到解法时的兜底是
-   * 改走别的登录路（astudio：读桌面应用的会话文件）。
+   * 改走别的登录路（如读桌面应用会话文件的渠道）。
    */
   captcha?: { gt: string; challenge: string; success?: unknown };
 }
@@ -156,7 +156,7 @@ export interface CredModule {
       /**
        * 强制重读（`mx relogin`）：跳过「已有凭据就复用」的短路。
        *
-       * astudio 这类「凭据来自外部会话文件」的渠道不传就永远是空操作。
+       * 「凭据来自外部会话文件」的渠道不传就永远是空操作。
        */
       force?: boolean;
     },
@@ -238,9 +238,14 @@ export interface UpstreamModule {
    * 可选：对话请求的**专用头族**（上游按整组头判定「是否官方客户端」的渠道需要）。
    *
    * 缺省时网关回退 `buildHeaders`（基础鉴权头）——普通 OpenAI 兼容渠道无需声明。
-   * 实例：workbuddyai 的官方桌面端身分头族（含每轮新生的会话/请求 ID）。
+   * 实例：官方桌面端的身分头族（含每轮新生的会话/请求 ID）。
+   *
+   * `body`（可选）：网关已序列化的请求体。**签名类渠道**要用它把 payload 哈希
+   * 计进签名（如华为云 `SDK-HMAC-SHA256` 的 `X-Sdk-Content-Sha256` 与
+   * `Authorization` 头）—— 签名覆盖 body 时必须在建头阶段算好，而网关的
+   * `fetch` 只认这组网。不签名的渠道忽略该参数即可（向后兼容）。
    */
-  buildChatHeaders?(credential: any, cfg?: any): Record<string, string>;
+  buildChatHeaders?(credential: any, cfg?: any, body?: Buffer): Record<string, string>;
   /**
    * 可选：判定某个**非 200** 响应是否算**鉴权失败**（触发 token 刷新 + 标记账号不可用）。
    *
@@ -256,7 +261,7 @@ export interface UpstreamModule {
   /**
    * 可选：声明本渠道的**额度信号**（业务码 / 专有措辞）。
    *
-   * 为什么需要它：额度类业务码是**渠道知识**（如 workbuddyai 的 `code=6004`
+   * 为什么需要它：额度类业务码是**渠道知识**（如某渠道的 `code=6004`
    * 「usage exceeds frequency limit」），共享层不许硬编码。共享层只认**通用**措辞
    * （`insufficient_quota`、「余额不足」这类任何上游都可能用的说法）；渠道自己的
    * 码与专有措辞通过本钩子上报。
@@ -271,13 +276,23 @@ export interface UpstreamModule {
    *
    * 共享层已有一层通用判定（`isQuotaExhausted`，看措辞），命中就**冷却**该账号；
    * 但「等到什么时候」只有渠道知道 —— 有的上游直接把重置时间放在错误体里
-   * （主人实测 workbuddyai 花完 1 亿 token 后返回下次刷新时间），有的按自然日重置。
+   * （实测有渠道花完额度后返回下次刷新时间），有的按自然日重置。
    *
    * @param bodySnippet 上游错误响应体的片段（可能被截断，见 `BUFFER_LIMIT`）。
    * @returns 下次刷新时刻（epoch ms）；**认不出返回 `null`**，共享层回落次日本地 0 点。
    *          不要为了「显得完整」编一个时间 —— 编错会让账号冷却到错误的时刻。
    */
   quotaResetAt?(bodySnippet: string): number | null;
+  /**
+   * 可选：判定一个**非 200** 响应是否是**上游容量型过载**（推理集群无空闲实例一类）。
+   *
+   * 为什么单独认：这类错误**换账号没用** —— 整个集群都没容量，继续给账号计连败会把
+   * 健康账号误熔断（上游排队高峰整批 5xx，几个账号接连被标 `error` 后全池绕行）。
+   * 命中时网关仍记渠道级冷却（把候选让给别家），但**不计账号连败**。
+   * 渠道自己的业务码（如 loomy 的 `no_provider_error, provider_name=venus`）由渠道
+   * 声明，共享层不硬编码（AGENTS.md：共享层不许出现任何渠道知识）。
+   */
+  isCapacityError?(status: number, body: string): boolean;
   /**
    * 可选：上游响应头到达后允许的**连续静默上限**（毫秒），默认 `MODELMUX_READ_TIMEOUT_MS`（120s）。
    *
@@ -316,6 +331,23 @@ export interface UpstreamModule {
    * 未实现时网关直接跳过（绝大多数渠道不需要）。
    */
   prepareChat?(body: Record<string, unknown>): Promise<void>;
+  /**
+   * 可选：由渠道自行提供**本次对话的响应字节流**，覆盖网关默认的 POST chatUrl 读响应体。
+   *
+   * 为什么需要它：有些上游的对话内容不在主 POST 的响应体上 —— 主 POST 只回一个受理结果，
+   * 内容经另一条长连接（SSE / WS）回流。没有本钩子时，这种渠道只能在 prepareChat 里把
+   * 整轮跑完再一次性交给翻译器，流式退化成末尾突发：客户端在整个生成期间收不到任何字节
+   * （连响应头都没有），与卡死无法区分。
+   *
+   * 声明本钩子后，网关不再向 chatUrl() 建连（buildHeaders / chatUrlForModel 不会为此被调用），
+   * 改为把返回的 ReadableStream 当作上游响应体交给翻译器增量消费；首帧、心跳、空闲守卫与
+   * 探测重试走既有同一套管线。返回 null 时回落到默认的 POST chatUrl 路径。
+   *
+   * 返回流的字节形态必须与 WIRE / newTranslator() 对齐。鉴权建连由渠道自己完成（在
+   * runInChannel 上下文里 cred.load() 取凭据）；建连阶段的凭据失效必须抛 UpstreamUnauthorized，
+   * 网关据此走刷新重试。只有内容确实在侧信道的渠道才声明它。
+   */
+  openChatStream?(body: Record<string, unknown>): Promise<ReadableStream<Uint8Array> | null>;
   fetchModels(credential: any): Promise<Record<string, unknown>>;
   resolveConfig(data: Record<string, unknown>, fallback?: any): any;
   /**
@@ -377,9 +409,9 @@ export interface CatalogModule {
   /**
    * **强制**从上游重拉目录并落盘（CLI 的 `--refresh` 用）。
    *
-   * 可选：只有具备「远端目录层」的渠道才实现（catpaw / lobsterai /
-   * traecn / raccoon / loomy）。目录本身就是静态内置表的渠道
-   * （workbuddyai / qoder）**不实现** —— 共享层据此回报
+   * 可选：只有具备「远端目录层」的渠道才实现（codebuddycn / loomy /
+   * raccoon / traecn）。目录本身就是静态内置表的渠道
+   * 部分渠道**不实现** —— 共享层据此回报
    * 「该渠道的模型表是内置的，没有可刷新的远端」，而不是假装刷了一遍。
    *
    * 实现约定：
@@ -424,10 +456,51 @@ export interface SigninStatus {
    */
   claimedToday?: boolean | null;
   /**
+   * **今天已领多少额度**（可选，仅 `claimedToday === true` 时有意义）。
+   *
+   * 用途：控制台在账号详情里显示「今日签到 +N」。有的渠道只在**状态查询**里
+   * 给当天入账额（raccoon 的账单、traecn 的 checkin status），领取接口本身不回数字 ——
+   * 调度器据此给「台账已签但没记额度」的记录补一次额度（见 `auto-signin`）。
+   * 领不到就不填，绝不从 summary 里正则抠数字。
+   */
+  reward?: SigninReward;
+  /**
+   * 本渠道**每日签到发放的额度**（可选，与 `reward` 无关）。
+   *
+   * `reward` 是「今天实际入账多少」；这个是「每天发多少」的公布值 —— 适用于**签到动作
+   * 本身就是当日额度的发放**（loomy 的每日重置：领到就是 5000/天）而上游不回报入账额的渠道。
+   * 必须是上游公布或实测的值，**不能是猜的**；拿不准就不填。
+   */
+  dailyReward?: SigninReward;
+  /**
+   * 当前签到窗口的**结束**时刻（epoch ms，可选）。
+   *
+   * 用途：有的渠道签到日界不是本地 0 点（qoder 系上游是 10:00 UTC+8）。调度器把领取时的
+   * `resetAt` 记进台账，`Date.now() > resetAt` 就说明已进入新窗口，允许再领一轮 ——
+   * 不声明则按本地自然日判定。
+   */
+  resetAt?: number;
+  /**
+   * 当前签到窗口的**开始**时刻（epoch ms，可选）。
+   *
+   * 用途：判定**旧台账记录**（没有记窗口）是否属于已结束的窗口 ——
+   * `windowStartsAt > 记录时刻` 就说明记录是上一窗口的，需要再领一轮。
+   * 只在成功查询到状态时用作一次性判定，不落台账。
+   */
+  windowStartsAt?: number;
+  /**
    * 是否**每日**语义。默认 `true`；`false` 表示它不是每日签到（如 raccoon 那种
    * 一次性登录奖励）—— CLI 不会对它套"今天"的话术。
    */
   daily?: boolean;
+}
+
+/** 一次领取到手的额度（签到奖励）。 */
+export interface SigninReward {
+  /** 数量；上游没给具体数值就不填（不要从摘要里猜）。 */
+  amount: number;
+  /** 单位（`积分` / `credits` / `Points`…，渠道给的原文）。 */
+  unit: string;
 }
 
 /** 执行签到 / 领取的结果。 */
@@ -435,6 +508,14 @@ export interface SigninOutcome {
   ok: boolean;
   /** 人读摘要（如「签到成功，+300 积分」）。 */
   summary: string;
+  /**
+   * **这次实际领到多少额度**（可选）。
+   *
+   * 只有渠道能从上游回答「发放了多少」时才填：控制台据此在账号详情里显示
+   * 「今日签到 +N」，并记进本地台账。填不出来（上游只回一句 message）就省略 ——
+   * 从 `summary` 里正则抠数字会把「连续 3 天」这类文案当成额度。
+   */
+  reward?: SigninReward;
   /** 渠道原始返回（`--json` 时给）。 */
   detail?: unknown;
 }
@@ -478,12 +559,15 @@ export interface SigninModule {
 /**
  * 渠道声明的额度信号类型。
  *
- * - `usage_limit`：**账户级用量限额**（如 workbuddyai `6004`）—— 对所有模型生效，
- *   连倍率 0 的也受限 → 网关**一律冷却**该账号。
+ * - `usage_limit`：**账户级用量限额**（渠道专有业务码）—— 对所有模型生效，
+ *   连倍率 0 的也受限 → 网关**一律冷却**该账号（等到渠道认的重置时刻）。
  * - `balance`：**余额不足**（如 loomy `402 insufficient_quota`）—— 只影响计费用量，
  *   免费模型仍可继续打上游 → 只冷却**付费**模型。
+ * - `rate_limit`：**频率/速率超限**（如 traecn `3004`）—— 上游说「等会儿再试」，
+ *   但**没给等待时长**；账号级冷却挡不住它（生效凭据照样被使用，其他账号的额度
+ *   仍让渠道保持高优先级），故改为**渠道级短冷却**，让请求先落到别家。
  */
-export type QuotaSignal = "usage_limit" | "balance";
+export type QuotaSignal = "usage_limit" | "balance" | "rate_limit";
 
 /**
  * 渠道的额度周期（可选能力，见 `BillingModule.quotaPeriod`）。
@@ -509,8 +593,11 @@ export interface BillingModule {
    * 查额度。
    *
    * `credential` 用于**按账号**查询：不传 = 当前生效账号（`cred.load()`）；
-   * 传入时用它代替 `cred.load()`，并应配合 `refreshOn401: false`（避免刷新/回写
-   * 当前生效账号的凭证文件）。形状见 `credential-shape.ts` 的归一化结果。
+   * 传入时用它代替 `cred.load()`。形状见 `credential-shape.ts` 的归一化结果。
+   *
+   * `refreshOn401` 为真且上游拒绝凭据时，渠道应续期后重试一次。**传入 `credential`
+   * 的调用方必须先套 `accounts.runForAccountCredential(cid, key, …)`** —— 否则
+   * 渠道 `refresh()` 的落盘会写进 live 文件，把生效账号的凭据顶掉。
    */
   fetchCredits(options?: { refreshOn401?: boolean; credential?: unknown }): Promise<any>;
   /**
@@ -530,6 +617,14 @@ export interface ChannelCapabilities {
   readonly billing: boolean;
   /** 是否提供签到 / 领取。false = 无签到概念，CLI 统一显示 `-`。 */
   readonly signin: boolean;
+  /**
+   * 上游是否可能**排队**（请求被收下但长时间不出字）。
+   *
+   * true 时：网关的排队探测会**立即放弃本候选、换下一条**（不等待）；
+   * 模型偏好的自动排序也把它往后放（用户默认不该把排队渠道设为首选）。
+   * 省略 = `false`。
+   */
+  readonly queue: boolean;
 }
 
 /**
@@ -546,11 +641,11 @@ export interface ChannelConfig {
    * **单渠道独立运行**时的网关默认监听地址，如 `127.0.0.1:8803`。
    *
    * 仓库级（多渠道路由）网关注册多个渠道，**不看这个字段** —— 它固定用
-   * `REPO_DEFAULT_ADDR`（`127.0.0.1:8787`）。本字段只在
+   * `REPO_DEFAULT_ADDR`（`127.0.0.1:4412`，见 `runtime/cli-consts.ts`）。本字段只在
    * `channels/<cid>/dist/cli.js start|serve` 这类单渠道入口里生效。
    */
   readonly defaultAddr: string;
-  /** 单渠道独立运行时的控制台 API 默认端口（仓库级固定用 `REPO_DEFAULT_UI_PORT`）。 */
+  /** 单渠道独立运行时的控制台 API 默认端口（仓库级固定用 `defaultUiPort()`）。 */
   readonly uiPort: number;
   /** 抓包落盘目录的环境变量名，如 `CATPAW_DEBUG_DUMP`（值 `1` 表示用渠道内 `debug/`）。 */
   readonly debugDumpEnv: string;
@@ -559,6 +654,34 @@ export interface ChannelConfig {
    * 无对应能力的渠道声明 false：共享层直接显示 `-`，不再调用上游。
    */
   readonly capabilities?: Partial<ChannelCapabilities>;
+  /**
+   * 选路权重乘数（可选，缺省 1）。
+   *
+   * 乘进 `priorityOf()` 的「剩余额度 × 速度 × 可靠性」—— 权重 2 表示「同样的额度，
+   * 这个渠道先被用掉」。用于**额度每天刷新、不用就浪费**的渠道：它的额度是易失的，
+   * 留在池里不用等于白扔，应该优先消耗，把能攒的额度（积分 / credits）留到最后。
+   *
+   * 为什么由渠道自己声明而不是共享层硬编码：共享层不许出现渠道知识
+   * （`verify-layering` 会拦）。渠道知道自己额度是不是每天清零，共享层不知道。
+   *
+   * 取值建议：`2`（易失额度）/ `1`（默认）/ 不设。别设太大 —— 会盖过额度差异，
+   * 让「只剩 5 额度」的渠道压过「剩 5000」的。
+   */
+  readonly priorityWeight?: number;
+  /**
+   * 选路**档位**（可选，缺省 1；**数值越小越优先**）。
+   *
+   * 与 `priorityWeight` 的区别是「硬」的：档位不同的渠道**永不按额度互相比较**，
+   * 低档位只要还有额度就一定排在前面；额度只在**同档位内**决定先后。
+   *
+   * 用于「额度当天清零、且必须在别的渠道之前用掉」的渠道 —— 乘法权重做不到这一点：
+   * 权重 2 遇到 2.3 倍的额度差就被翻盘（实测 loomy 1020×2 < traecn 2329×1，
+   * 易失额度照样留着不用）。
+   *
+   * 约束：低档位渠道**全部不可用**（无额度 / 冷却 / 未登录）时才轮到高档位 ——
+   * 这正是「先用完易失的，再动能攒的」。
+   */
+  readonly priorityTier?: number;
 }
 
 /** 读取渠道能力（缺省 true）。 */
@@ -566,6 +689,7 @@ export function channelCapabilities(config: ChannelConfig): ChannelCapabilities 
   return {
     billing: config.capabilities?.billing ?? true,
     signin: config.capabilities?.signin ?? true,
+    queue: config.capabilities?.queue ?? false,
   };
 }
 

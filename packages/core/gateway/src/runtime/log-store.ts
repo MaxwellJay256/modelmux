@@ -6,7 +6,7 @@
  *  - 每类文件独立大小上限（默认 10MB）、超限轮转 `<name>.1.log` 最多保留 3 份；
  *    日期目录按本地时区切分、默认保留 14 天（过期目录在当日首次写入时清理）
  *  - 所有写入 best-effort：日志失败绝不影响请求
- *  - 控制台日志页经 `queryAccessLogs` 读回；请求正文抓取默认开启、偏好可关（见 docs/LOGGING.md §9）
+ *  - 控制台日志页经 `queryAccessLogs` 读回；请求正文抓取**恒开启、无开关**（见 docs/LOGGING.md §9）
  */
 
 import { randomUUID } from "node:crypto";
@@ -23,7 +23,6 @@ import {
   rmSync,
   statSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 // 命名空间导入 + 运行时探测：zstd 是 Node ≥ 22.15 才有的绑定，直接具名导入会让老版本
@@ -33,8 +32,38 @@ import type { ServerResponse } from "node:http";
 
 import * as paths from "./paths.js";
 import { enforcePermissions } from "./permissions.js";
+import { writeAtomicFile } from "./secret-file.js";
 
-export type AccessOutcome = "success" | "failure" | "other";
+/**
+ * 一次请求的结果分桶 —— **只有成功与失败**。
+ *
+ * 历史上还有第三桶 `other`（「中断」：没拿到状态码就断开）。实测它恒为空
+ * （`status<200` 才落，正常请求拿不到这种状态；客户端提前断开也在 `finishRequestLog`
+ * 之前就被 2xx 定了 success），却在界面上多给用户一个看不懂的分段。
+ * 读旧 `other.log` 的行按 **failure** 计（没有状态码 = 服务端没给出结果）。
+ */
+export type AccessOutcome = "success" | "failure";
+
+/** 候选被剔除的原因（选路快照用）。 */
+export type RouteSkipReason = "auth" | "window" | "unauthorized" | "cooling";
+
+/**
+ * 一次请求的**选路快照**（落进访问日志，控制台展开详情可见）。
+ *
+ * 为什么落盘：路由只在内存里发生，响应里看不到任何痕迹 —— 「这次为什么走了这家」
+ * 事后无从查证（2026-11-16 排查 qodercn 单次失败，网关日志里只有最终 cid，
+ * 候选顺序与顺延原因全都丢了）。只存摘要（渠道名 + 原因词），不带额度数值。
+ */
+export interface RouteTrace {
+  /** 输入估算（token）；`<= 0` = 没算出来，不参与窗口过滤。 */
+  est: number;
+  /** 全部候选渠道，按选路顺序（已按档位 / 排队 / 有效优先级排好）。 */
+  candidates: string[];
+  /** 本次实际会尝试的候选（冷却回退后取前 N 个）。 */
+  attempts: string[];
+  /** 被剔除的候选与原因。 */
+  skipped: Array<{ cid: string; why: RouteSkipReason }>;
+}
 
 /** 单请求的访问日志上下文；由 HTTP 层创建，响应结束时落盘。 */
 export interface RequestLog {
@@ -42,13 +71,42 @@ export interface RequestLog {
   method: string;
   path: string;
   startAt: number;
+  /** 客户端请求的模型 —— **规范 deepseek 名**（如 `deepseek-v4.1-flash`；别名已归并）。 */
   model?: string;
+  /** 入站协议名（anthropic / responses；chat 透传路径不落字段）。 */
+  protocol?: string;
+  /** **承接**这次请求的渠道（跨渠道选路后由 `http/chat/attempt.ts` 逐次尝试写入）。 */
   cid?: string;
+  /**
+   * 承接请求的**账号 key**（池内账号标识，控制台的账号行按它归集 token）。
+   *
+   * 为什么必须有：账号池要按账号展示「今日 tokens」，而账本只记 ok/fail/credits，
+   * 逐请求的 token 只在访问日志里 —— 不落这个字段就只能按渠道汇总。
+   */
+  key?: string;
   stream?: boolean;
   status?: number;
   outcome?: AccessOutcome;
   error?: string;
   message?: string;
+  /**
+   * 客户端 User-Agent（只在**未知路径 404** 上写）。
+   *
+   * 为什么记它：`/api/hello`、`/.well-known/...` 这类幽灵探针只知道路径，认不出是谁发的
+   * （2026-11-15 排查时 11 天里 69 次 HEAD `/api/hello` 无法定位来源）。只在 404 上记，
+   * 正常请求不落这个字段（省体积、也少一份可识别信息）。
+   */
+  ua?: string;
+  /**
+   * 网关自身异常的详情（诊断用，不发给客户端）。
+   *
+   * 为什么单开字段：`message` 是给客户端的那一句话（如「gateway internal error; see logs」），
+   * 真实异常若也走 `message`，会被随后的 `writeJsonError` 覆盖 —— 500 于是只剩一句空话，
+   * 事后无从定位（2026-11-15 排查 internal_error 时确认）。
+   */
+  detail?: string;
+  /** 选路快照（候选顺序 / 最终尝试 / 剔除原因，见 `RouteTrace`）。 */
+  route?: RouteTrace;
   /** 从请求开始到第一个响应字节（首帧）的毫秒数。 */
   ttfbMs?: number;
   /** 从请求开始到上游响应头到达的毫秒数。 */
@@ -94,7 +152,6 @@ type WithRequestLog = ServerResponse & { [REQUEST_LOG]?: RequestLog };
 const MAX_ROTATED = 3;
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_RETENTION_DAYS = 14;
-const DEFAULT_SLOW_MS = 30_000;
 
 let lastPruneDate = "";
 
@@ -113,8 +170,132 @@ function retentionDays(): number {
   return envInt("MODELMUX_LOG_RETENTION_DAYS", DEFAULT_RETENTION_DAYS);
 }
 
-function slowMs(): number {
-  return envInt("MODELMUX_SLOW_MS", DEFAULT_SLOW_MS);
+/**
+ * 生成窗口下限（毫秒）：小于它算不出可信速率（首末帧同毫秒 = 测不到）。
+ *
+ * 与 UI 侧 `packages/ui/src/lib/log-format.ts` 的 `GENERATE_FLOOR_MS` **必须同值** ——
+ * 两边算的是同一个 TPS，只是服务端用于聚合与「慢」判定、前端用于单条展示。改一处就要改两处。
+ */
+const GENERATE_FLOOR_MS = 50;
+
+/**
+ * 速率上限（tokens/s）：超过它说明分母算错了（非流式把 ttfb 当生成时间等）。
+ *
+ * 与 UI 侧 `MEASURE_CEILING_TPS` 同值，理由同上。
+ */
+const MEASURE_CEILING_TPS = 1000;
+
+/**
+ * 单个请求的生成速率（tokens/s）；算不出可信值时返回 null。
+ *
+ * 算法逐行对齐 UI 的 `tokensPerSecOf`：分母优先用**纯生成窗口** `generateMs`，
+ * 缺失时按 `durationMs` 减掉首字节 / 上游接单时间兜底；流式与非流式的兜底基准不同
+ * （非流式 `ttfbMs` 等于总耗时，减它会把分母压到 0）。
+ * 为什么服务端要再实现一遍：UI 包不依赖 `@modelmux/gateway`，两边各自构建。
+ */
+export function tokensPerSecOf(entry: {
+  tokens: { completion: number | null } | null;
+  durationMs?: number;
+  ttfbMs?: number;
+  upstreamMs?: number;
+  generateMs?: number;
+  stream?: boolean;
+}): number | null {
+  const completion = entry.tokens?.completion ?? null;
+  const durationMs = entry.durationMs;
+  if (completion === null || !Number.isFinite(completion) || completion <= 0) return null;
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs <= 0) return null;
+  /** 可用的绝对耗时：必须为正且小于总耗时（非流式 ttfbMs ≈ durationMs，不裁掉分母会趋 0，口径见 docs/LOGGING.md §3.1）。 */
+  const cut = (v: number | undefined): number =>
+    v !== undefined && Number.isFinite(v) && v > 0 && v < durationMs ? v : 0;
+
+  const direct = cut(entry.generateMs);
+  let generateMs: number;
+  if (direct > 0) {
+    generateMs = direct;
+  } else {
+    const ttfb = cut(entry.ttfbMs);
+    const upstream = cut(entry.upstreamMs);
+    const base =
+      entry.stream === true
+        ? ttfb || upstream
+        : entry.stream === false
+          ? upstream
+          : ttfb > 0 && upstream > 0
+            ? Math.min(ttfb, upstream)
+            : ttfb || upstream;
+    generateMs = base > 0 ? durationMs - base : durationMs;
+  }
+  if (generateMs < GENERATE_FLOOR_MS) return null;
+  const perSec = completion / (generateMs / 1000);
+  return perSec > MEASURE_CEILING_TPS ? null : perSec;
+}
+
+// ---------------------------------------------------------------------------
+// 慢请求判定（首字延迟 + 生成速率；总时长不作为判据）
+// ---------------------------------------------------------------------------
+
+/**
+ * 首字 token 延迟阈值（毫秒）：**流式**请求的 `ttfbMs` 达到它即判「首字慢」。
+ *
+ * 实测（2026-11-05，1816 条）：流式 ttfb p95 = 4.5s、p99 = 34.5s —— 10s 落在两档之间，
+ * 能抓住真异常（排队 / 上游接单卡住）又不滥发。非流式的 `ttfbMs` ≈ `durationMs`
+ * （见 docs/LOGGING.md §3.1），没有判别力，不参与该判定。
+ */
+export const SLOW_TTFB_MS = envInt("MODELMUX_SLOW_TTFB_MS", 10_000);
+
+/**
+ * 生成速率阈值（tokens/s）：可信速率低于它即判「速率慢」。
+ *
+ * 实测（2026-11-05，1816 条）分布：p05 = 54 t/s —— 30 落在正常分布之外，抓的是真龟速；
+ * 池选路那边的参考速率是 100（`pool/pool-usage.ts` 的 `SPEED_REF_TPS`，长期平均，
+ * 只用来折速度系数、不给单条请求贴标签），请求级用更宽的值避免把慢渠道的每条请求都标满。
+ */
+export const SLOW_TPS = envInt("MODELMUX_SLOW_TPS", 30);
+
+/** 生成量下限（tokens）：少于它不判速率慢 —— 1-3 个 token 的窗口太小，速率数值天然不可信（实测 2026-11-05：tps<30 的命中里 p50 completion=3，全是 ping 类短请求）。 */
+export const SLOW_MIN_COMPLETION = 20;
+
+/** 单条请求的「慢」判定结果（两个维度独立成立，任一命中即慢）。 */
+export interface SlowVerdict {
+  /** 首 token 延迟超标（仅流式参与判定）。 */
+  slowTtfb: boolean;
+  /** 生成速率超标（可信速率 < `SLOW_TPS` 且生成量 ≥ `SLOW_MIN_COMPLETION`）。 */
+  slowTps: boolean;
+  /** slowTtfb 或 slowTps。 */
+  slow: boolean;
+}
+
+/**
+ * 单条请求的「慢」判定：**首字 token 延迟 + 生成速率**；总时长不作为判据 ——
+ * 输出长同样会拉长总时长（2026-11-05 实测：总时长 ≥30s 的 94 条里 89 条只是长输出）。
+ *
+ * 写路径（`slow.log` 副本）与读路径（历史行重算）共用这一份 —— 历史日志没有
+ * 重写机会，但读出来时按当前口径重算，展示与统计自动统一。
+ */
+export function slowVerdictOf(input: {
+  stream?: boolean;
+  ttfbMs?: number;
+  durationMs?: number;
+  upstreamMs?: number;
+  generateMs?: number;
+  completion?: number | null;
+}): SlowVerdict {
+  // 首字慢只对流式有判别力：非流式 ttfbMs ≈ durationMs，减它没有意义
+  const slowTtfb = input.stream === true && (input.ttfbMs ?? 0) >= SLOW_TTFB_MS;
+  const tps =
+    input.completion != null && input.completion >= SLOW_MIN_COMPLETION
+      ? tokensPerSecOf({
+          tokens: { completion: input.completion },
+          durationMs: input.durationMs,
+          ttfbMs: input.ttfbMs,
+          upstreamMs: input.upstreamMs,
+          generateMs: input.generateMs,
+          stream: input.stream,
+        })
+      : null;
+  const slowTps = tps !== null && tps < SLOW_TPS;
+  return { slow: slowTtfb || slowTps, slowTtfb, slowTps };
 }
 
 /** 本地日期 `YYYY-MM-DD`（用户按本地时间看日志，不用 UTC）。 */
@@ -225,6 +406,17 @@ function pruneOnce(): void {
   }
 }
 
+/**
+ * 写路径的慢判定（读路径 `parseAccessLine` 同一份口径）。
+ *
+ * `RequestLog` 的 token 数只存在 `usage` 原始对象里（`completion_tokens` / `output_tokens`），
+ * 不提取成顶层 `completion` 就喂给 `slowVerdictOf` 的话，「速率慢」维度恒判不出 ——
+ * `slow.log` 只剩首字慢，与读路径重算的结果分叉。
+ */
+function slowVerdictOfLog(log: RequestLog): SlowVerdict {
+  return slowVerdictOf({ ...log, completion: tokensOf(log.usage)?.completion ?? null });
+}
+
 function appendAccessFile(outcome: AccessOutcome, record: RequestLog): void {
   pruneOnce();
   const date = localDate();
@@ -233,7 +425,7 @@ function appendAccessFile(outcome: AccessOutcome, record: RequestLog): void {
   // 免得日志多两个没人读的绝对时刻（口径见 docs/LOGGING.md §3.1）。
   const { written: _written, firstFrameAt: _first, lastFrameAt: _last, ...payload } = record;
   appendLine(join(dir, `${outcome}.log`), JSON.stringify({ ts: new Date(record.startAt).toISOString(), ...payload }));
-  if ((record.durationMs ?? 0) >= slowMs()) {
+  if (slowVerdictOfLog(record).slow) {
     appendLine(join(dir, "slow.log"), JSON.stringify({ ts: new Date(record.startAt).toISOString(), ...payload }));
   }
   if (outcome === "failure") {
@@ -243,6 +435,8 @@ function appendAccessFile(outcome: AccessOutcome, record: RequestLog): void {
       model: record.model,
       cid: record.cid,
       error: record.error,
+      // 详情只在有值时出现：正常业务失败（未知模型、上游 4xx）没有这一项
+      ...(record.detail !== undefined ? { detail: record.detail } : {}),
       duration_ms: record.durationMs,
       ttfb_ms: record.ttfbMs,
       upstream_ms: record.upstreamMs,
@@ -262,12 +456,15 @@ export function finishRequestLog(log: RequestLog, status: number): void {
     log.generateMs = log.lastFrameAt - log.firstFrameAt;
   }
   if (!log.outcome) {
-    log.outcome = status >= 400 ? "failure" : status >= 200 ? "success" : "other";
+    // 没有状态码（`status < 200`，通常为 0）= 服务端没给出结果 → 按失败记。
+    // 不再单列「中断」：见 `AccessOutcome` 的说明。
+    log.outcome = status >= 200 && status < 400 ? "success" : "failure";
+    if (status < 200) log.error ??= "no_status";
   }
-  // 成功的健康检查 / 模型轮询不记访问日志：Web 控制台每 5 秒拉一次 /v1/models，
-  // 记下来只会把真正的 chat 请求淹没。失败与慢请求仍然记录。
-  const routine = log.path === "/health" || log.path === "/v1/models";
-  if (routine && log.outcome === "success" && (log.durationMs ?? 0) < slowMs()) return;
+  // 成功的健康检查 / 模型轮询 / 指标抓取不记访问日志：Web 控制台每 5 秒拉一次 /v1/models、
+  // Prometheus 定时刮 /metrics，记下来只会把真正的 chat 请求淹没。失败与慢请求仍然记录。
+  const routine = log.path === "/health" || log.path === "/v1/models" || log.path === "/metrics";
+  if (routine && log.outcome === "success" && !slowVerdictOfLog(log).slow) return;
   appendAccessFile(log.outcome, log);
 }
 
@@ -315,6 +512,40 @@ export function noteRequestError(res: ServerResponse, code: string, message: str
   log.outcome = "failure";
   log.error ??= code;
   log.message = message.slice(0, 800);
+}
+
+/**
+ * 记网关自身异常详情（只进日志，不回客户端）。
+ *
+ * 与 `noteRequestError` 分开：那个写的是给客户端看的原因，可能被随后的
+ * `writeJsonError` 用同文案再写一遍；详情走独立字段，不被覆盖。
+ */
+export function noteRequestDetail(res: ServerResponse, detail: string): void {
+  const log = getRequestLog(res);
+  if (!log) return;
+  log.detail = detail.slice(0, 800);
+}
+
+/**
+ * 记选路快照（候选顺序 / 实际尝试 / 剔除原因）。
+ *
+ * 在候选解析完成后调用一次；控制台展开详情据此回答「为什么走了这家」。
+ */
+export function noteRequestRoute(res: ServerResponse, trace: RouteTrace): void {
+  const log = getRequestLog(res);
+  if (!log) return;
+  log.route = trace;
+}
+
+/**
+ * 记客户端 User-Agent（只给未知路径 404 用；见 `RequestLog.ua` 的 why）。
+ *
+ * 截断到 160 字符：UA 可能很长，且这里只为认领「谁在探」。
+ */
+export function noteRequestUa(res: ServerResponse, ua: string | undefined): void {
+  const log = getRequestLog(res);
+  if (!log || !ua) return;
+  log.ua = ua.slice(0, 160);
 }
 
 /** 标记客户端主动断开（不算服务端失败）。 */
@@ -462,7 +693,7 @@ function latestDateDir(categoryDir: string, fileName: (date: string) => string):
  * 解析 CLI 要 tail 的日志文件。
  *
  * `kind`：access / error / system / lifecycle / worker / channel；
- * `outcome`：success / failure / other。未给日期时取今天，今天没有则取最新日期。
+ * `outcome`：success / failure。未给日期时取今天，今天没有则取最新日期。
  */
 export function resolveLogPath(options: {
   kind?: string;
@@ -521,7 +752,7 @@ export function resolveLogPath(options: {
 /**
  * 单条访问日志的可读形态（字段语义见 docs/LOGGING.md §3.1）。
  *
- * `outcome` 取自**它所在的文件**（`success.log` / `failure.log` / `other.log`）而不是行内字段：
+ * `outcome` 取自**它所在的文件**（`success.log` / `failure.log`；旧 `other.log` 读入时按 failure）而不是行内字段：
  * 文件归属是分桶的权威事实源，行内字段只作兜底。
  */
 export interface AccessEntry {
@@ -531,6 +762,8 @@ export interface AccessEntry {
   path?: string;
   cid?: string;
   model?: string;
+  /** 承接请求的账号 key（与 `cid` 一对：渠道 + 账号才能定位到具体凭据）。 */
+  key?: string;
   stream?: boolean;
   status?: number;
   outcome: AccessOutcome;
@@ -561,25 +794,41 @@ export interface AccessEntry {
     total: number | null;
     cache: { hit: number | null; miss: number | null } | null;
   } | null;
-  /** 耗时达慢阈值 —— 与 `slow.log` 同一判据，不另设标准。 */
-  slow: boolean;
   /** 进过上游排队（收到过排队帧）。缺省 = 没有排队帧，不代表「没等过」。 */
   queued?: boolean;
+  /** 选路快照（候选顺序 / 实际尝试 / 剔除原因）；缺省 = 该行没记（历史行）。 */
+  route?: RouteTrace;
+  /**
+   * 「慢」判定（读路径按当前口径重算，历史行自动跟随，见 `slowVerdictOf`）。
+   * 两个维度独立成立：`slowTtfb` 首字延迟超标（仅流式）、`slowTps` 生成速率超标。
+   */
+  slow: boolean;
+  slowTtfb: boolean;
+  slowTps: boolean;
 }
 
 /**
- * 模型请求的路径。
+ * 模型请求的路径集合（三种入站协议：OpenAI chat / Anthropic Messages / OpenAI Responses）。
  *
- * 日志页与用量统计都只认它 —— `/health` 之类的非模型请求同样会落进 access 日志
+ * 日志页与用量统计都只认它们 —— `/health` 之类的非模型请求同样会落进 access 日志
  * （`http/server.ts` 只跳过 console 路径），混进来会让「调用次数 / 累计 tokens」失真。
  */
-export const MODEL_REQUEST_PATH = "/v1/chat/completions";
+export const MODEL_REQUEST_PATHS = ["/v1/chat/completions", "/v1/messages", "/v1/responses"] as const;
+
+/** 旧常量（OpenAI 路径）；统计口径已换成 `isModelRequestPath`。 */
+
+/** 是否为模型请求路径（统计只看是不是模型调用，不分协议）。 */
+export function isModelRequestPath(path: string | undefined): boolean {
+  return path !== undefined && (MODEL_REQUEST_PATHS as readonly string[]).includes(path);
+}
 
 export interface AccessQuery {
   date?: string;
   outcome?: AccessOutcome;
-  /** 精确匹配请求路径（日志页固定传 `MODEL_REQUEST_PATH`）。 */
+  /** 精确匹配请求路径（与 `paths` 二选一）。 */
   path?: string;
+  /** 精确匹配多个请求路径（日志页固定传 `MODEL_REQUEST_PATHS`，三协议一起查）。 */
+  paths?: readonly string[];
   cid?: string;
   model?: string;
   stream?: boolean;
@@ -593,9 +842,21 @@ export interface AccessStats {
   requests: number;
   success: number;
   failure: number;
-  other: number;
+  /** 判定为慢的条数（口径见 `slowVerdictOf`）。 */
   slow: number;
+  /** 其中首字延迟超标的条数（仅流式参与判定）。 */
+  slowTtfb: number;
+  /** 其中生成速率超标的条数。 */
+  slowTps: number;
   avgDurationMs: number | null;
+  /**
+   * 窗口内**成功请求**的平均生成速率（tokens/s）；一条都算不出时为 null。
+   *
+   * 只算成功请求（口径同 `UsageModelRow.avgTps`）：失败的 usage 多为空，混进去会把
+   * 速率拉成「丑但成功不了」的假象。分母是**每条速率各算一次再平均**，不是
+   * `Σcompletion / Σ生成窗口` —— 后者被长请求主导，答不了「一条请求通常多快」。
+   */
+  avgTps: number | null;
   /** 窗口内没有 usage 的条数（失败请求通常没有），避免把缺失当成 0。 */
   noUsage: number;
   tokens: { prompt: number; completion: number; total: number };
@@ -615,9 +876,10 @@ export interface AccessPage {
   /** 实际返回的日期（回落后的）；无任何日志时为空串。 */
   date: string;
   dates: string[];
-  /** 扫描窗口内出现过的渠道（**未过滤**，供筛选下拉用，不会随筛选消失）。 */
+  /** 扫描窗口内出现过的渠道（**未过滤**，供筛选下拉用，不会随筛选消失；受 `path`/`paths` 范围约束，见 `inScope`）。 */
   cids: string[];
-  slowMs: number;
+  /** 「慢」判定的两个阈值（前端展示归因用；阈值定义见 `SLOW_TTFB_MS` / `SLOW_TPS`）。 */
+  slowThresholds: { ttfbMs: number; tps: number };
   scanned: number;
   /** 尾部窗口是否被截断：true 时统计只代表窗口内，不代表全天。 */
   truncated: boolean;
@@ -632,12 +894,16 @@ const ACCESS_SCAN_LINES = 20_000;
 const ACCESS_DEFAULT_LIMIT = 100;
 const ACCESS_MAX_LIMIT = 500;
 /**
- * 只读这三个文件。
+ * 读取的三个文件（**含历史 `other.log`**）。
  *
- * 刻意**不读** `slow.log`：它是成功/失败行的**并行副本**（同一请求写两处），
- * 一起读会让慢请求在列表里出现两遍。
+ * 新写入只有 success / failure 两类；`other.log` 只为「旧版本落过盘的机器」保留读取，
+ * 其中的行按 failure 计（见 `AccessOutcome`）。刻意**不读** `slow.log`：它是成功/失败行的
+ * 并行副本（同一请求写两处），一起读会让慢请求在列表里出现两遍。
  */
-const ACCESS_OUTCOMES: AccessOutcome[] = ["success", "failure", "other"];
+const ACCESS_OUTCOMES: AccessOutcome[] = ["success", "failure"];
+
+/** 历史「中断」桶的文件名（读到时并入 failure；不再写入）。 */
+const LEGACY_OTHER_FILE = "other.log";
 
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
@@ -649,6 +915,38 @@ function num(value: unknown): number | undefined {
 
 function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+/** 取字符串数组（元素全为字符串才认；读到脏行时整段丢弃比塞进半份数据好）。 */
+function strArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.every((v) => typeof v === "string") ? (value as string[]) : undefined;
+}
+
+const ROUTE_SKIP_REASONS: readonly RouteSkipReason[] = ["auth", "window", "unauthorized", "cooling"];
+
+function isSkipReason(value: string | undefined): value is RouteSkipReason {
+  return value !== undefined && (ROUTE_SKIP_REASONS as readonly string[]).includes(value);
+}
+
+/** 读回选路快照；形状不完整就当没有（一行脏数据不该让整页读不出来）。 */
+function routeTraceOf(value: unknown): RouteTrace | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const est = num(raw["est"]);
+  const candidates = strArray(raw["candidates"]);
+  const attempts = strArray(raw["attempts"]);
+  if (est === undefined || candidates === undefined || attempts === undefined) return undefined;
+  const skipped: Array<{ cid: string; why: RouteSkipReason }> = [];
+  if (Array.isArray(raw["skipped"])) {
+    for (const item of raw["skipped"]) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const cid = str((item as Record<string, unknown>)["cid"]);
+      const why = str((item as Record<string, unknown>)["why"]);
+      if (cid !== undefined && isSkipReason(why)) skipped.push({ cid, why });
+    }
+  }
+  return { est, candidates, attempts, skipped };
 }
 
 /**
@@ -728,7 +1026,8 @@ function tokensOf(usage: unknown): AccessEntry["tokens"] {
  * 读文件**尾部**最多 `maxBytes` 字节。
  *
  * 起点落在行中间时丢掉残缺的首行（半行解析必然失败，留着只会污染结果）；
- * 文件被并发轮转/删除时返回空 —— 读日志绝不能反过来影响主流程。
+ * 读不到（并发轮转 / 删除 / 锁）按 `truncated` 上报 —— 读日志绝不能反过来影响主流程，
+ * 但也不能把「读不到」伪装成「没有」。
  */
 function readTail(file: string, maxBytes: number): { text: string; truncated: boolean } {
   let fd: number | null = null;
@@ -749,7 +1048,9 @@ function readTail(file: string, maxBytes: number): { text: string; truncated: bo
     }
     return { text, truncated: false };
   } catch {
-    return { text: "", truncated: false };
+    // 读失败（锁 / 轮转 / 权限）**不能当成空文件**：那样这一天的统计会静默少算，
+    // 页面也不显示「统计只覆盖窗口内」的横幅。置 `truncated` 让残缺可见。
+    return { text: "", truncated: true };
   } finally {
     if (fd !== null) {
       try {
@@ -778,6 +1079,18 @@ function accessFiles(date: string, outcome: AccessOutcome): string[] {
   return out;
 }
 
+/** 历史 `other.log`（含轮转）—— 只在读取时并入 failure，不再写入。 */
+function legacyOtherFiles(date: string): string[] {
+  const base = join(logsRoot(), "access", date, LEGACY_OTHER_FILE);
+  const out: string[] = [];
+  for (let i = MAX_ROTATED; i >= 1; i -= 1) {
+    const rotated = `${base}.${i}.log`;
+    if (existsSync(rotated)) out.push(rotated);
+  }
+  if (existsSync(base)) out.push(base);
+  return out;
+}
+
 /** `access/` 下真正有日志的日期，倒序（新的在前）。 */
 export function listAccessDates(): string[] {
   const dir = join(logsRoot(), "access");
@@ -790,7 +1103,11 @@ export function listAccessDates(): string[] {
   return entries
     .filter((e) => e.isDirectory() && /^\d{4}-\d{2}-\d{2}$/.test(e.name))
     .map((e) => e.name)
-    .filter((date) => ACCESS_OUTCOMES.some((o) => existsSync(join(dir, date, `${o}.log`))))
+    .filter(
+      (date) =>
+        ACCESS_OUTCOMES.some((o) => existsSync(join(dir, date, `${o}.log`))) ||
+        existsSync(join(dir, date, LEGACY_OTHER_FILE)),
+    )
     .sort()
     .reverse();
 }
@@ -801,15 +1118,74 @@ export function listAccessDates(): string[] {
  * 与 `queryAccessLogs` 的分工：那个服务交互式分页（要快、允许截断），本函数服务
  * **统计聚合**（要全、宁慢）—— 截断会让「累计 tokens」这类数字直接错。
  * 调用方自己负责节流与缓存（见 `usage-stats.ts`）。
+ *
+ * 返回**读失败被跳过**的文件数：调用方（统计聚合）据此避免把残缺结果缓存成
+ * 「该日的真实累计」—— 文件被锁 / 正在轮转只是暂时的，缓存却是进程级的。
  */
-export function scanAccessDate(date: string, visit: (entry: AccessEntry) => void): void {
+/** 速率聚合样本（路由优先级用；只留和与条数，不留原始行）。 */
+export interface TpsSample {
+  sum: number;
+  count: number;
+}
+
+/** 一次速率聚合的结果：按（渠道 × 模型）与按渠道两个维度。 */
+export interface ModelTpsAggregate {
+  /** 键 = `<cid>/<模型>`。 */
+  byModel: Map<string, TpsSample>;
+  byChannel: Map<string, TpsSample>;
+}
+
+/**
+ * 聚合最近几天模型请求的**实测速率**（路由优先级用，见 `pool-usage.speedOf`）。
+ *
+ * 为什么不复用 `queryAccessLogs`：那个服务交互式分页（排序 + 统计 + 缓存），
+ * 而且 `limit` 会按「最近 N 条」截断 —— 忙渠道一天的量上千，会把一天只有几条的
+ * 慢渠道整个挤出样本（实测 qodercn 11-05 的 3 条就被 500 条窗口挡在外面）。
+ * 本函数只读**尾部 1MB**（与 `queryAccessLogs` 同量）并按天遍历，只累加速度，
+ * 不做排序 / 统计 / 缓存 —— 忙渠道占不满慢渠道的样本。
+ *
+ * 读失败的日子直接跳过（不抛）：速度是**先验**，缺一天不影响路由可用性。
+ */
+export function aggregateModelTps(days: readonly string[]): ModelTpsAggregate {
+  const byModel = new Map<string, TpsSample>();
+  const byChannel = new Map<string, TpsSample>();
+  const add = (map: Map<string, TpsSample>, key: string, tps: number): void => {
+    const prev = map.get(key);
+    if (prev === undefined) map.set(key, { sum: tps, count: 1 });
+    else {
+      prev.sum += tps;
+      prev.count += 1;
+    }
+  };
+  for (const date of days) {
+    for (const outcome of ACCESS_OUTCOMES) {
+      for (const file of accessFiles(date, outcome)) {
+        const tail = readTail(file, ACCESS_TAIL_BYTES);
+        for (const line of tail.text.split("\n")) {
+          if (line.trim() === "") continue;
+          const entry = parseAccessLine(line, outcome);
+          if (entry === null || entry.cid === undefined) continue;
+          const tps = tokensPerSecOf(entry);
+          if (tps === null) continue;
+          add(byChannel, entry.cid, tps);
+          if (entry.model !== undefined) add(byModel, `${entry.cid}/${entry.model}`, tps);
+        }
+      }
+    }
+  }
+  return { byModel, byChannel };
+}
+
+export function scanAccessDate(date: string, visit: (entry: AccessEntry) => void): number {
+  let skipped = 0;
   for (const outcome of ACCESS_OUTCOMES) {
     for (const file of accessFiles(date, outcome)) {
       let text: string;
       try {
         text = readFileSync(file, "utf8");
       } catch {
-        continue; // 正在轮转 / 被删：跳过这个文件，不让整次统计失败
+        skipped += 1; // 正在轮转 / 被删 / 被杀毒软件短暂锁定：跳过，不让整次统计失败
+        continue;
       }
       for (const line of text.split("\n")) {
         if (line.trim() === "") continue;
@@ -818,6 +1194,22 @@ export function scanAccessDate(date: string, visit: (entry: AccessEntry) => void
       }
     }
   }
+  // 历史「中断」桶：按 failure 计入（不再写入，只为旧机器上已落盘的正文保留可见性）
+  for (const file of legacyOtherFiles(date)) {
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (line.trim() === "") continue;
+      const entry = parseAccessLine(line, "failure");
+      if (entry) visit(entry);
+    }
+  }
+  return skipped;
 }
 
 function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | null {
@@ -833,12 +1225,27 @@ function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | nu
   const id = str(raw["id"]);
   if (!id) return null;
   const durationMs = num(raw["durationMs"]);
+  const stream = bool(raw["stream"]);
+  const ttfbMs = num(raw["ttfbMs"]);
+  const upstreamMs = num(raw["upstreamMs"]);
+  const generateMs = num(raw["generateMs"]);
+  const tokens = tokensOf(raw["usage"]);
+  // 「慢」在**读路径重算**：行内的历史口径不回改，展示与统计恒按当前判据（首字延迟 + 生成速率）。
+  // 历史行因此自动跟随新口径，不需要迁移。
+  const verdict = slowVerdictOf({
+    stream,
+    ttfbMs,
+    upstreamMs,
+    generateMs,
+    durationMs,
+    completion: tokens?.completion ?? null,
+  });
   const entry: AccessEntry = {
     id,
     ts: str(raw["ts"]) ?? "",
     outcome,
-    tokens: tokensOf(raw["usage"]),
-    slow: (durationMs ?? 0) >= slowMs(),
+    tokens,
+    ...verdict,
   };
   const cid = str(raw["cid"]);
   if (cid !== undefined) entry.cid = cid;
@@ -848,7 +1255,8 @@ function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | nu
   if (path !== undefined) entry.path = path;
   const model = str(raw["model"]);
   if (model !== undefined) entry.model = model;
-  const stream = bool(raw["stream"]);
+  const key = str(raw["key"]);
+  if (key !== undefined) entry.key = key;
   if (stream !== undefined) entry.stream = stream;
   const status = num(raw["status"]);
   if (status !== undefined) entry.status = status;
@@ -857,11 +1265,8 @@ function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | nu
   const message = str(raw["message"]);
   if (message !== undefined) entry.message = message;
   if (durationMs !== undefined) entry.durationMs = durationMs;
-  const upstreamMs = num(raw["upstreamMs"]);
   if (upstreamMs !== undefined) entry.upstreamMs = upstreamMs;
-  const ttfbMs = num(raw["ttfbMs"]);
   if (ttfbMs !== undefined) entry.ttfbMs = ttfbMs;
-  const generateMs = num(raw["generateMs"]);
   if (generateMs !== undefined) entry.generateMs = generateMs;
   const requestBytes = num(raw["requestBytes"]);
   if (requestBytes !== undefined) entry.requestBytes = requestBytes;
@@ -873,6 +1278,8 @@ function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | nu
   if (toolCount !== undefined) entry.toolCount = toolCount;
   const queued = bool(raw["queued"]);
   if (queued !== undefined) entry.queued = queued;
+  const route = routeTraceOf(raw["route"]);
+  if (route !== undefined) entry.route = route;
   return entry;
 }
 
@@ -880,52 +1287,116 @@ function parseAccessLine(line: string, outcome: AccessOutcome): AccessEntry | nu
  * 查询某天的访问日志。
  *
  * 读量有界：每个 outcome 文件只读尾部 1MB、总扫描行数上限 2 万 —— 超限时
- * `truncated=true`，调用方据此把统计口径标注成「窗口内」，而不是假装是全量。
- * 给出的 `stats` 基于**未过滤**的扫描窗口（当天概览），`total` 才是筛选后的条数。
+ * `truncated=true`，让残缺可见（排障用；界面不展示，列表本身就是窗口内的样本）。
+ * 给出的 `stats`（与 `cids`）基于**未过滤**的扫描窗口（当天概览），`total` 才是筛选后的
+ * 条数；两组数字唯一的范围差别是**路径**：统计只覆盖 `path` / `paths` 声明的范围
+ * （否则分段计数会把列表永远显示不出来的非模型请求算进去，见 `inScope`）。
  */
 export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
   const dates = listAccessDates();
-  const date = query.date !== undefined && dates.includes(query.date) ? query.date : (dates[0] ?? "");
+  /** `all` = 跨**全部**有日志的日期聚合（控制台「全部时间」）。 */
+  const all = query.date === "all";
+  const date = !all && query.date !== undefined && dates.includes(query.date) ? query.date : (dates[0] ?? "");
+  // `listAccessDates()` 本身已是倒序（新的在前），直接沿用：扫描行数上限触发时先读满最新日期，
+  // 被截断丢掉的必须是最旧那几天 —— 否则默认视图（全部时间）会看不到当天与最近几天。
+  const scanDates = all ? dates : [date];
   const limit = Math.min(Math.max(1, query.limit ?? ACCESS_DEFAULT_LIMIT), ACCESS_MAX_LIMIT);
   const offset = Math.max(0, query.offset ?? 0);
   const stats: AccessStats = {
     requests: 0,
     success: 0,
     failure: 0,
-    other: 0,
     slow: 0,
+    slowTtfb: 0,
+    slowTps: 0,
     avgDurationMs: null,
+    avgTps: null,
     noUsage: 0,
     tokens: { prompt: 0, completion: 0, total: 0 },
     cache: { hit: 0, total: 0, hitRate: null },
   };
-  if (!date) {
-    return { date: "", dates, cids: [], slowMs: slowMs(), scanned: 0, truncated: false, total: 0, stats, entries: [] };
+  const slowThresholds = { ttfbMs: SLOW_TTFB_MS, tps: SLOW_TPS };
+  if (!date && !all) {
+    return { date: "", dates, cids: [], slowThresholds, scanned: 0, truncated: false, total: 0, stats, entries: [] };
   }
 
   const scanned: AccessEntry[] = [];
   let truncated = false;
+  let scannedLines = 0;
   let durationSum = 0;
   let durationCount = 0;
-  scan: for (const outcome of ACCESS_OUTCOMES) {
-    for (const file of accessFiles(date, outcome)) {
+  let tpsSum = 0;
+  let tpsCount = 0;
+  /**
+   * 统计是否覆盖这条记录：只认调用方声明的**范围**（路径 + 渠道）。
+   *
+   * 日志页与总览都传 `MODEL_REQUEST_PATHS`，但 access 日志里还有 `/health`、`/v1/models`
+   * 的失败与慢请求，以及浏览器探测（`GET /.well-known/appspecific/com.chrome.devtools.json`
+   * 404）。把它们计进统计，统计条就会说「请求 230」而列表只有 229 条，筛选分段的
+   * 「失败 1」点进去还一条都没有（2026-11-06 实测，分段计数与列表必须同源）。
+   * 不传路径时统计覆盖全部（CLI / 排障要全量）。
+   *
+   * 渠道同理：统计条是「当前筛选下的这一批请求」的画像 —— 选了某个渠道，成功率 /
+   * 慢 / 平均 TPS 就该是那个渠道的，否则换渠道时这几个数纹丝不动，读者会以为统计没生效。
+   * 模型筛选同理（否则「全部 16137」与列表 8 条同屏，更像统计坏了）。
+   * `outcome` / `stream` / `slow` / `q` 有意不进这里：它们各自的命中数就在列表里，
+   * 再收口会让「成功率」随结果分段变化（选「失败」显示 100% 失败），自相矛盾。
+   */
+  const modelNeedle = query.model?.toLowerCase();
+  const inScope = (path: string | undefined, cid: string | undefined, model: string | undefined): boolean =>
+    (query.path === undefined || path === query.path) &&
+    (query.paths === undefined || query.paths.includes(path ?? "")) &&
+    (query.cid === undefined || cid === query.cid) &&
+    (modelNeedle === undefined || (model ?? "").toLowerCase().includes(modelNeedle));
+  /**
+   * 下拉用的渠道集合：只受**路径**范围约束，不受 `cid` 约束 ——
+   * 否则选中某个渠道后，下拉里只剩它自己，用户没法再切回别的渠道。
+   */
+  const pathInScope = (path: string | undefined): boolean =>
+    (query.path === undefined || path === query.path) &&
+    (query.paths === undefined || query.paths.includes(path ?? ""));
+  const seenCids = new Set<string>();
+  // 历史 other.log 并入 failure 一起扫（新写入不再产生，只覆盖旧机器上已有的行）
+  const buckets: Array<{ outcome: AccessOutcome; files: string[] }> = [];
+  for (const d of scanDates) {
+    buckets.push(...ACCESS_OUTCOMES.map((outcome) => ({ outcome, files: accessFiles(d, outcome) })));
+    buckets.push({ outcome: "failure" as const, files: legacyOtherFiles(d) });
+  }
+  scan: for (const { outcome, files } of buckets) {
+    for (const file of files) {
       const tail = readTail(file, ACCESS_TAIL_BYTES);
       if (tail.truncated) truncated = true;
       for (const line of tail.text.split("\n")) {
         if (line.trim() === "") continue;
-        if (scanned.length >= ACCESS_SCAN_LINES) {
+        // 行数上限按**读到的行**算（不是进统计的行）：不然后半程全是范围外记录时，
+        // 读量只受单文件字节上限约束，行数护栏形同虚设
+        if (scannedLines >= ACCESS_SCAN_LINES) {
           truncated = true;
           break scan;
         }
+        scannedLines += 1;
         const entry = parseAccessLine(line, outcome);
         if (!entry) continue;
+        // 渠道下拉先收（路径范围内全部渠道），再按 cid 收口统计
+        if (pathInScope(entry.path) && entry.cid !== undefined) seenCids.add(entry.cid);
+        if (!inScope(entry.path, entry.cid, entry.model)) continue;
         scanned.push(entry);
         stats.requests += 1;
         stats[outcome] += 1;
         if (entry.slow) stats.slow += 1;
+        if (entry.slowTtfb) stats.slowTtfb += 1;
+        if (entry.slowTps) stats.slowTps += 1;
         if (entry.durationMs !== undefined) {
           durationSum += entry.durationMs;
           durationCount += 1;
+        }
+        // 平均速率只采成功请求的样本（口径与 `usage-stats` 的 `avgTps` 一致）
+        if (outcome === "success") {
+          const tps = tokensPerSecOf(entry);
+          if (tps !== null) {
+            tpsSum += tps;
+            tpsCount += 1;
+          }
         }
         if (entry.tokens === null) {
           stats.noUsage += 1;
@@ -946,20 +1417,19 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
     }
   }
   stats.avgDurationMs = durationCount > 0 ? Math.round(durationSum / durationCount) : null;
+  stats.avgTps = tpsCount > 0 ? tpsSum / tpsCount : null;
   stats.cache.hitRate = stats.cache.total > 0 ? stats.cache.hit / stats.cache.total : null;
 
-  const cids = [...new Set(scanned.map((e) => e.cid).filter((c): c is string => c !== undefined))].sort();
+  const cids = [...seenCids].sort();
 
   const needle = query.q?.toLowerCase();
+  // `path` / `paths` 已在扫描时由 `inScope` 收口（统计与列表同一范围），这里不再重复判定 ——
+  // 同一个「二选一」契约写两处，改一处就会让两边口径静默分叉
   const matched = scanned.filter((e) => {
     if (query.outcome !== undefined && e.outcome !== query.outcome) return false;
-    if (query.path !== undefined && e.path !== query.path) return false;
     if (query.cid !== undefined && e.cid !== query.cid) return false;
     if (query.stream !== undefined && e.stream !== query.stream) return false;
     if (query.slow === true && !e.slow) return false;
-    if (query.model !== undefined && !(e.model ?? "").toLowerCase().includes(query.model.toLowerCase())) {
-      return false;
-    }
     if (needle !== undefined && needle !== "") {
       const hay = `${e.id} ${e.model ?? ""} ${e.error ?? ""} ${e.message ?? ""}`.toLowerCase();
       if (!hay.includes(needle)) return false;
@@ -971,10 +1441,10 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
   matched.sort((a, b) => (a.ts === b.ts ? (a.id < b.id ? 1 : -1) : a.ts < b.ts ? 1 : -1));
 
   return {
-    date,
+    date: all ? "all" : date,
     dates,
     cids,
-    slowMs: slowMs(),
+    slowThresholds,
     scanned: scanned.length,
     truncated,
     total: matched.length,
@@ -984,14 +1454,16 @@ export function queryAccessLogs(query: AccessQuery = {}): AccessPage {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 请求正文抓取（默认开启，偏好可关 —— 见 docs/LOGGING.md §9）
+// 请求正文抓取（恒开启、无开关 —— 见 docs/LOGGING.md §9）
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * 一次请求的正文记录（形状与落盘行一致，`ts` / `seq` 由写入时补）。
  *
  * `body` 存**原样文本**（不解析成对象）：既忠实反映「构造了什么」，又让界面在能
- * `JSON.parse` 时按消息渲染、截断时降级成原文。
+ * `JSON.parse` 时按消息渲染、截断时降级成原文。客户端发的字节不是合法 UTF-8 时
+ * （Windows GBK 控制台输出被原样塞进 JSON 等），呈现按替换符，原样字节仍在
+ * 压缩块里无损保存 —— 损坏在源头，不在存储。
  */
 export interface PayloadRecord {
   ts: string;
@@ -1008,6 +1480,8 @@ export interface PayloadRecord {
   body: string;
   /** 正文存储形态（`plain` / `zstd` / `gzip`）；空串 = 旧行（等价 plain）。 */
   bodyEnc?: string;
+  /** 原始字节里无效 UTF-8 序列覆盖的字节数（0 缺省 = 全部有效或旧行未统计）。 */
+  invalidBytes?: number;
 }
 
 /**
@@ -1037,25 +1511,109 @@ function payloadCids(): string[] | null {
 }
 
 /**
+ * 数无效 UTF-8 序列覆盖的**字节**数（WHATWG 状态机）。孤立续字节、坏第二字节、
+ * overlong / 代理区 / 越界头与 `toString("utf8")` 的替换符一一对应；截断的
+ * 不完整序列按「首字节 + 合法续字节前缀」整段计坏 —— 字节覆盖口径，数量可
+ * 多于呈现层的替换符数（不完整序列只顶出一个 FFFD）。
+ */
+export function countInvalidUtf8(buf: Buffer): number {
+  let bad = 0;
+  let i = 0;
+  while (i < buf.length) {
+    const b0 = buf[i]!;
+    let need: number;
+    let lower = 0x80;
+    let upper = 0xbf;
+    if (b0 < 0x80) {
+      i += 1;
+      continue;
+    }
+    if (b0 >= 0xc2 && b0 <= 0xdf) {
+      need = 1;
+    } else if (b0 >= 0xe0 && b0 <= 0xef) {
+      need = 2;
+      lower = b0 === 0xe0 ? 0xa0 : 0x80;
+      upper = b0 === 0xed ? 0x9f : 0xbf;
+    } else if (b0 >= 0xf0 && b0 <= 0xf4) {
+      need = 3;
+      lower = b0 === 0xf0 ? 0x90 : 0x80;
+      upper = b0 === 0xf4 ? 0x8f : 0xbf;
+    } else {
+      // 0x80-0xbf 孤立续字节、0xc0/0xc1 overlong 头、0xf5-0xff
+      bad += 1;
+      i += 1;
+      continue;
+    }
+    const b1 = i + 1 < buf.length ? buf[i + 1]! : -1;
+    if (b1 < lower || b1 > upper) {
+      // 首字节带不出合法第二字节：首字节坏，从下一个字节重试
+      bad += 1;
+      i += 1;
+      continue;
+    }
+    let ok = true;
+    for (let k = 2; k <= need; k += 1) {
+      if (i + k >= buf.length || (buf[i + k]! & 0xc0) !== 0x80) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      i += need + 1;
+      continue;
+    }
+    // 截断或中途坏：首字节 + 合法续字节前缀都算坏字节
+    let consumed = 2;
+    while (consumed <= need && i + consumed < buf.length && (buf[i + consumed]! & 0xc0) === 0x80) {
+      consumed += 1;
+    }
+    bad += consumed;
+    i += consumed;
+  }
+  return bad;
+}
+
+/** clipPayload 的产物：字节直通（不 lossy），附带溯源统计。 */
+interface ClippedPayload {
+  /** 双端保留后的字节（未截断时即全量原字节）。 */
+  data: Buffer;
+  bytes: number;
+  truncated: boolean;
+  invalidBytes: number;
+}
+
+/**
  * 截断到单条上限：超过时**双端保留**（头尾各半），而不是保头弃尾 ——
  * agent 会话的最新消息（排查重点）在尾部，截旧尾等于没截在点子上。
  *
- * 截断可能切在 UTF-8 中间（会产生替换字符）—— 这是刻意的取舍：抓包的价值在
- * 「看到构造」，为了一个字符去做边界对齐不划算；`truncated` 已经如实标注。
+ * 返回**字节**而非字符串：客户端发的坏字节（GBK 等）必须原样进压缩块，
+ * 在这里 toString 就永远找不回来了（2026-11-07 实测 meta bytes:107 vs 落盘 119）。
  */
-function clipPayload(body: Buffer | string): Pick<PayloadRecord, "body" | "bytes" | "truncated"> {
+function clipPayload(body: Buffer | string): ClippedPayload {
   const buf = typeof body === "string" ? Buffer.from(body, "utf8") : body;
   const max = payloadMaxBytes();
   if (buf.length <= max) {
-    return { body: buf.toString("utf8"), bytes: buf.length, truncated: false };
+    return { data: buf, bytes: buf.length, truncated: false, invalidBytes: countInvalidUtf8(buf) };
   }
-  const head = buf.subarray(0, Math.floor(max / 2)).toString("utf8");
-  const tail = buf.subarray(buf.length - Math.floor(max / 2)).toString("utf8");
-  const note = `\n\n…（请求体超 ${(max / 1024 / 1024).toFixed(0)}MB，仅保留首尾；共 ${buf.length} 字节）…\n\n`;
+  const note = Buffer.from(
+    `\n\n…（请求体超 ${(max / 1024 / 1024).toFixed(0)}MB，仅保留首尾；共 ${buf.length} 字节）…\n\n`,
+    "utf8",
+  );
+  // 头尾各 max/2（note 叠加在外）：上限被测试调到极小时 note 反超预算，
+  // 从预算里扣会让 half 变负 —— 保头尾语义优先于落盘体严格 ≤ max
+  const half = Math.max(1, Math.floor(max / 2));
+  const data = Buffer.concat([
+    buf.subarray(0, half),
+    note,
+    buf.subarray(buf.length - half),
+  ]);
+  // invalidBytes 只认**全量原文**的无效字节：自家切点劈开的合法字符不是「客户端发的坏字节」，
+  // 按半段各自扫描会把切点悬空前缀错记进来（评审 2026-11-07）
   return {
-    body: head + note + tail,
+    data,
     bytes: buf.length,
     truncated: true,
+    invalidBytes: countInvalidUtf8(buf),
   };
 }
 
@@ -1092,10 +1650,19 @@ interface PackedBody {
   bodyChunks?: string[];
   /** 各块**解压后**的字节数（与 `bodyChunks` 一一对应）；读取侧靠它定位块号。 */
   bodyChunkLens?: number[];
+  /** 原始字节的无效 UTF-8 计数（仅 >0 时落盘；旧行无此字段）。 */
+  invalidBytes?: number;
 }
 
 /**
  * 把正文压成可内联进 JSON 行的形态。
+ *
+ * 输入是**字节**（clipPayload 的产物）：合法 UTF-8 的小正文维持 plain 字符串
+ * （与旧行同形态），其余一律走压缩 —— 无效字节（GBK 等）只能活在这个分支里，
+ * 任何「先转字符串」的动作都会把它们顶成替换符、原样字节永久丢失。
+ *
+ * `invalidBytes` 省略时自动检测（compact 重编码路径复用）；appendPayload 路径
+ * clipPayload 已经算过，显式传入免第二次扫描。
  *
  * 为什么不学 dsh 做「内容寻址 blob + 去重」：实测本仓库 payload 的重复率是 **0**
  * （2 天 114 条正文，唯一 114 条；client 与 upstream 正文也无一字节相同），
@@ -1105,32 +1672,36 @@ interface PackedBody {
  * 大正文按 `PAYLOAD_CHUNK_BYTES` 切成多帧（dsh 式）：读取按块局部解码，
  * 取一片不必解全量 —— 这是「上下文弹窗分片读取」的后端前提。
  */
-function packBody(body: string): PackedBody {
-  const buf = Buffer.from(body, "utf8");
-  if (buf.length < PAYLOAD_COMPRESS_MIN_BYTES) return { body, bodyEnc: "plain" };
+function packBody(data: Buffer, invalidBytes?: number): PackedBody {
+  const bad = invalidBytes ?? countInvalidUtf8(data);
+  const mark = bad > 0 ? { invalidBytes: bad } : {};
+  if (data.length < PAYLOAD_COMPRESS_MIN_BYTES && bad === 0) {
+    return { body: data.toString("utf8"), bodyEnc: "plain" };
+  }
   const enc: BodyEncoding = hasZstd() ? "zstd" : "gzip";
   const pack = (chunk: Buffer): Buffer =>
     enc === "zstd" ? zlib.zstdCompressSync(chunk) : zlib.gzipSync(chunk);
   const chunks: Buffer[] = [];
   const lens: number[] = [];
-  for (let off = 0; off < buf.length; off += PAYLOAD_CHUNK_BYTES) {
-    const slice = buf.subarray(off, Math.min(off + PAYLOAD_CHUNK_BYTES, buf.length));
+  for (let off = 0; off < data.length; off += PAYLOAD_CHUNK_BYTES) {
+    const slice = data.subarray(off, Math.min(off + PAYLOAD_CHUNK_BYTES, data.length));
     chunks.push(pack(slice));
     lens.push(slice.length);
   }
   // 单块时直接落整帧（与旧行形态一致，省一层字段）；多块才走 bodyChunks
-  if (chunks.length === 1) return { bodyEnc: enc, bodyB64: chunks[0]!.toString("base64") };
+  if (chunks.length === 1) return { bodyEnc: enc, bodyB64: chunks[0]!.toString("base64"), ...mark };
   // 每块**明文长度**：读取侧据此算出 `total` 并直接定位命中的块号，
   // 从而只解压需要的那几块（不落这个数组就只能解全部块才知道边界）。
   return {
     bodyEnc: enc,
     bodyChunks: chunks.map((c) => c.toString("base64")),
     bodyChunkLens: lens,
+    ...mark,
   };
 }
 
-/** 解码 `packBody` 的产物；旧行的纯 `body` 由调用方直接取用。 */
-function unpackBody(rec: PackedBody): string | null {
+/** 解码 `packBody` 的产物为**字节**；旧行的纯 `body`（字符串）由调用方自己转。 */
+function unpackBody(rec: PackedBody): Buffer | null {
   const decode = (b64: string): Buffer | null => {
     try {
       const buf = Buffer.from(b64, "base64");
@@ -1157,10 +1728,13 @@ function unpackBody(rec: PackedBody): string | null {
   } else {
     return null;
   }
-  return Buffer.concat(parts).toString("utf8");
+  return Buffer.concat(parts);
 }
 
-function appendPayload(record: Omit<PayloadRecord, "ts" | "seq">): void {
+/** appendPayload 的输入：元数据 + clipPayload 的字节产物（body 形态由 packBody 决定）。 */
+type AppendPayloadInput = Omit<PayloadRecord, "ts" | "seq" | "body" | "bodyEnc"> & ClippedPayload;
+
+function appendPayload(record: AppendPayloadInput): void {
   try {
     const date = localDate();
     const dir = join(logsRoot(), "payload", date);
@@ -1174,12 +1748,14 @@ function appendPayload(record: Omit<PayloadRecord, "ts" | "seq">): void {
     const file = join(dir, "payload.log");
     rotateIfNeeded(file);
     payloadSeq += 1;
-    const { body, ...rest } = record;
+    const { data, bytes, truncated, invalidBytes, ...rest } = record;
     const line = JSON.stringify({
       ts: new Date().toISOString(),
       seq: payloadSeq,
       ...rest,
-      ...packBody(body),
+      bytes,
+      truncated,
+      ...packBody(data, invalidBytes),
     });
     appendFileSync(file, `${line}\n`, "utf8");
   } catch {
@@ -1278,21 +1854,23 @@ function compactPayloadFile(file: string): { before: number; after: number } | n
         out.push(line);
         continue;
       }
-      const body =
+      // 统一取字节：明文行（含历史 FFFD 的字符串，本身是合法 UTF-8）与压缩行一致处理，
+      // invalidBytes 由 packBody 自动检测 —— 无效字节的行重编码后标注不丢
+      const data =
         typeof raw["body"] === "string"
-          ? raw["body"]
+          ? Buffer.from(raw["body"], "utf8")
           : unpackBody(raw as PackedBody);
-      if (body === null) {
+      if (data === null) {
         out.push(line);
         continue;
       }
       // 单帧行重编码为分块；重压后仍是单帧（不足两块）就原样保留（无收益不冒险）
-      const repacked = packBody(body);
+      const repacked = packBody(data);
       if (repacked.bodyChunks === undefined) {
         out.push(line);
         continue;
       }
-      const { body: _b, bodyEnc: _e, bodyB64: _x, bodyChunks: _c, ...rest } = raw;
+      const { body: _b, bodyEnc: _e, bodyB64: _x, bodyChunks: _c, invalidBytes: _i, ...rest } = raw;
       migrated += 1;
       out.push(JSON.stringify({ ...rest, ...repacked }));
     }
@@ -1301,9 +1879,10 @@ function compactPayloadFile(file: string): { before: number; after: number } | n
     // 是接受的成本 —— 与明文压缩那次不同，这里的判据是**形态迁移完成**而非变小；
     // 零迁移（该段没有单帧行可转）时没有改写价值，别动文件。
     if (migrated === 0) return null;
-    const tmp = `${file}.compact`;
-    writeFileSync(tmp, next, "utf8");
-    renameSync(tmp, file);
+    // 唯一临时名 + 原子 rename：`${file}.compact` 与网关主进程共用同一路径，
+    // 两边同时压同一段会把对方的半份内容 rename 成正式日志（STORAGE-CONVENTION §3.7）。
+    // 日志是逐行 JSON（全 UTF-8 文本），以 utf8 形态写回与原来的字节一致。
+    writeAtomicFile(file, next.toString("utf8"), 0o600);
     return { before, after: next.length };
   } catch {
     return null;
@@ -1355,14 +1934,19 @@ function parsePayloadLine(line: string, withBody = true): PayloadRecord | null {
       truncated: bool(raw["truncated"]) ?? false,
       // 新行把正文压进 bodyChunks / bodyB64（按 bodyEnc 解码）；旧行直接是 body 字符串。
       // 三种形态都要能读 —— 已落盘的正文按保留期陪着老版本一起走完。
+      // 呈现按 UTF-8 文本（无效字节显示替换符）；原样字节留在压缩块里无损。
       //
       // `withBody=false` 时**跳过解压**：解压是这条读路径上唯一的重量级操作
       // （实测单行 1.2 MB 压缩 → 数 MB 明文），而列表与首屏只需要元数据。
-      body: withBody ? str(raw["body"]) ?? unpackBody(raw as PackedBody) ?? "" : "",
+      body: withBody
+        ? str(raw["body"]) ?? unpackBody(raw as PackedBody)?.toString("utf8") ?? ""
+        : "",
       bodyEnc: str(raw["bodyEnc"]) || (str(raw["body"]) ? "plain" : ""),
     };
     const attempt = num(raw["attempt"]);
     if (attempt !== undefined) rec.attempt = attempt;
+    const invalid = num(raw["invalidBytes"]);
+    if (invalid !== undefined && invalid > 0) rec.invalidBytes = invalid;
     const cid = str(raw["cid"]);
     if (cid !== undefined) rec.cid = cid;
     const model = str(raw["model"]);
@@ -1499,8 +2083,13 @@ function locatePayloadChunks(
  * **只解压命中窗口覆盖的那几块**；旧行没有这个数组，退回「解全部块」的慢路径
  *（实测 4.2 MB / 5 块：只解命中块 2.3 ms，解全部 10.5 ms）。
  *
+ * 输出是 **base64**：分片窗口常落在多字节字符中间，如果这里转字符串再传，
+ * 接缝就会劈出替换符（且 UI 侧无法复原）；字节交给 UI 拼齐后一次性解码，
+ * 接缝问题在字节层自然消失。`offset` / `length` / `total` 恒为字节
+ *（明文行也转字节后再切，旧实现按字符切是另一处乱码源）。
+ *
  * @param phase 指定取哪一份（`client` / `upstream`）；不指定则取第一条有正文的记录。
- * @returns `{ offset, length, total, body }`；未命中返回 `null`
+ * @returns `{ offset, length, total, bodyB64 }`；未命中返回 `null`
  */
 export function readPayloadSlice(
   id: string,
@@ -1508,15 +2097,20 @@ export function readPayloadSlice(
   phase: string | undefined,
   offset = 0,
   limit = PAYLOAD_SLICE_BYTES,
-): { offset: number; length: number; total: number; body: string } | null {
+): { offset: number; length: number; total: number; bodyB64: string } | null {
   const located = locatePayloadChunks(id, date, phase);
   if (!located) return null;
-  // 明文块：字符语义与压缩块的字节语义在切片上是同一回事（UTF-8 直读）
+  // 明文行（旧格式 / <4KB）：字符串本身是合法 UTF-8，转字节后与压缩块同一套几何
   if (located.plain) {
-    const raw = located.chunks[0] ?? "";
+    const raw = Buffer.from(located.chunks[0] ?? "", "utf8");
     const start = Math.max(0, Math.min(offset, raw.length));
     const end = Math.max(start, Math.min(start + limit, raw.length));
-    return { offset: start, length: end - start, total: raw.length, body: raw.slice(start, end) };
+    return {
+      offset: start,
+      length: end - start,
+      total: raw.length,
+      bodyB64: raw.subarray(start, end).toString("base64"),
+    };
   }
   const decode = (b64: string): Buffer | null => {
     try {
@@ -1552,7 +2146,7 @@ export function readPayloadSlice(
       chunkStart = chunkEnd;
       if (chunkStart >= end) break;
     }
-    return { offset: start, length: end - start, total, body: acc.toString("utf8") };
+    return { offset: start, length: end - start, total, bodyB64: acc.toString("base64") };
   }
   // 慢路径（旧行无块长）：解全部块累加 total —— 只把命中区间拼进结果。
   let total = 0;
@@ -1575,5 +2169,5 @@ export function readPayloadSlice(
   }
   if (!hit) return null;
   const start = Math.max(0, Math.min(offset, total));
-  return { offset: start, length: Math.min(limit, total - start), total, body: accumulated.toString("utf8") };
+  return { offset: start, length: Math.min(limit, total - start), total, bodyB64: accumulated.toString("base64") };
 }

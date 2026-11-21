@@ -1,80 +1,55 @@
 /**
  * 「使用统计」聚合（Web 控制台 `GET /web/api/usage` 的数据源）。
  *
- * 只读 `access/<date>/{success,failure,other}.log`，不为统计另建账本（口径见 docs/USAGE-STATS.md）。
+ * 只读 `access/<date>/{success,failure}.log`（历史的 `other.log` 由 log-store 并入 failure），不计别的账本（口径见 docs/USAGE-STATS.md）。
  * 只统计**模型请求**（`/v1/chat/completions`）—— `/health` 等也落盘，计入会让调用次数失真。
  * 缓存：已过去的日期永久缓存、今天每次重算；不按 mtime 失效（追加写入不改目录 mtime）。
  */
 
-import { listAccessDates, MODEL_REQUEST_PATH, scanAccessDate } from "./log-store.js";
+import { listAccessDates, isModelRequestPath, scanAccessDate, tokensPerSecOf } from "./log-store.js";
 
-export type UsageRange = "7d" | "30d" | "90d" | "365d";
-
-const RANGE_DAYS: Record<UsageRange, number> = { "7d": 7, "30d": 30, "90d": 90, "365d": 365 };
-
-/**
- * 生成窗口下限（毫秒）：小于它算不出可信速率（首末帧同毫秒 = 测不到）。
- *
- * 与 UI 侧 `packages/ui/src/lib/log-format.ts` 的 `GENERATE_FLOOR_MS` **必须同值** ——
- * 两边算的是同一个 TPS，只是服务端用于聚合、前端用于单条展示。改一处就要改两处。
- */
-const GENERATE_FLOOR_MS = 50;
+// 单请求生成速率的公式与护栏在 `log-store.ts`（读路径重算「慢」也要用同一份）；
+// 这里 re-export 保持既有导入面（tests / probe 走这里取）。
+export { tokensPerSecOf };
 
 /**
- * 速率上限（tokens/s）：超过它说明分母算错了（非流式把 ttfb 当生成时间等）。
+ * 用量区间。
  *
- * 与 UI 侧 `MEASURE_CEILING_TPS` 同值，理由同上。
+ * `365d` 只供热力图（52 周日历恒看一年，不随区间选择器变化），不出现在区间选择器里。
+ * `all` = 累计：按日志保留期内**实际存在**的日期聚合，不设天数上限。
  */
-const MEASURE_CEILING_TPS = 1000;
+export type UsageRange = "today" | "7d" | "30d" | "90d" | "365d" | "all";
+
+const RANGE_DAYS: Record<Exclude<UsageRange, "all">, number> = {
+  today: 1,
+  "7d": 7,
+  "30d": 30,
+  "90d": 90,
+  "365d": 365,
+};
 
 /**
- * 单个请求的生成速率（tokens/s）；算不出可信值时返回 null。
+ * 未知模型（日志里没有 model 字段的模型请求，如解析前就失败的）在统计里的占位 id。
  *
- * 算法逐行对齐 UI 的 `tokensPerSecOf`：分母优先用**纯生成窗口** `generateMs`，
- * 缺失时按 `durationMs` 减掉首字节 / 上游接单时间兜底；流式与非流式的兜底基准不同
- * （非流式 `ttfbMs` 等于总耗时，减它会把分母压到 0）。
- * 为什么服务端要再实现一遍：UI 包不依赖 `@modelmux/gateway`，两边各自构建。
+ * 渠道未知（没有 cid）时同理为空串 —— 两者合成聚合键 `"<cid>/<model>"`。
  */
-export function tokensPerSecOf(entry: {
-  tokens: { completion: number | null } | null;
-  durationMs?: number;
-  ttfbMs?: number;
-  upstreamMs?: number;
-  generateMs?: number;
-  stream?: boolean;
-}): number | null {
-  const completion = entry.tokens?.completion ?? null;
-  const durationMs = entry.durationMs;
-  if (completion === null || !Number.isFinite(completion) || completion <= 0) return null;
-  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs <= 0) return null;
-  /** 可用的绝对耗时：必须为正且小于总耗时，否则视为缺失。 */
-  const cut = (v: number | undefined): number =>
-    v !== undefined && Number.isFinite(v) && v > 0 && v < durationMs ? v : 0;
-
-  const direct = cut(entry.generateMs);
-  let generateMs: number;
-  if (direct > 0) {
-    generateMs = direct;
-  } else {
-    const ttfb = cut(entry.ttfbMs);
-    const upstream = cut(entry.upstreamMs);
-    const base =
-      entry.stream === true
-        ? ttfb || upstream
-        : entry.stream === false
-          ? upstream
-          : ttfb > 0 && upstream > 0
-            ? Math.min(ttfb, upstream)
-            : ttfb || upstream;
-    generateMs = base > 0 ? durationMs - base : durationMs;
-  }
-  if (generateMs < GENERATE_FLOOR_MS) return null;
-  const perSec = completion / (generateMs / 1000);
-  return perSec > MEASURE_CEILING_TPS ? null : perSec;
-}
-
-/** 未知模型（日志里没有 model 字段的模型请求，如解析前就失败的）在统计里的占位 id。 */
 export const UNKNOWN_MODEL = "";
+
+/**
+ * 聚合键：`<cid>/<模型>` —— **模型 + 渠道**双维度。
+ *
+ * 为什么按渠道拆：对外模型只剩 deepseek 几个名字，同一个名字可能由多个渠道承接，
+ * 合成一个数会把「哪家慢」抹平（用户要的正是这个）。趋势图按这个键分序列。
+ *
+ * 旧日志的模型名自带渠道前缀（池 id 时代写的是 `<cid>/<模型>`），这里先剥掉同名前缀，
+ * 否则聚合键会变成 `cid/cid/模型`（实测 `loomy/loomy/deepseek-v4.1-flash`）。
+ */
+export function usageKeyOf(cid: string | undefined, model: string | undefined): string {
+  const c = cid ?? "";
+  let m = model ?? UNKNOWN_MODEL;
+  if (c !== "" && m.startsWith(`${c}/`)) m = m.slice(c.length + 1);
+  return `${c}/${m}`;
+}
 
 export interface UsageDaily {
   date: string;
@@ -83,21 +58,26 @@ export interface UsageDaily {
   tokensOut: number;
   requests: number;
   messages: number;
-  /** 该日各模型 tokens（键 = `<cid>/<模型>`）；趋势图按它分序列。 */
+  /** 该日各（渠道 × 模型）tokens（键 = `<cid>/<模型>`）；趋势图按它分序列。 */
   byModel: Record<string, number>;
 }
 
 export interface UsageModelRow {
+  /** 聚合键 `<cid>/<模型>`（趋势图分序列用）。 */
   id: string;
+  /** 纯模型名（对外 deepseek id；空串 = 未知模型）。 */
+  model: string;
+  /** 承接该模型的渠道（空串 = 日志没记渠道）。 */
+  cid: string;
   tokens: number;
   input: number;
   output: number;
   cache: number;
   /** 占区间总 tokens 的比例（0–1；总数为 0 时为 0）。 */
   share: number;
-  /** 成功请求数（`success.log` 里该模型的条数）。 */
+  /** 成功请求数（`success.log` 里该模型 × 渠道的条数）。 */
   ok: number;
-  /** 失败请求数（`failure.log` + `other.log`）。 */
+  /** 失败请求数（`failure.log`；历史 other.log 已并入）。 */
   fail: number;
   /** 进过上游排队的请求数；> 0 时控制台打「排队」标签。 */
   queued: number;
@@ -107,6 +87,14 @@ export interface UsageModelRow {
    * 只算成功请求：失败的 usage 多为空，混进去会把速率往下拉成「丑但成功不了」的假象。
    */
   avgTps: number | null;
+}
+
+/** 一个账号**今日**的 token 消耗（账号池账号行用，与「今日消耗」同口径）。 */
+export interface UsageAccountRow {
+  /** 账号 key（池内标识，与账本 / 控制台的账号行同一套）。 */
+  key: string;
+  tokens: number;
+  requests: number;
 }
 
 export interface UsageStats {
@@ -120,6 +108,11 @@ export interface UsageStats {
     tokensOut: number;
     requests: number;
     messages: number;
+    /** 成功 / 失败条数（按 access 日志的**文件归属**分桶，与日志页同一口径）。 */
+    success: number;
+    failure: number;
+    /** 判定为慢的条数（口径见 docs/LOGGING.md §3.5）。 */
+    slow: number;
     durationMs: number;
     /** 加权命中率 `Σhit / Σ(hit+miss)`；区间内无一条带缓存字段时为 null（显示 `—`，不是 0%）。 */
     cacheHitRate: number | null;
@@ -128,6 +121,12 @@ export interface UsageStats {
     cacheTotal: number;
     /** 区间内单请求最长耗时。替代 ZCode 的「最长聊天时长」—— 网关无会话概念（见 docs/USAGE-STATS.md）。 */
     longestRequestMs: number | null;
+    /**
+     * 区间内**成功请求**的平均生成速率（tokens/s）；一条都算不出时为 null。
+     *
+     * 口径与 `models[].avgTps` 同源（成功请求、每条各算一次再平均），只是不按模型拆分。
+     */
+    avgTps: number | null;
     /** 上游没回 usage 的请求数（与日志页 `stats.noUsage` 同一判据：`tokens === null`）。 */
     noUsage: number;
   };
@@ -135,6 +134,13 @@ export interface UsageStats {
   daily: UsageDaily[];
   /** 按 tokens 降序；`id` 为空串表示「未知模型」。 */
   models: UsageModelRow[];
+  /**
+   * 每个账号**今日**的 token 消耗（降序）；当天没有请求时为空数组。
+   *
+   * 只给今日：账号行已经显示「今日消耗」（额度），tokens 与之同口径才有可比性；
+   * 逐日明细会让账号维度迅速膨胀（账号数 × 天数），账号行也用不上。
+   */
+  accounts: UsageAccountRow[];
   /** 「有请求」的连续天数。今天没请求时 `current` 算到昨天为止。 */
   streak: { current: number; longest: number };
   peak: { date: string; tokens: number; hour: number; hourTokens: number } | null;
@@ -142,6 +148,11 @@ export interface UsageStats {
 }
 
 interface DayAgg extends UsageDaily {
+  /** 成功 / 失败条数（`outcome` 取自文件归属；历史 other.log 已并入 failure）。 */
+  success: number;
+  failure: number;
+  /** 判定为慢的条数。 */
+  slow: number;
   durationMs: number;
   longestMs: number | null;
   cacheHit: number;
@@ -159,8 +170,16 @@ interface DayAgg extends UsageDaily {
   /** 该模型成功请求的速率之和与样本数（`tpsCount` 只算算得出速率的）。 */
   byModelTpsSum: Record<string, number>;
   byModelTpsCount: Record<string, number>;
+  /** 当日成功请求的速率之和与样本数（区间总计的 `avgTps`；与 `byModelTps*` 同一批样本）。 */
+  tpsSum: number;
+  tpsCount: number;
+  /** 账号维度（今日 token）：访问日志的 `key` 字段，渠道 + 账号才能定位到具体凭据。 */
+  byAccountTokens: Record<string, number>;
+  byAccountRequests: Record<string, number>;
   /** 24 项（**本地**小时）；`ts` 是 UTC，必须转本地。 */
   byHour: number[];
+  /** 本次扫描有日志文件读失败被跳过：结果残缺，不得写进历史缓存。 */
+  partial: boolean;
 }
 
 /** 历史日期（已过去）的聚合缓存；今天不缓存。 */
@@ -181,6 +200,9 @@ function aggregateDay(date: string): DayAgg {
     requests: 0,
     messages: 0,
     byModel: {},
+    success: 0,
+    failure: 0,
+    slow: 0,
     durationMs: 0,
     longestMs: null,
     cacheHit: 0,
@@ -194,7 +216,12 @@ function aggregateDay(date: string): DayAgg {
     byModelQueued: {},
     byModelTpsSum: {},
     byModelTpsCount: {},
+    tpsSum: 0,
+    tpsCount: 0,
+    byAccountTokens: {},
+    byAccountRequests: {},
     byHour: new Array<number>(24).fill(0),
+    partial: false,
   };
   scanInto(date, agg);
   return agg;
@@ -202,18 +229,23 @@ function aggregateDay(date: string): DayAgg {
 
 /** 把某日的模型请求逐条累加进聚合体（与 `aggregateDay` 分开只为让缓存分支读起来更直）。 */
 function scanInto(date: string, agg: DayAgg): void {
-  scanAccessDate(date, (entry) => {
-    if (entry.path !== MODEL_REQUEST_PATH) return;
+  const skipped = scanAccessDate(date, (entry) => {
+    if (!isModelRequestPath(entry.path)) return;
     const tokens = entry.tokens;
     const total = tokens?.total ?? 0;
     const input = tokens?.prompt ?? 0;
     const output = tokens?.completion ?? 0;
-    const id = entry.model ?? UNKNOWN_MODEL;
+    const model = entry.model ?? UNKNOWN_MODEL;
+    const cid = entry.cid ?? "";
+    const id = usageKeyOf(cid, model);
     agg.requests += 1;
     agg.tokens += total;
     agg.tokensIn += input;
     agg.tokensOut += output;
     agg.messages += entry.messageCount ?? 0;
+    // 结果分桶与「慢」按文件归属 / 读路径判定（与日志页的统计条同一口径）
+    agg[entry.outcome] += 1;
+    if (entry.slow) agg.slow += 1;
     if (entry.durationMs !== undefined) {
       agg.durationMs += entry.durationMs;
       if (agg.longestMs === null || entry.durationMs > agg.longestMs) agg.longestMs = entry.durationMs;
@@ -228,6 +260,11 @@ function scanInto(date: string, agg: DayAgg): void {
     // 上游没回 usage（`tokens === null`）单独计数：这些请求既不进 tokens 也不进命中率分母，
     // 仪表盘要把这个数露出来，否则「tokens 少」看起来像「用的人少」而不是「上游没报」。
     if (tokens === null) agg.noUsage += 1;
+    // 账号维度：日志没带 `key` 的请求（登录前 / 健康检查）不进账号汇总
+    if (entry.key) {
+      agg.byAccountTokens[entry.key] = (agg.byAccountTokens[entry.key] ?? 0) + total;
+      agg.byAccountRequests[entry.key] = (agg.byAccountRequests[entry.key] ?? 0) + 1;
+    }
     agg.byModel[id] = (agg.byModel[id] ?? 0) + total;
     agg.byModelIn[id] = (agg.byModelIn[id] ?? 0) + input;
     agg.byModelOut[id] = (agg.byModelOut[id] ?? 0) + output;
@@ -238,6 +275,8 @@ function scanInto(date: string, agg: DayAgg): void {
       if (tps !== null) {
         agg.byModelTpsSum[id] = (agg.byModelTpsSum[id] ?? 0) + tps;
         agg.byModelTpsCount[id] = (agg.byModelTpsCount[id] ?? 0) + 1;
+        agg.tpsSum += tps;
+        agg.tpsCount += 1;
       }
     } else {
       agg.byModelFail[id] = (agg.byModelFail[id] ?? 0) + 1;
@@ -249,15 +288,18 @@ function scanInto(date: string, agg: DayAgg): void {
       agg.byHour[hour] = (agg.byHour[hour] ?? 0) + total;
     }
   });
+  // 有文件读失败（轮转窗口 / 文件锁）→ 数字残缺。宁可下次重算，也不把「少算的
+  // 累计」固化进缓存 —— 那会让某一天的 tokens 从此偏低且无任何痕迹。
+  agg.partial = skipped > 0;
 }
 
-/** 取某日聚合（历史日期走缓存，今天每次重算）。 */
+/** 取某日聚合（历史日期走缓存，今天每次重算；残缺结果不进缓存，见 `partial`）。 */
 function dayAgg(date: string, today: string): DayAgg {
   if (date >= today) return aggregateDay(date);
   const hit = dayCache.get(date);
   if (hit !== undefined) return hit;
   const agg = aggregateDay(date);
-  dayCache.set(date, agg);
+  if (!agg.partial) dayCache.set(date, agg);
   return agg;
 }
 
@@ -302,21 +344,28 @@ const prevDay = (value: string): string => shiftDay(value, -1);
 const isNextDay = (a: string, b: string): boolean => shiftDay(a, 1) === b;
 
 /**
- * 聚合最近 N 天的模型请求用量。
+ * 聚合用量（区间由 `range` 决定）。
  *
  * `now` 可注入（测试用）；默认取当前时刻。只聚合**实际存在日志**的日期
- * （`listAccessDates()`），所以日志保留期（默认 14 天）之外不会有数据。
+ * （`listAccessDates()`），所以日志保留期（默认 14 天）之外不会有数据 ——
+ * 「累计」也是保留期内的累计，不是全历史。
  */
 export function computeUsageStats(range: UsageRange, now: Date = new Date()): UsageStats {
-  const days = RANGE_DAYS[range];
   const today = localDateOf(now);
-  const from = shiftDay(today, -(days - 1));
   const available = new Set(listAccessDates());
+  // 「累计」= 保留期内所有有日志的日期，不设窗口；其余按区间天数回推
   const inRange: string[] = [];
-  for (let i = 0; i < days; i += 1) {
-    const date = shiftDay(from, i);
-    if (available.has(date)) inRange.push(date);
+  if (range === "all") {
+    inRange.push(...[...available].sort());
+  } else {
+    const days = RANGE_DAYS[range];
+    const from = shiftDay(today, -(days - 1));
+    for (let i = 0; i < days; i += 1) {
+      const date = shiftDay(from, i);
+      if (available.has(date)) inRange.push(date);
+    }
   }
+  const from = inRange[0] ?? today;
 
   const daily: UsageDaily[] = [];
   const totals = {
@@ -325,16 +374,22 @@ export function computeUsageStats(range: UsageRange, now: Date = new Date()): Us
     tokensOut: 0,
     requests: 0,
     messages: 0,
+    success: 0,
+    failure: 0,
+    slow: 0,
     durationMs: 0,
     cacheHitRate: null as number | null,
     cacheHit: 0,
     cacheTotal: 0,
     longestRequestMs: null as number | null,
+    avgTps: null as number | null,
     noUsage: 0,
   };
   let cacheHit = 0;
   let cacheTotal = 0;
   let longest: number | null = null;
+  let tpsSum = 0;
+  let tpsCount = 0;
   const modelTotals = new Map<
     string,
     {
@@ -371,12 +426,17 @@ export function computeUsageStats(range: UsageRange, now: Date = new Date()): Us
     totals.tokensOut += agg.tokensOut;
     totals.requests += agg.requests;
     totals.messages += agg.messages;
+    totals.success += agg.success;
+    totals.failure += agg.failure;
+    totals.slow += agg.slow;
     totals.durationMs += agg.durationMs;
     totals.noUsage += agg.noUsage;
     cacheHit += agg.cacheHit;
     cacheTotal += agg.cacheTotal;
     totals.cacheHit += agg.cacheHit;
     totals.cacheTotal += agg.cacheTotal;
+    tpsSum += agg.tpsSum;
+    tpsCount += agg.tpsCount;
     if (agg.longestMs !== null && (longest === null || agg.longestMs > longest)) longest = agg.longestMs;
     // 并集：只有失败请求的模型在 `byModel` 里可能不存在（usage 为空、tokens 记 0），
     // 但它的失败条数必须进健康度 —— 否则「全挂」会被显示成「没被用过」，正好反过来。
@@ -418,24 +478,42 @@ export function computeUsageStats(range: UsageRange, now: Date = new Date()): Us
   }
 
   const models: UsageModelRow[] = [...modelTotals.entries()]
-    .map(([id, row]) => ({
-      id,
-      tokens: row.tokens,
-      input: row.input,
-      output: row.output,
-      cache: row.cache,
-      share: totals.tokens > 0 ? row.tokens / totals.tokens : 0,
-      ok: row.ok,
-      fail: row.fail,
-      queued: row.queued,
-      avgTps: row.tpsCount > 0 ? row.tpsSum / row.tpsCount : null,
-    }))
+    .map(([id, row]) => {
+      // 聚合键 `cid/model` 拆回两列（cid 不含 `/`，按首个 `/` 切即可）
+      const slash = id.indexOf("/");
+      const cid = slash < 0 ? "" : id.slice(0, slash);
+      const model = slash < 0 ? id : id.slice(slash + 1);
+      return {
+        id,
+        model,
+        cid,
+        tokens: row.tokens,
+        input: row.input,
+        output: row.output,
+        cache: row.cache,
+        share: totals.tokens > 0 ? row.tokens / totals.tokens : 0,
+        ok: row.ok,
+        fail: row.fail,
+        queued: row.queued,
+        avgTps: row.tpsCount > 0 ? row.tpsSum / row.tpsCount : null,
+      };
+    })
     .sort((a, b) => b.tokens - a.tokens);
 
   totals.cacheHitRate = cacheTotal > 0 ? cacheHit / cacheTotal : null;
   totals.longestRequestMs = longest;
+  totals.avgTps = tpsCount > 0 ? tpsSum / tpsCount : null;
 
   const streak = computeStreak(new Set(daily.map((d) => d.date)), today);
+
+  // 今日账号维度：只取「今天」这一天（账号行与「今日消耗」同口径）。
+  // 当天没有请求时 inRange 不含今天 → 空数组（没消耗就是没消耗）。
+  const todayAgg = inRange.includes(today) ? dayAgg(today, today) : null;
+  const accounts: UsageAccountRow[] = todayAgg
+    ? Object.entries(todayAgg.byAccountTokens)
+        .map(([key, tokens]) => ({ key, tokens, requests: todayAgg.byAccountRequests[key] ?? 0 }))
+        .sort((a, b) => b.tokens - a.tokens)
+    : [];
 
   return {
     range,
@@ -444,6 +522,7 @@ export function computeUsageStats(range: UsageRange, now: Date = new Date()): Us
     totals,
     daily,
     models,
+    accounts,
     streak,
     peak: peakDate === null ? null : { date: peakDate, tokens: peakTokens, hour: peakHour, hourTokens: peakHourTokens },
     favorite: models[0] === undefined ? null : { id: models[0].id, share: models[0].share },

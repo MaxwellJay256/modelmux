@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { clearChannels, setChannel, channelCount, type ChannelConfig, type Channel } from "../dist/runtime/channel.js";
+import { registerChannelSupply } from "./registry-seed.ts";
 import { captureActive } from "../dist/runtime/account-pool.js";
 import { noteSuccess, resetPoolLedgerForTest } from "../dist/pool/pool-usage.js";
 import { credentialsPath } from "../dist/runtime/paths.js";
@@ -55,6 +56,10 @@ interface FakeSigninSpec {
 }
 
 function makeChannel(cid: string, opts: FakeSigninSpec): Channel {
+  // 候选渠道由统一注册表声明（与线上同口径）：alpha 的上游写法是大写形态，
+  // 用来验证「上游 id 由注册表逐渠道保留、不被小写化」
+  registerChannelSupply(cid, cid === "alpha" ? [["deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"]] : ["deepseek-v4.1-flash"]);
+
   const config: ChannelConfig = {
     cid,
     display: cid === "alpha" ? "Alpha 池" : "Beta 池",
@@ -151,7 +156,7 @@ function makeChannel(cid: string, opts: FakeSigninSpec): Channel {
     },
     catalog: {
       exposedIds: () =>
-        cid === "alpha" ? ["DeepSeek-V4.1-Flash", "glm-5.3-flash"] : ["deepseek-v4.1-flash"],
+        cid === "alpha" ? ["DeepSeek-V4.1-Flash"] : ["deepseek-v4.1-flash"],
       resolveModel: (n: string) => n,
     },
     billing,
@@ -165,7 +170,7 @@ let savedRoot: string | undefined;
 const refreshState = {
   calls: 0,
   /** 下一次 `refresh()` 会从上游拿到的内容（写成**能进池**的形态）。 */
-  upstream: ["glm-5.3-flash-0731"] as string[],
+  upstream: ["deepseek-v4.1-flash-0731"] as string[],
   /** 设了就让 `refresh()` 抛这个错（模拟未登录 / 上游拒绝）。 */
   failWith: null as string | null,
   /**
@@ -193,7 +198,7 @@ function makeRemoteChannel(cid: string): Channel {
       const cached = readCatalogCache<{ id: string }>(cid);
       refreshState.current = cached ? cached.map((m) => m.id) : [];
     }
-    return refreshState.current.length > 0 ? [...refreshState.current] : ["glm-5.3-flash"];
+    return refreshState.current.length > 0 ? [...refreshState.current] : ["deepseek-v4.1-flash"];
   };
   (ch.catalog as { refresh?: () => Promise<void> }).refresh = async () => {
     refreshState.calls += 1;
@@ -210,6 +215,7 @@ function resetChannels(): void {
   clearChannels();
   setChannel(makeChannel("alpha", { signin: true }));
   setChannel(makeChannel("beta", { signin: false }));
+  // alpha 只供 deepseek-v4.1-flash：glm 已移出对外家族，池视图不再有第二型号
 }
 
 before(() => {
@@ -239,9 +245,9 @@ describe("1. 常见命令与帮助", () => {
       assert.ok(r.out.includes("--json"), "选项有中文说明");
       // 一眼能看完：帮助的行数有上限（改帮助时别让它膨胀回去）。
       // 上限随**用户可见动词数**走：渠道组每加一个动词就 +1 行，模型组同理。
-      // 2026-10-26 加 `logout` → 45 抬到 46；2026-10-28 加 `model spec` → 46 抬到 47。
+      // 加 `logout` → 45→46；加 `model spec` → 46→47；加 `catalog` → 47→48；加 `connect` → 48→49。
       const lines = r.out.split("\n").length;
-      assert.ok(lines <= 47, `帮助不超过 47 行（当前 ${lines} 行）`);
+      assert.ok(lines <= 49, `帮助不超过 49 行（当前 ${lines} 行）`);
     }
   });
 
@@ -292,24 +298,58 @@ describe("2. 模型池（model 分组）", () => {
       model: string;
       candidates: Array<{ cid: string; exposed_id: string }>;
     }>;
-    // alpha 提供 2 个 (deepseek-v4.1-flash / glm-5.3-flash) +
-    // beta 提供 1 个 (deepseek-v4.1-flash) = 3 个池条目（不跨渠道去重）
-    assert.equal(parsed.length, 3, `应 3 个池条目，实际 ${parsed.length}`);
-    const alpha_ds = parsed.find((x) => x.model === "alpha/deepseek-v4.1-flash");
-    const alpha_glm = parsed.find((x) => x.model === "alpha/glm-5.3-flash");
-    const beta_ds = parsed.find((x) => x.model === "beta/deepseek-v4.1-flash");
-    assert.ok(alpha_ds, "应包含 alpha/deepseek-v4.1-flash");
-    assert.ok(alpha_glm, "应包含 alpha/glm-5.3-flash");
-    assert.ok(beta_ds, "应包含 beta/deepseek-v4.1-flash");
-    assert.deepEqual(alpha_ds!.candidates.map((c) => c.cid), ["alpha"]);
-    assert.deepEqual(alpha_glm!.candidates.map((c) => c.cid), ["alpha"]);
-    assert.deepEqual(beta_ds!.candidates.map((c) => c.cid), ["beta"]);
+    // glm 移出家族后池里只有 deepseek 一个型号，alpha / beta 两家都供
+    assert.equal(parsed.length, 1, `只列对外家族，实际 ${parsed.length}`);
+    const ds = parsed.find((x) => x.model === "deepseek-v4.1-flash");
+    assert.ok(ds, "应包含 deepseek-v4.1-flash");
+    assert.deepEqual(
+      ds!.candidates.map((c) => c.cid).sort(),
+      ["alpha", "beta"],
+      "两家都有货（不跨渠道去重）",
+    );
   });
 
   it("未知 model 子命令 → 2", async () => {
     const r = await run(["model", "乱写"]);
     assert.equal(r.code, 2);
     assert.ok(r.err.includes("未知的 model 子命令"));
+  });
+});
+
+describe("2c. model spec / usage / 渠道视图", () => {
+  it("model spec 给聚合规格与逐渠道值", async () => {
+    const r = await run(["model", "spec", "deepseek-v4.1-flash", "--json"]);
+    assert.equal(r.code, 0, r.err);
+    const parsed = JSON.parse(r.out) as {
+      model: string;
+      aggregate: Record<string, unknown>;
+      channels: Array<{ cid: string }>;
+    };
+    assert.equal(parsed.model, "deepseek-v4.1-flash");
+    assert.ok(parsed.channels.length >= 1, "逐渠道值至少一条");
+    assert.ok(parsed.aggregate, "要有聚合规格");
+  });
+
+  it("model spec 缺模型名 → 2", async () => {
+    assert.equal((await run(["model", "spec"])).code, 2);
+  });
+
+  it("model spec 未知模型 → 2 且提示可选", async () => {
+    const r = await run(["model", "spec", "nope"]);
+    assert.equal(r.code, 2);
+    assert.ok(r.err.includes("未知模型"), r.err);
+  });
+
+  it("model usage 输出池账本", async () => {
+    const r = await run(["model", "usage", "--json"]);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(r.out.trim().length > 0);
+  });
+
+  it("model <cid> 给该渠道的模型目录视图", async () => {
+    const r = await run(["model", "alpha", "--json"]);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(r.out.includes("glm-5.3-flash") || r.out.includes("deepseek-v4.1-flash"));
   });
 });
 
@@ -324,7 +364,7 @@ describe("2b. 模型目录：缓存优先 / 首次拉取 / --refresh", () => {
   function useRemoteOnly(): void {
     clearChannels();
     refreshState.calls = 0;
-    refreshState.upstream = ["glm-5.3-flash-0731"];
+    refreshState.upstream = ["deepseek-v4.1-flash-0731"];
     refreshState.failWith = null;
     refreshState.current = null; // 新进程：内存缓存为空，靠磁盘缓存种子
     setChannel(makeRemoteChannel("remote"));
@@ -337,14 +377,14 @@ describe("2b. 模型目录：缓存优先 / 首次拉取 / --refresh", () => {
     const first = await run(["model", "remote"]);
     assert.equal(first.code, 0);
     assert.equal(refreshState.calls, 1, "首次没有缓存，应该拉一次");
-    assert.match(first.out, /glm-5.3-flash-0731/);
+    assert.match(first.out, /deepseek-v4.1-flash-0731/);
     assert.ok(first.err.includes("刚从上游拉取"), "要告诉用户这次是现拉的");
 
     const second = await run(["model", "remote"]);
     assert.equal(second.code, 0);
     assert.equal(refreshState.calls, 1, "第二次应命中缓存，不再拉");
     assert.ok(!second.err.includes("刚从上游拉取"), "命中缓存不必打扰用户");
-    assert.match(second.out, /glm-5.3-flash-0731/);
+    assert.match(second.out, /deepseek-v4.1-flash-0731/);
 
     resetChannels();
   });
@@ -353,18 +393,18 @@ describe("2b. 模型目录：缓存优先 / 首次拉取 / --refresh", () => {
     withFreshRoot();
     useRemoteOnly();
 
-    await run(["model", "remote"]); // 写入缓存（glm-5.3-flash-0731）
-    refreshState.upstream = ["GLM-5.3-Flash-Official"]; // 上游变了
+    await run(["model", "remote"]); // 写入缓存（deepseek-v4.1-flash-0731）
+    refreshState.upstream = ["sn-deepseek-v4-1-flash"]; // 上游变了（家族内的另一种写法）
 
     const cached = await run(["model", "remote"]);
     assert.equal(refreshState.calls, 1, "仍不该打网络");
-    assert.match(cached.out, /glm-5.3-flash-0731/, "用的是本地记录的那份");
-    assert.ok(!cached.out.includes("Official"));
+    assert.match(cached.out, /deepseek-v4.1-flash-0731/, "用的是本地记录的那份");
+    assert.ok(!cached.out.includes("sn-deepseek-v4-1-flash"));
 
     const forced = await run(["model", "remote", "--refresh"]);
     assert.equal(forced.code, 0);
     assert.equal(refreshState.calls, 2, "--refresh 必须真的重拉");
-    assert.match(forced.out, /GLM-5.3-Flash-Official/, "重拉后是新内容");
+    assert.match(forced.out, /sn-deepseek-v4-1-flash/, "重拉后是新内容");
     assert.ok(forced.err.includes("刚从上游拉取"));
 
     resetChannels();
@@ -435,11 +475,10 @@ describe("2b. 模型目录：缓存优先 / 首次拉取 / --refresh", () => {
 });
 
 describe("3. <动词> [<cid>] 路由", () => {
-  it("model <cid> 只列该渠道贡献的池模型（不需要网关）", async () => {
+  it("model <cid> 只列该渠道贡献的对外模型（不需要网关）", async () => {
     const r = await run(["model", "alpha"]);
     assert.equal(r.code, 0);
     assert.ok(r.out.includes("deepseek-v4.1-flash"), r.out);
-    assert.ok(r.out.includes("glm-5.3-flash"), r.out);
     assert.ok(r.out.includes("← DeepSeek-V4.1-Flash"), "要能看出目录里的原始写法");
   });
 
@@ -486,7 +525,8 @@ describe("3. <动词> [<cid>] 路由", () => {
 
       const text = await run(["status", "gamma", "--addr", "127.0.0.1:1", "--ui-port", "1"]);
       assert.equal(text.code, 0);
-      assert.ok(text.out.includes("签到: -"), text.out);
+      // 报表对齐后标签列有填充，断言值而非整行（渠道无台账 → 报「无台账」+ 无签到功能）
+      assert.ok(text.out.includes("无台账（gamma 无签到功能）"), text.out);
     } finally {
       resetChannels();
     }
@@ -722,6 +762,43 @@ describe("4. 账号池与落点（也走 CLI）", () => {
       assert.ok(forced.out.includes("生效中"), forced.out);
     } finally {
       resetChannels();
+    }
+  });
+});
+
+describe("5. acct 列表状态文案", () => {
+  it("到期 / 熔断（error + trip_until）文案", async () => {
+    const myRoot = mkdtempSync(join(tmpdir(), "mx-acct-"));
+    const savedHome = process.env["MODELMUX_HOME"];
+    process.env["MODELMUX_HOME"] = myRoot;
+    mkdirSync(join(myRoot, "channels", "alpha"), { recursive: true, force: true });
+    clearChannels();
+    setChannel(makeChannel("alpha", { signin: false }));
+    try {
+      writeFileSync(
+        credentialsPath("alpha"),
+        `${JSON.stringify({ accessToken: "tok-a", uid: "user-a", domain: "example.com" }, null, 2)}\n`,
+        "utf8",
+      );
+      captureActive("alpha");
+      const indexFile = join(myRoot, "channels", "alpha", "accounts.json");
+      const index = JSON.parse(readFileSync(indexFile, "utf8")) as {
+        accounts: Array<Record<string, unknown>>;
+      };
+      index.accounts[0]!.health = "error";
+      index.accounts[0]!.trip_until = new Date(Date.now() + 60_000).toISOString();
+      index.accounts[0]!.expires_at = Math.floor(Date.now() / 1000) + 86400 * 3;
+      writeFileSync(indexFile, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+
+      const r = await run(["acct", "alpha", "list"]);
+      assert.equal(r.code, 0, r.err);
+      assert.ok(r.out.includes("error"), r.out);
+      assert.ok(/到期（\d+ 天后）/.test(r.out), r.out);
+    } finally {
+      clearChannels();
+      if (savedHome === undefined) delete process.env["MODELMUX_HOME"];
+      else process.env["MODELMUX_HOME"] = savedHome;
+      rmSync(myRoot, { recursive: true, force: true });
     }
   });
 });

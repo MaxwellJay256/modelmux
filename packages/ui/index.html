@@ -3,14 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <!--
+      color-scheme 不在这里写死：深浅由 lib/theme.ts 落 `<html data-theme>`，
+      index.css 的 color-scheme 随之切换（写死会让浅色首帧用深色表单控件渲染）。
+    -->
     <!--
       图标经 Vite 资源管线处理（`src/assets/` → 构建后落在 `/web/assets/*`）。
       不能放 `public/`：console 只托管 `/web/` 与 `/web/assets/*`，
         `/web/favicon.svg` 这类路径会命中 SPA 回退而返回 HTML（实测踩过）。
       显式声明也让浏览器不再去根路径要默认的 `/favicon.ico`。
     -->
-    <link rel="icon" type="image/svg+xml" href="/src/assets/favicon.svg" />
+    <!-- 32px PNG：新图标是彩色位图，SVG 里没法直接引用；这条同时给浏览器标签页
+         与「添加到主屏」的默认图标用。`apple-touch-icon` 用 180px（iOS 推荐尺寸） -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/src/assets/favicon-32.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/src/assets/apple-touch-icon-180.png" />
     <title>modelmux 控制台</title>
   </head>
   <body>

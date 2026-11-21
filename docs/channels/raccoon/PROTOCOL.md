@@ -383,6 +383,19 @@ RACCOON_EFFORT_OFF = 'off'   → extra_body.thinking = { type: 'disabled' }
 
 ## 5. 模型目录
 
+**对外暴露范围**：随包 `models.json` 给 `sn-glm-5-3-flash` 标了 `hidden` —— 网关里
+`glm-5.3-flash` 已移出对外家族，本渠道不进它的候选。隐藏集合由共享层 `hiddenModelIds()`
+并集读用户表与随包快照（读不到即抛错），目录数据照常保留。
+
+**deepseek-v4.1-flash 供给实测（2026-11-14）**：上游 id `sn-deepseek-v4-1-flash-1017`——
+上下文窗口 `1000000` / 最大输出 `100000` / 倍率 x0.25（`effectiveMultiplier` 同值）。
+缓存字段 `prompt_tokens_details.cached_tokens`（形态② OpenAI），14 天全量加权命中率
+实测 **86.0%**（707/814 条带缓存字段；口径见 [CACHE-HIT-RATE.md](../../CACHE-HIT-RATE.md)）。
+
+**glm-5.3-flash 供给实测（2026-11-14）**：上游 id `sn-glm-5-3-flash`——上下文窗口
+`1000000` / 最大输出 `100000` / 倍率 x0.2（`effectiveMultiplier` 同值）。同目录的
+`sn-glm-5-3`（1M / 100000 / x0.75）是同族另一型号，不进 glm-5.3-flash 池。
+
 ### 5.1 拉取
 
 ```
@@ -508,7 +521,7 @@ def raccoon_supports_image(model_id, tags):
 4 个型号（`glm-5.3` / `kimi-k3` / `glm-5.3-flash` / `deepseek-v4.1-flash`）
 一律是 `1_000_000` / `100_000`，只有 `sensenova-6.8-flash(-lite)` 是
 `256_000` / `63_999`。故 `/v1/models` 报的是**这条渠道实际能给的上限**
-（按 [MODEL-CATALOG.md](../../MODEL-CATALOG.md) 的五级取值链，上游目录声明最优先），不是模型公开规格 —— 客户端据此
+（按 [MODEL-CATALOG.md](../../MODEL-CATALOG.md) 的注册表口径），不是模型公开规格 —— 客户端据此
 请求不会被上游打回 4xx。
 
 **规格表（键是归一后的规范模型名，`sn-glm-5-3-flash` → `glm-5.3-flash`）**：
@@ -523,7 +536,7 @@ def raccoon_supports_image(model_id, tags):
 | `sensenova-6.8-flash-lite` | （留空） | （留空） | 官方无公开规格 |
 
 来源：渠道包根的 `models.json`（联网核实的唯一事实源）；
-全局五级取值链见 [MODEL-CATALOG.md](../../MODEL-CATALOG.md)；
+对外规格以统一注册表为准，见 [MODEL-CATALOG.md](../../MODEL-CATALOG.md)；
 **官方无公开规格的型号一律留空**（回落兜底值），不编造数字。
 
 ---
@@ -538,10 +551,23 @@ def raccoon_supports_image(model_id, tags):
 | 每日积分发放 | 300 | `GET /api/web/office/v3/setting_info`（按天幂等） | 签到（触发 + 账单核对） |
 | 桌面端登录奖励 | 3000 | `POST …/login/points/grant`（幂等一次性） | 导出备用（不与签到混跑） |
 
+**「每日 300」已由账单实测确认**：本地签到台账连续多日记到 `+300`（`balance.before → after`
+为 261 → 561、565 → 865 等，`rewardSource: "channel"`，即账单里当天的发放记录；2026-11-07
+起每天一次）。单次探测仍可能拿不到样本（`setting_info` 的 `point_grant_popups` 常为空、
+账单入账异步），故 `signin.claim()` 用**触发 + 账单核对**的结论，额度重试由共享层台账接手。
+
+因此 `billing.quotaPeriod()` 的 `label` 写「每天签到送 300 积分」；日界（北京时间 0 点）
+与数额都是实打实的（`setting_info` 按天幂等、账单按 UTC+8 切日）。
+
 **签到 = 触发 + 核对两步**：`setting_info` 只是**触发器**（官方桌面端每次启动都打，
-服务端按天幂等发放）；「今天有没有领到」以**账单**为准 —— 存在 `biz_type: 'daily_grant'`
-（或任何 `points > 0` 且日期为今天的记录）才算入账。只看触发器会把「服务端没发」
-误报成签到成功。
+服务端按天幂等发放）；「今天领到多少」以**账单**为准 —— 存在 `biz_type: 'daily_grant'`
+（或任何 `points > 0` 且日期为今天的记录）才算入账。
+
+**`claim()` 的成功口径是「触发成功」**，不是「账单已入账」：入账是**异步**的，把账单
+当成功前提会让自动签到在「已触发、账单未入账」时连记 3 次失败并当日熔断，之后连入账了
+也看不到（2026-11-16 raccoon 面板卡在「未签到」即此）。因此触发成功即 `ok: true`
+（summary 写明「入账待账单确认」），金额报**公布的每日额度 300 积分**（实测常量，不估算）；
+`status()` 的 `claimedToday` 仍只认账单，作为「今天领到多少」的权威。
 
 **「今天」按北京时间（UTC+8）**：上游自然日即 UTC+8 零点，跟机器时区走会让海外 /
 容器部署把 16 小时的账单认成昨天（参考实现 agent2api 为此专门定了北京时间口径）。
@@ -683,6 +709,22 @@ mx model raccoon --refresh
 账号被判 `error` 时的恢复步骤见「已知限制」第 3 条。
 
 ## 参考实现
+
+### 7.x 2026-11-20 生态对齐
+
+- **客户端身份头族六件套**（`x-client-name/@raccoon/office-desktop`、`x-client-platform/
+  desktop-windows-x64`、`x-client-version/v1.1.5`、`x-client-os-version`、`x-client-channel/
+  official`、`x-client-device-id` 按账号派生）+ `X-Request-Id`（relay_js_ 形态）+ 会话关联头
+  （`X-RACCOON-Session-ID` 首条 user 消息派生会话内稳定；`X-RACCOON-Turn-ID` 消息集哈希）。
+  版本不合法时整组头被上游丢弃（JustCnc），取抓包值。
+- **IAM 令牌体系**（官方桌面端已签发）：`iss=<host>/iam`、`sub=pu-*`、30 天、无 refresh_token；
+  `/api/web/auth/v1/iam/confirm` 必需。本仓 JWT/uid 口径需兼容分支——**待真机拿到 IAM 票后
+  实现，本轮未改**。
+- **授权页校验器变更风险**（待真机复核，未改实现）：现行解析器要求 64-hex state + `/auth/callback`
+  路径 + `desktop_callback=loopback`；本仓 32-hex + `/callback` 形态不在 2026-11-05 解析器
+  白名单内。失效即改（三份实现已走通新形态）。
+- 账单 `type=income` 与 `total_chargeable_points`（可扣总量应作主字段）、目录 `display_name`
+  （`description` 已是内部代号）——本轮未改，登记待办。
 
 clone 到 `reference/` 的学习材料（不入库）；结论进本文件。
 下表与 `packages/core/channels/raccoon/reference/` 下实际 clone 的目录逐条对应。

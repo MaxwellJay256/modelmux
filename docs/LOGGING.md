@@ -23,7 +23,7 @@
 | `access/<date>/success.log` | 判定为成功的请求 | 结构化行 | `log-store.ts` | 响应结束时 `outcome=success`（§3.2、§3.3 的例外除外） |
 | `access/<date>/failure.log` | 判定为失败的请求 | 结构化行 | 同上 | `outcome=failure` |
 | `access/<date>/other.log` | **没给出状态码**的请求（连接在应答前就断了） | 结构化行 | 同上 | `outcome=other` |
-| `access/<date>/slow.log` | 耗时达到慢阈值的请求（与结果分类并行写入） | 结构化行 | 同上 | `durationMs >= MODELMUX_SLOW_MS`（默认 30000） |
+| `access/<date>/slow.log` | 判定为「慢」的请求（与结果分类并行写入；口径见 §3.5） | 结构化行 | 同上 | 首字延迟 ≥ `MODELMUX_SLOW_TTFB_MS`（默认 10000，仅流式）或 生成速率 < `MODELMUX_SLOW_TPS`（默认 30 t/s，且生成量 ≥ 20 tokens） |
 | `error/<date>/error.log` | 错误上下文 | 结构化行 | `appendError()` | 失败请求镜像（§3.4）+ worker 错误行 + 监督者错误事件 |
 | `system/<date>/lifecycle.log` | 进程生命周期事件 | 结构化行 | `appendSystem()` | §4 的事件名单 |
 | `system/<date>/gateway.log` | 网关与 worker 的自身输出 | 文本行 | `appendGateway()` | worker 的 stdout/stderr 转发（§5） |
@@ -46,8 +46,9 @@
 | `id` | string | 请求标识 `req_` + 16 位十六进制；同时写入 `X-Request-Id` 响应头 | 请求进入时 |
 | `method` / `path` | string | HTTP 方法与路径 | 请求进入时 |
 | `startAt` | number | 请求开始的 epoch 毫秒 | 请求进入时 |
-| `model` | string | 请求使用的池 id（`<cid>/<模型>`） | 解析出模型后 |
-| `cid` | string | 承接请求的渠道 | 解析出模型后 |
+| `model` | string | 请求的模型（**规范 deepseek 名**，如 `deepseek-v4.1-flash`；别名已归并） | 解析出模型后 |
+| `cid` | string | **承接**本次请求的渠道（跨渠道选路后逐次尝试写入，最后一条即服务方） | 候选尝试时（`attemptCandidate`） |
+| `key` | string | 承接请求的**账号 key**（池内账号标识，账号池按它归集「今日 tokens」） | 候选尝试时（`attemptCandidate`） |
 | `stream` | boolean | 是否流式 | 解析出模型后 |
 | `requestBytes` | number | 请求体字节数 | 读入请求体后 |
 | `messageCount` | number | 请求消息条数 | 读入请求体后 |
@@ -60,9 +61,12 @@
 | `status` | number | 最终 HTTP 状态码 | 响应结束时 |
 | `outcome` | string | 结果分类，见 §3.2 | 响应结束时 |
 | `error` | string | 错误码（如 `upstream_error`、`upstream_timeout`） | 出错时 |
+| `detail` | string | **网关自身异常详情**（如 500 的真实异常）。只进 `error/*/error.log` 的镜像行，情况见 §5 第 3 条 | `internal_error` 兜底时（`noteRequestDetail`） |
 | `message` | string | 错误说明（**截断到 800 字符**） | 出错时 |
 | `usage` | object | 上游返回的 token 用量（含各家的缓存命中字段，逐渠道形态不同） | 收到 usage 帧（非流式为聚合后） |
 | `queued` | boolean | **进过上游排队**（收到排队帧并等待重试）。只在为真时写，缺省 = 没收到排队帧 | 排队帧到达时（`noteQueued`） |
+| `ua` | string | 客户端 User-Agent（截断 160 字符）。**只在未知路径 404 上写**：`/api/hello` 这类幽灵探针只能靠它认领来源 | 未知路径应答时（`noteRequestUa`） |
+| `route` | object | **选路快照**：`{ est, candidates[], attempts[], skipped[{cid,why}] }`。`est` 是输入估算 token，`candidates` 是全部候选顺序，`attempts` 是本次实际会试的，`skipped.why` 取 `auth` / `window` / `unauthorized` / `cooling`。落它的原因：路由只在内存里发生，事后「这次为什么走了这家」原本无从查证（2026-11-16 排查 qodercn 单次限流失败时确认） | 候选解析完成时（`noteRequestRoute`） |
 
 > `ttfbMs` 的语义是「**我们**什么时候开始回字节」，不是「上游什么时候开始吐字」：
 > 流式下两者几乎相同（收到首帧即转发），但**非流式下我们收完才写** —— 该值于是 ≈ `durationMs`，
@@ -71,7 +75,7 @@
 >
 > `usage` 在**两条转发路径**上都会采集：渠道翻译器路径与 `openai` 线型的直通路径
 > （`http/wire/sse-stream.ts` 的 `relay`）。因此 openai 线型渠道
-> （workbuddy / lobsterai / loomy / raccoon / workbuddyai）的流式请求也有该字段。
+> （workbuddy / loomy / raccoon / codebuddycn）的流式请求也有该字段。
 >
 > 读回时 `usage` 被归一化为 `tokens: { prompt, completion, total, cache }`，其中
 > `cache.{hit,miss}` 是**缓存命中**的归一化结果（各家字段名差异极大，规则见
@@ -88,6 +92,12 @@
 | `status < 200` | `other` |
 
 显式标记优先于推导：流内错误、上游错误、超时由 `noteRequestError()` 置为 `failure`。
+**流内业务错误帧**（上游回 HTTP 200 却在 SSE 里投递 `{"error":{…}}`，qoder 系的排队 /
+额度 / 认证都是这个形态）由 `http/chat/stream.ts::noteStreamError` 逐帧记账；非流式请求
+则在聚合后一次性判定（`forward.ts` 的 `firstSseError`）—— 两条路径**同一套判据**。
+在这之前这类帧无声无息地记成 `success`，同一个上游错误会一直重复（实测 qodercn
+`code=112` + `pricingUrl` 额度错误）。额度类业务错误同时冷却账号（`quotaSignal` 判据，
+渠道知识不上共享层；免费模型只记账不冷却）。
 客户端提前断开**不改变分桶**（`noteClientDisconnect()` 与 `close` 回调都只留一句说明）——
 `outcome` 表达的是**服务端这次请求的结果**：上游该回的已经回了（200）就记 `success` ✓，
 说明里带上「客户端提前断开」即可；按 `success.log` 统计成功率才不失真 ✓。
@@ -114,18 +124,47 @@
 | `message` | `message` | 内容一致 |
 | `error` / `status` / `model` / `cid` | 同名 | — |
 
-### 3.5 慢请求定位
+### 3.5 慢请求判定与定位
 
-判定：同时读取 `slow.log` 与 `access/<date>/failure.log`，按三个耗时字段的组合定位：
+**判定**（`log-store.ts` 的 `slowVerdictOf`，写路径与读路径同一份 —— 读路径按当前口径
+重算，历史行自动跟随）：两个维度独立成立，任一命中即「慢」，**总时长不参与**
+（2026-11-05 实测 1816 条：旧口径「总时长 ≥ 30s」的 94 条里 89 条是「输出长但快」，
+长输出不等于慢）：
+
+| 维度 | 条件 | 阈值 |
+| --- | --- | --- |
+| 首字慢 | `stream === true` 且 `ttfbMs` ≥ 阈值 | `MODELMUX_SLOW_TTFB_MS`（默认 10000ms；实测流式 ttfb p95 = 4.5s、p99 = 34.5s） |
+| 速率慢 | 可信速率 < 阈值，且生成量 ≥ 20 tokens（少于它窗口太小，速率数值不可信——实测 tps<30 的命中里 p50 completion=3，全是 ping 类短请求） | `MODELMUX_SLOW_TPS`（默认 30 t/s；实测分布 p05 = 54 t/s） |
+
+速率复用 `tokensPerSecOf`（护栏同 TPS 展示：窗口 < 50ms 或速率 > 1000 t/s 算不可测，
+不可测不判慢）。它与池选路的参考速率（`pool/pool-usage.ts` 的 `SPEED_REF_TPS = 100`，
+看的是长期平均、只折速度系数）故意不同：请求级判定抓单条真龟速，参考速率给渠道排序。
+
+**平均 TPS**（日志页统计条 `stats.avgTps` 与仪表盘的「平均 TPS」格）：样本 = **成功请求**里
+`tokensPerSecOf` 算得出速率的那些，先**逐条**算速率再求均值 —— 用 `Σcompletion / Σ生成窗口`
+会把均值交给长输出（口径见 [USAGE-STATS.md](./USAGE-STATS.md) §2）。失败请求不进分母：
+它们的 usage 多为空，混进去只会把速率拉成「丑但成功不了」的假象。**不套生成量下限**
+（`SLOW_MIN_COMPLETION` 只服务「速率慢」判定，均值要的是所有可计算样本）。算不出样本时
+为 `null`（界面显示 `—`，不是 0）。
+
+**统计范围与列表同源**（`queryAccessLogs` 的 `inScope`）：`stats` 只覆盖调用方声明的
+`path` / `paths` **与 `cid`**（渠道下拉仍列路径范围内全部渠道，不随选择塌缩），日志页与控制台总览都传 `MODEL_REQUEST_PATHS`。不这么收口的话，access 日志里
+必然存在的非模型记录（浏览器探测 `GET /.well-known/appspecific/com.chrome.devtools.json` → 404、
+`/health`、`/v1/models`）会把统计条顶成「请求 1 / 失败 1」，而列表只列模型请求、点「失败」一条
+也没有 —— 分段计数与列表必须同源（2026-11-06 实测）。不传路径与渠道时统计覆盖全部（CLI / 排障要全量）。**结果分桶只有成功 / 失败两桶**：历史上的「中断」
+（`other.log`，`status < 200` 才落）实测恒空、界面上也说不清含义，已删；旧机器上的 `other.log`
+读取时按失败计（`legacyOtherFiles`），不再写入。
+
+**定位**：命中后按三个耗时字段的组合找原因：
 
 | `upstreamMs` | `ttfbMs` | `durationMs` | 结论 |
 | --- | --- | --- | --- |
 | 大 | 大 | — | 耗时在**建立上游连接**（建连 / 上游接单） |
-| 正常 | 大或缺失 | 正常 | 耗时在**上游首帧** |
-| 正常 | 正常 | 大 | 耗时在**流式输出 / 工具循环 / 客户端读取**（结合 `usage`、`toolCount` 判断） |
+| 正常 | 大或缺失 | 正常 | 耗时在**上游首帧**（即「首字慢」） |
+| 正常 | 正常 | 大 | **生成速率慢**（结合 `usage.completion` 算 tps 复核） |
 
 > 读这张表时注意 `ttfbMs` 的流式 / 非流式差异（见 §3.1）：非流式下它 ≈ `durationMs`，
-> 第二行「首帧慢」因此对流式请求才有判别力；非流式要看生成速度请用 `generateMs`。
+> 「首帧慢」因此对流式请求才有判别力；非流式看生成速度请用 `generateMs`。
 
 `error=upstream_timeout` 表示上游在 `MODELMUX_READ_TIMEOUT_MS`（默认 120000ms）内**未产生任何
 数据**。该超时是**空闲**超时：每读到一块数据即重置计时，因此持续出字的流不会因总时长被切断。
@@ -154,8 +193,16 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 2. 渠道维度：单渠道运行时写入 `channels/<cid>/<date>.log`；多渠道运行时按消息的
    `[cid]` 前缀路由到对应渠道目录，前缀不匹配已知渠道则不写渠道日志。
 3. 错误判定：消息命中 `error` / `failed` / `timeout` / `reject` / `aborted` / `exception` /
-   `unauthor` 之一（不区分大小写、**前缀匹配**）时，追加写入 `error/<date>/error.log`（结构化行）。
+   `unauthor` 之一（不区分大小写）时，追加写入 `error/<date>/error.log`（结构化行）。
    该判定是**关键词匹配**，不解析上游错误结构。
+   - 消息以 `info:` 开头时**不进**错误日志：网关自己消化的降级（如「该渠道接不住这段输入，
+     换渠道重试」）与逐轮心跳（账单刷新汇总）走这一类 —— 它们的文本里带 `Error` / `failed`
+     字面量，靠关键词判定会被误收（`UnsupportedInputError` 即如此）。
+   - **同因去重**：账单刷新失败按 scope（渠道级 `cid` / 账号级 `cid/key`）记住上一条原因，
+     连续同因只写一行，成功后清账 —— 未登录这类常态原因会持续数天，每轮写一行会把错误日志
+     淹掉（2026-11-15 实测 14 天里 98% 是这类噪音）。
+   - 请求级失败的 `detail` 字段装**网关自身的异常详情**（如 500 的真实异常），与给客户端的
+     `message` 分开：`message` 会被随后的错误应答覆盖，`detail` 不会（同次排查确认）。
 
 ## 6. 轮转、保留与阈值
 
@@ -163,16 +210,17 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 | --- | --- | --- | --- |
 | 单文件大小上限 | 10MB | `MODELMUX_LOG_MAX_BYTES` | 每次追加前检查（`rotateIfNeeded`） |
 | 保留天数 | 14 | `MODELMUX_LOG_RETENTION_DAYS` | 每个进程每天首次写入时清理（`pruneOnce`） |
-| 慢请求阈值 | 30000ms | `MODELMUX_SLOW_MS` | 落盘时判定是否写 `slow.log` |
+| 首字慢阈值 | 10000ms（仅流式） | `MODELMUX_SLOW_TTFB_MS` | 写 `slow.log` 与读路径重算（§3.5） |
+| 速率慢阈值 | 30 t/s（生成量 ≥ 20 tokens） | `MODELMUX_SLOW_TPS` | 同上（`MODELMUX_SLOW_MS` 总时长口径已退役） |
 | 上游空闲超时 | 120000ms | `MODELMUX_READ_TIMEOUT_MS` | 转发层读上游时 |
 | 抓取单条正文上限 | 10MB | `MODELMUX_LOG_PAYLOAD_MAX_BYTES` | 抓取落盘时（§9）；超限双端保留（头尾各半） |
-| 抓取保留天数 | 3 | `MODELMUX_LOG_PAYLOAD_DAYS` | `pruneOnce` **先**按它清 `payload/`，再走 14 天（§9） |
+| 抓取保留天数 | 3 | `MODELMUX_LOG_PAYLOAD_DAYS` | `pruneOnce` **先**按它清 `payload/`，再走保留期（§9） |
 
 环境变量取值规则：非数字、`<= 0` 或未设置时**回落到默认值**。
 
 ## 7. CLI 检索
 
-**检索命令与排查流程见 `log-triage` 技能**（`mx log` 的 `--kind` / `--outcome` / `--date` /
+**检索命令与排查流程见本文 §10、§11**（`mx log` 的 `--kind` / `--outcome` / `--date` /
 `--list` / `-f` 组合与判读都在那儿，含各 kind 该看什么字段）。本文只记该技能没有的**解析规则**：
 
 | 规则 | 内容 |
@@ -182,10 +230,9 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 | 渠道维度 | `--kind channel` 必须配渠道 id（**位置参数**，如 `mx log catpaw --kind channel`）—— 渠道维度日志按 `<cid>` 分目录落盘，没有 cid 时该 kind 找不到文件 |
 | 严格模式 | CLI 走 `parseArgs` 严格模式：**未知选项直接报错**（没有 `--cid` 这种写法） |
 
-不要在本文件内联 `mx log` 命令清单 —— 那会与技能形成两份事实并漂移（`verify-docs` 拦这条）。
+不要在本文件内联 `mx log` 命令清单 —— 那会与 §10 形成两份事实并漂移（`verify-docs` 拦这条）。
 
-`log` 动词还有一个**维护**选项 `--compact`（检索之外的唯一入口；用法见 `--help` 与
-`log-triage` 技能）：它把**已封存**的抓取轮转段（`payload.log.1.log`…`.3.log`）里
+`log` 动词还有一个**维护**选项 `--compact`（检索之外的唯一入口；用法见 `--help` 与 §10）：它把**已封存**的抓取轮转段（`payload.log.1.log`…`.3.log`）里
 仍是明文的正文逐行重编码后原子替换，用于消化已落盘的明文正文存量；压缩后没有变小就保持原文件。
 只动封存段 —— 活跃段可能被并发追加，而本项目没有文件锁，重写它有丢记录的窗口。
 
@@ -233,9 +280,17 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 | `bodyB64` | `zstd` / `gzip` 时的**单帧**正文 base64（Base64 是 JSON 行里放二进制文本的唯一安全形态） |
 | `bodyChunks` | 分块形态：每块 1 MiB 明文独立压缩后 base64，数组顺序即正文顺序 |
 | `bodyChunkLens` | 与 `bodyChunks` 一一对应的**明文字节数**；读取侧据此只解命中块（缺省=旧行，退回全解） |
+| `invalidBytes` | 原始字节里无效 UTF-8 序列覆盖的字节数（仅 >0 时落盘；缺省 = 全部有效或旧行未统计） |
 
-**正文压缩与分块**：正文 ≥ 4KB 就压（zstd 优先，Node < 22.15 回落 gzip），
-小于 4KB 保持明文（压完还要 base64，可能反而变大）；超过 1 MiB 的正文按 1 MiB 一块
+**字节无损（2026-11-07）**：抓包的价值在「看到构造」，正文从入口起就按**字节**处理，
+不再提前 `toString("utf8")` —— 客户端发的坏字节（Windows GBK 控制台输出被原样塞进 JSON、
+GBK argv）原样进压缩块，落盘后仍可逐字节复原；呈现层按 UTF-8 文本展示时那些字节显示为
+替换符，`invalidBytes` 如实标注数量。**已落盘的旧行**里那些字节已被替换符顶掉、
+无从恢复，因此**不带** `invalidBytes` 标注 —— 无从统计就不猜。
+
+**正文压缩与分块**：**合法 UTF-8 且 < 4KB** 保持明文（压完还要 base64，可能反而变大）；
+其余一律压缩（zstd 优先，Node < 22.15 回落 gzip）—— 无效字节只能活在压缩分支里，
+任何「先转字符串」的动作都会把它们顶掉。超过 1 MiB 的正文按 1 MiB 一块
 **切成多帧**（dsh 的会话日志按批分帧，本仓的「批」就是整条正文，单帧会把「取一片 64 KiB」
 逼成「解压全量」）。块越小开销越大（实测 3.77 MB 正文：256K 块 +15.5%、512K +10.5%、
 1M 仅 +5.4%），1 MiB 是存储开销与局部解码收益的平衡点。读回按 `bodyEnc` 透明解码，
@@ -265,11 +320,166 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 行内带 `bodyChunkLens`（各块明文长度，新写入的多块行），分片读取据此直接定位块号、
 **只解压命中窗口覆盖的那几块**（实测 4.2 MB / 5 块：2.3 ms，解全部块则 10.5 ms）；
 旧行没有这个数组时退回「解全部块」的慢路径（结果相同，仅解码量不同）。
-接口分两级：
+`offset` / `length` / `total` 恒为**字节**（明文行也转字节后切）；分片以 **base64** 返回 ——
+窗口常落在多字节字符中间，字节交给前端按格拼齐后一次性解码，接缝处不再产生替换符。
+接口分三级：
 
-- `GET /api/logs/payload?id=X&date=Y` 默认**只回元数据**（`bytes` / `phase` / `model` / `truncated` / `bodyEnc`）；
-- `&part=body&phase=<client|upstream>&offset=N&limit=M` 取正文分片（默认片 64 KiB）；
+- `GET /api/logs/payload?id=X&date=Y` 默认**只回元数据**（`bytes` / `phase` / `model` / `truncated` / `bodyEnc` / `invalidBytes`）；
+- `&part=body&phase=<client|upstream>&offset=N&limit=M` 取正文分片（默认片 64 KiB，响应 `bodyB64`）；
 - `&full=1` 返回整段正文，仅兼容旧前端与排障，正常路径不要用（弹窗首屏会因此慢一个数量级）。
 
-命令行侧**不提供**正文检索：正文行动辄几十 KB，尾部输出没有意义（检索命令与判读见 `log-triage` 技能）。
+弹窗打开后**后台自动补全**剩余分片（本地网关逐片毫秒级），读完全文解析成消息列表按
+对话卡渲染 —— 滚动定位以消息为单位，「滚动到底部」落在最后一条消息（细节见 WEB-CONSOLE.md）。
+
+命令行侧**不提供**正文检索：正文行动辄几十 KB，尾部输出没有意义（检索命令与判读见本文 §10、§11）。
+
+## 10. 故障分诊流程
+
+> 来源：原 `log-triage` 技能（已并入本文，技能不再注册）。
+
+### 10.1. 前置检查
+
+```bash
+mx status --json
+```
+
+（`mx log` 的 `--kind` / `--outcome` / `--date` 组合见 [CONTRACT-TS.md §9](./CONTRACT-TS.md)「命令速查」。）
+
+| 判定 | 处置 |
+| --- | --- |
+| `gateway.reachable=false` | 转 §3「网关不可用」 |
+| 顶层 `stale_build=true` | 运行的是旧代码：`npm run build && mx restart`，直到 `stale_build=false` |
+| 顶层 `log_dir` 与预期不一致 | 可能是有意设置的 `MODELMUX_HOME`；先确认这是不是当前实例的存储根，再继续 |
+
+字段层级提醒：`reachable` / `occupied_by` 在 `gateway` 下；`stale_build` / `log_dir` 在顶层。
+`mx status` 的**退出码恒为 0**（无论网关是否可达），脚本必须解析 JSON，不能看 exit code。
+
+
+### 10.2. 定位文件
+
+| 目标 | 命令 |
+| --- | --- |
+| 失败请求 | `mx log --kind access --outcome failure --lines 50` |
+| 成功请求基线 | `mx log --kind access --outcome success --lines 20` |
+| 慢请求 | `mx log --list` 找到 `access/<date>/slow.log` 后直接读（CLI **没有** `--kind slow`；慢且失败的请求同时也在 `failure.log`） |
+| 错误上下文 | `mx log --kind error --lines 50` |
+| 启停与 worker 事件 | `mx log --kind lifecycle --lines 50` |
+| worker 原始输出 | `mx log --kind worker --lines 100` |
+| 某渠道 | `mx log catpaw --kind channel --lines 50`（`--kind channel` **必须**给 cid，否则报「日志不存在」） |
+| 指定日期 | `mx log --date YYYY-MM-DD --kind access --outcome failure` |
+| **压缩存量正文**（维护，非检索） | `mx log --compact` 就地压**已封存**的抓取轮转段（新写入的正文本就已压缩）；不动活跃段，`--json` 出机器可读统计 |
+
+> `--compact` 是唯一与检索无关的选项：用于消化已落盘的明文正文（正文落盘形态见
+> [LOGGING.md](./LOGGING.md) §9）。**别拿它当日常动作** —— 新数据自动压缩。
+
+- `mx log` 默认是 system 日志；查请求必须加 `--kind access`。
+- 未指定 `--date` 时取本地当天；当天无该文件时回落到最新含该文件的日期。
+- 失败请求在 `failure.log` 与 `error.log` 各有一份，但**字段名不同**：
+  access 用 `id`，error 镜像用 `request_id`；耗时为 `duration_ms` / `upstream_ms` / `ttfb_ms`（蛇形）。
+  按 `id` 在 `error.log` 里 grep 会漏，必须用 `request_id`。
+
+> **另有一条可视化入口**：Web 控制台「日志」页（`mx web` → `/web/logs`）按同一份
+> `access/*` 渲染成表格（筛选 / 分页 / 展开看全字段），排查时用鼠标翻比 tail 快。
+> 它还能显示**请求上下文**（客户端原样体与实际上行体；正文抓取默认开启、控制台右上角可关，
+> 见 [LOGGING.md](./LOGGING.md) §9）；`mx log` 没有 payload kind。
+> 本文件的命令仍然是**无 GUI 环境**（SSH / 脚本 / CI）下的唯一手段。
+
+
+### 10.3. 耗时判定
+
+以 `upstreamMs`（到上游响应头）、`ttfbMs`（到首帧）、`durationMs`（总耗时）三个字段判定：
+
+| `upstreamMs` | `ttfbMs` | `durationMs` | 结论 | 下一步 |
+| --- | --- | --- | --- | --- |
+| 大 | 大 | — | 耗时在**上游建连** | 对照该渠道 PROTOCOL 的端点与握手流程 |
+| 正常 | 大或缺失 | 正常 | 耗时在**上游首帧** | 看请求规模（`requestBytes` / `systemChars` / `toolCount`）与该渠道的排队机制 |
+| 正常 | 正常 | 大 | 耗时在**流式输出 / 工具循环 / 客户端读取** | 看 `usage` 与 `toolCount` 判断是否为长 tool 循环 |
+| — | — | — | `error=upstream_timeout`：上游在空闲超时内无任何数据 | 该超时是**空闲**超时（每读一块即重置），持续出字的流不会被切断。默认 120s（`MODELMUX_READ_TIMEOUT_MS`）；声明 `idleTimeoutMs()` 的渠道各有自己的值（qwenworkcn 900s、raccoon 180s） |
+
+**报告必须包含**：`id`、`model`、`cid`、`stream`、`status`、`outcome`、三个耗时、`usage`、`error`。
+字段缺失时注明「未采集」，**不要推断或编造**。
+
+
+### 10.4. 网关不可用 / 启动失败
+
+```bash
+mx status --json
+```
+
+再看 worker 原始输出与生命周期事件（`--kind worker` / `--kind lifecycle`，命令形态见
+[CONTRACT-TS.md §9](./CONTRACT-TS.md)），各取尾部若干行。
+
+| 事件 | 含义 | 处置 |
+| --- | --- | --- |
+| `start_timeout` | 启动窗口内未 ready | `mx restart`（默认 30 秒窗口） |
+| `worker_unhealthy` | worker 异常退出 | 看 `worker.log` 末 80 行，定位端口占用或未捕获异常 |
+| `worker_exited` | worker 退出，监督者将按退避重生 | 同上，并看 `delay_ms` 判断退避档位 |
+| `gateway.reachable=false` 且无 worker | 网关未运行 | `mx start --wait 30`（启动失败**恒非零退出**；`--strict` 仅兼容保留，默认即严格）；仍失败则逐个渠道 `mx login <cid>`，排除渠道启动探测卡住 |
+| `gateway.occupied_by` 非空 | 端口被其它进程占用 | 不直接杀未知进程；先确认进程归属 |
+
+
+### 10.5. 失败码速查
+
+| `error` | 判定 | 动作 |
+| --- | --- | --- |
+| `unknown_model` | 模型名不在网关对外清单（家族表裸名） | `GET /v1/models` 核对；`mx model list` 看有货的渠道 |
+| `not_authenticated` / `upstream_unauthenticated` | 凭据缺失或失效 | `mx acct <cid>`、`mx login <cid>`；**不删凭据文件** |
+| `upstream_error` / `upstream_stream_failed` | 上游返回错误或流中断。流式下**零内容帧**（上游 200 却一个帧都没交付）也归此类：响应头挪到首次写出才落，因此能换下一条候选，全部候选都空流才终局 502 —— 不再把「200 空响应」递给客户端 | 用 `request_id` 查 `error.log` + `worker.log`，再对照该渠道 PROTOCOL |
+| `upstream_timeout` | 上游空闲超时 | 见 §2 第 4 行 |
+| `upstream_queued` | 上游排队，网关已换过所有候选 | 排队即换渠道、不等待；全部候选都排队才回 503。给渠道加供给或换模型 |
+| `insufficient_quota` | 账号额度耗尽 | 账号进入**冷却**（`cooldown_until`，不是标 `error`），到期自动恢复；可等窗口刷新、`mx acct <cid> use <key>` 换号，或 `mx model usage` 看冷却状态 |
+| `upstream_insufficient_quota` | 免费（×0）模型撞到余额类信号 | 不冷却账号（免费模型不吃额度），网关原样回 402；换模型或换渠道 |
+| `upstream_rate_limited` | 上游限流（渠道级短冷却） | 网关把该渠道冷却几十秒，让请求先落别家；等一会儿自然恢复 |
+| `unsupported_input` | 本渠道承载不了这类输入（上下文超限、缺必填字段等） | 网关换下一条候选（不计连败）；所有候选都不行才回 400 |
+| `client_disconnected` | 客户端主动断连 | 网关按已完成处理，不计失败 |
+| `invalid_request` | 请求体或上下文问题 | 对照渠道 `buildChatBody` 的约束 |
+| `internal_error` | 网关自身异常 | 在 `gateway.log` / `worker.log` 搜 `request handler error`；记录可复现的请求 |
+
+客户端响应头 `X-Request-Id` 与日志里的 `id` 一一对应，**按 id 关联，不按时间猜**。
+
+
+### 10.6. 改动后的验证
+
+```bash
+npm test
+npm run build
+mx restart
+mx status --json          # 顶层 stale_build 必须为 false
+```
+
+再发一次真实请求：改的是成功路径 → 在 `success.log` 确认 `status=200`、`durationMs` 合理、
+`usage` 有值；改的是失败路径 → 在 `failure.log` 确认同类 `error` 不再出现。
+
+
+### 10.7. 已知边界
+
+- 日志默认在 `~/.modelmux/logs/`（存储根可被 `MODELMUX_HOME` 覆盖，以 `mx status --json`
+  的 `log_dir` 为准；分层目录见 LOGGING.md §2）。**不要**去仓库目录或
+  `~/.modelmux/<cid>/gateway.log` 找。
+- 成功的 `/health` 与 `/v1/models` 请求不写 access 日志：worker 每 5 秒自轮询一次
+  `/v1/models`，控制台页面每 3 秒轮询 `/api/state`。在 `success.log` 看到它们只可能是
+  慢请求或来自其它进程；失败请求只会进 `failure.log`，不会出现在 `success.log`。
+- `logs/channels/<cid>/` 只在单渠道运行、或消息自带 `[cid]` 前缀时才有文件；
+  仓库级运行主要看 `access/` 与 `system/`。
+- **上游错误响应体片段会落盘**（`gateway.log` 一份；只有日志行命中 error/failed/timeout
+  等关键词时才额外进 `error.log`），上限 2048 字符且不脱敏 —— 报告里不要复制大段上游
+  原文，只给结论与关键片段。
+- 网关不主动写入凭据字段；但**不要把请求头原文贴进报告**。
+- `mx log` 的渠道 id 是**位置参数**（`mx log <cid> --kind channel`），**没有 `--cid` 选项**
+  —— CLI 走 `parseArgs` 严格模式，未知选项直接报错退出。
+- 有活跃流时不要执行 `mx restart`（会切断客户端请求）；先确认网关是否真的不可用。
+
+
+### 10.8. 输出格式
+
+```text
+结论：<一句话>
+证据：
+- request=<id> model=<...> cid=<...> stream=<...> status=<...> outcome=<...>
+- upstreamMs=<...> ttfbMs=<...> durationMs=<...> usage=<...>
+- error=<...> message=<...>
+根因：<上游建连 / 首帧 / 流中 / 客户端 / 网关启动 / 鉴权 / 模型>
+动作：<下一步命令或代码改动>
+验证：<重启、测试、真实请求结果>
+```
 

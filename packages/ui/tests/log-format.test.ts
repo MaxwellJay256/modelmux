@@ -1,14 +1,32 @@
 /**
  * 缓存命中率的展示口径（分层负责：归一化在共享层，这里只测展示）。
  *
- * 重点是**不把 99.6% 显示成 100%** —— 上游给的近似满命中与真正的满命中必须区分，
- * 否则满屏 100% 会让人以为数据坏了（见 docs/CACHE-HIT-RATE.md §6）。
+ * 统一**两位小数**（`99.70%` / `100.00%`）—— 近似满命中与真满命中依然可区分
+ * （99.96% ≠ 100.00%），且不再需要 `>` / `<` 前缀（见 docs/CACHE-HIT-RATE.md §6）。
+ * `formatPercent` 只剩仪表盘占比一个使用方，保留整数百分比口径。
  */
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { formatCacheRate, formatPercent, formatRate, tokensPerSecOf } from "../src/lib/log-format.ts";
+import {
+  countOrDash,
+  formatBytes,
+  formatClock,
+  formatCount,
+  formatDateTime,
+  formatDuration,
+  cacheHitRateText,
+  formatCacheHitRate,
+  formatPercent,
+  formatRate,
+  formatRecoveryAt,
+  formatTokens,
+  formatTokensPerSec,
+  tokensPairText,
+  tokensPerSecOf,
+  tokensPerSecOfEntry,
+} from "../src/lib/log-format.ts";
 
 describe("formatPercent", () => {
   it("无数据 / 极值分别显示 —、0%、<1%", () => {
@@ -30,20 +48,46 @@ describe("formatPercent", () => {
   });
 });
 
-describe("formatCacheRate", () => {
-  it("分母恒为 hit + miss（独占口径的上游也正确）", () => {
-    assert.equal(formatCacheRate({ hit: 3, miss: 2 }), "60%");
-    // Anthropic 独占口径：hit=900（读缓存）、miss=150（输入 + 写缓存）
-    assert.equal(formatCacheRate({ hit: 900, miss: 150 }), "86%");
+describe("cacheHitRateText", () => {
+  it("用命中 / (命中 + 未命中) 算百分比", () => {
+    // 1983 / 1989 = 99.698% —— 不能因为接近满命中就显示 100%
+    assert.equal(cacheHitRateText({ hit: 1983, miss: 6 }), "99.70%");
+    assert.equal(cacheHitRateText({ hit: 1, miss: 1 }), "50.00%");
+    assert.equal(cacheHitRateText({ hit: 0, miss: 1989 }), "0.00%");
   });
 
-  it("缺字段时显示 — 而不是 0%（「没采集到」与「完全没命中」是两件事）", () => {
-    assert.equal(formatCacheRate(null), "—");
-    assert.equal(formatCacheRate(undefined), "—");
-    assert.equal(formatCacheRate({ hit: null, miss: null }), "—");
-    // 命中数已知但分母推不出 → 同样不给百分比
-    assert.equal(formatCacheRate({ hit: 100, miss: null }), "—");
-    assert.equal(formatCacheRate({ hit: 0, miss: 100 }), "0%");
+  it("99% 以上不四舍五入成 100%（近似满命中与真满命中是两件事）", () => {
+    assert.equal(cacheHitRateText({ hit: 996, miss: 4 }), "99.60%");
+  });
+
+  it("没有缓存字段 → —", () => {
+    assert.equal(cacheHitRateText(null), "—");
+    assert.equal(cacheHitRateText(undefined), "—");
+  });
+
+  it("只写缓存（读写计数都缺）→ —（写缓存不是命中）", () => {
+    assert.equal(cacheHitRateText({ hit: null, miss: null }), "—");
+  });
+
+  it("分母为 0 → —（0/0 不是 0%，是没有可判定样本）", () => {
+    assert.equal(cacheHitRateText({ hit: 0, miss: 0 }), "—");
+  });
+
+  it("单边缺值按 0 计入分母", () => {
+    assert.equal(cacheHitRateText({ hit: 100, miss: null }), "100.00%");
+    assert.equal(cacheHitRateText({ hit: null, miss: 100 }), "0.00%");
+  });
+});
+
+describe("formatCacheHitRate", () => {
+  it("统一两位小数，不再需要 > / < 前缀", () => {
+    assert.equal(formatCacheHitRate(0.9996), "99.96%");
+    assert.equal(formatCacheHitRate(0.9999), "99.99%");
+    assert.equal(formatCacheHitRate(0.004), "0.40%");
+    assert.equal(formatCacheHitRate(0), "0.00%");
+    assert.equal(formatCacheHitRate(1), "100.00%");
+    assert.equal(formatCacheHitRate(null), "—");
+    assert.equal(formatCacheHitRate(Number.NaN), "—");
   });
 });
 
@@ -118,5 +162,113 @@ describe("formatRate", () => {
     assert.equal(formatRate(0.01), "<0.1 t/s");
     assert.equal(formatRate(9.44), "9.4 t/s");
     assert.equal(formatRate(158.9), "159 t/s");
+  });
+});
+
+describe("时间与耗时格式", () => {
+  it("formatDateTime：UTC 输入转本地 MM-DD HH:mm:ss；非法输入给 -", () => {
+    // 本地 2026-11-06 00:05:09 的 UTC 串（日志行存 UTC，展示必须转本地）
+    const ts = new Date(2026, 10, 6, 0, 5, 9);
+    assert.equal(formatDateTime(ts.toISOString()), "11-06 00:05:09");
+    assert.equal(formatDateTime("not-a-date"), "-");
+  });
+
+  it("formatClock：只取时分秒；非法输入给 -", () => {
+    const ts = new Date(2026, 10, 6, 9, 7, 3);
+    assert.equal(formatClock(ts.toISOString()), "09:07:03");
+    assert.equal(formatClock("garbage"), "-");
+  });
+
+  it("formatDuration 三档：ms / s（一位小数）/ 分秒", () => {
+    assert.equal(formatDuration(undefined), "-");
+    assert.equal(formatDuration(845), "845ms");
+    assert.equal(formatDuration(2_940), "2.9s");
+    assert.equal(formatDuration(61_400), "1m1s");
+  });
+});
+
+describe("计数与字节", () => {
+  it("formatCount 千分位；countOrDash 对 null 给 -", () => {
+    assert.equal(formatCount(12_345), "12,345");
+    assert.equal(countOrDash(null), "-");
+    assert.equal(countOrDash(1_200), "1,200");
+  });
+
+  it("formatTokens：千分位 / 万 / 亿，尾零收敛", () => {
+    assert.equal(formatTokens(9_999), "9,999");
+    assert.equal(formatTokens(12_100), "1.21 万");
+    assert.equal(formatTokens(120_000_000), "1.2 亿");
+    assert.equal(formatTokens(100_000_000), "1 亿");
+  });
+
+  it("formatBytes 三档与缺失值", () => {
+    assert.equal(formatBytes(undefined), "-");
+    assert.equal(formatBytes(112), "112 B");
+    assert.equal(formatBytes(2_355), "2.3 KB");
+    assert.equal(formatBytes(1_300_000), "1.24 MB");
+  });
+
+  it("tokensPairText：入 / 出，缺失一半给 -；无 usage 给 -", () => {
+    assert.equal(tokensPairText(undefined), "-");
+    assert.equal(tokensPairText({ prompt: null, completion: null, total: null, cache: null }), "-");
+    const pair = tokensPairText({ prompt: 12_100, completion: 7, total: 12_107, cache: null });
+    assert.equal(pair, "1.21 万 / 7");
+  });
+});
+
+describe("formatTokensPerSec", () => {
+  it("formatTokensPerSec：复用 tokensPerSecOf 口径，无数据显示 —", () => {
+    assert.equal(
+      formatTokensPerSec({
+        tokens: { completion: 900, prompt: 0, total: 900, cache: null },
+        durationMs: 3_000,
+        stream: true,
+        ttfbMs: 2_000,
+        upstreamMs: 1_000,
+      } as never),
+      "900 t/s",
+    );
+    assert.equal(
+      formatTokensPerSec({ tokens: null, durationMs: 100 } as never),
+      "—",
+      "无 usage 的请求（如失败行）显示 —",
+    );
+  });
+
+  it("tokensPerSecOfEntry：给的是数值（统计聚合要用，不能是格式化字符串）", () => {
+    const entry = {
+      tokens: { completion: 900, prompt: 0, total: 900, cache: null },
+      durationMs: 3_000,
+      stream: true,
+      ttfbMs: 2_000,
+      upstreamMs: 1_000,
+    };
+    assert.equal(tokensPerSecOfEntry(entry as never), 900);
+    assert.equal(tokensPerSecOfEntry({ tokens: null, durationMs: 100 } as never), null);
+  });
+});
+
+describe("formatRecoveryAt：恢复时刻（绝对 + 本地时区）", () => {
+  // 断言只钉**语义**（同一天 / 跨天 / 用本地时区），不钉具体时区 ——
+  // CI 跑在 UTC、本机是 UTC+8，写死时钟会一边绿一边红。
+  const now = new Date("2026-11-06T10:46:00.000Z");
+  const sameDay = new Date("2026-11-06T12:46:45.000Z"); // 与 now 同一本地日
+  const nextDay = new Date("2026-11-07T02:10:00.000Z"); // 与 now 不同本地日
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hm = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+  it("同一天 → 「今天 + 本地时刻」", () => {
+    const out = formatRecoveryAt(sameDay.getTime(), now.getTime());
+    assert.equal(out, `今天 ${hm(sameDay)}`);
+    assert.ok(out.startsWith("今天 "), "同一天不能补日期");
+  });
+
+  it("跨天 → 补本地日期（避免被误读成今天）", () => {
+    const out = formatRecoveryAt(nextDay.getTime(), now.getTime());
+    assert.equal(out, `${pad(nextDay.getMonth() + 1)}-${pad(nextDay.getDate())} ${hm(nextDay)}`);
+  });
+
+  it("非法时刻 → 空串（调用方据此只显示相对时长）", () => {
+    assert.equal(formatRecoveryAt(Number.NaN, now.getTime()), "");
   });
 });

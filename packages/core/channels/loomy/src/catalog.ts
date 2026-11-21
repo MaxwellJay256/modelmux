@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import * as cred from "./cred.js";
 import * as upstream from "./upstream.js";
-import { ensureChannelModels, readCatalogCache, writeCatalogCache } from "@modelmux/gateway";
+import { canonicalModelId, ensureChannelModels, hiddenModelIds, readCatalogCache, writeCatalogCache } from "@modelmux/gateway";
 import { bundledSnapshotPath, packageSnapshotPath } from "@modelmux/gateway/snapshot";
 
 /** 档位词表（展示名必须与官方 IDE 一致 —— Loomy 基于 opencode 构建）。 */
@@ -44,7 +44,7 @@ interface CatalogEntry {
   id: string;
   name: string;
   rate: string;
-  /** 消耗倍率数值（由 `rate` 字符串解析，失败为 undefined）。供 `model_info.multiplier` 使用。 */
+  /** 消耗倍率数值（由 `rate` 字符串解析，失败为 undefined）。供 `PoolModelMeta.multiplier` 使用。 */
   multiplier?: number;
   contextWindow: number;
   /** 最大输出 token（远端不下发，按用户目录模型表补）。 */
@@ -259,10 +259,11 @@ function toCatalogEntry(m: FallbackModel): CatalogEntry {
   };
 }
 
-/** 把档位登记进 upstream（避免 upstream <-> catalog 循环依赖）。 */
+/** 把档位与输出上限登记进 upstream（避免 upstream <-> catalog 循环依赖）。 */
 function publish(entries: CatalogEntry[]): void {
   for (const entry of entries) {
     upstream.setModelEfforts(entry.id, entry.efforts, entry.defaultEffort);
+    if (entry.maxOutput !== undefined) upstream.setModelMaxOutput(entry.id, entry.maxOutput);
   }
 }
 
@@ -444,10 +445,23 @@ function loadAliases(): Array<[string, string]> {
   return [];
 }
 
-/** 对外暴露的模型 id（短名最前；被别名覆盖的原始 id 不再重复暴露）。 */
+/** 对外隐藏的模型 id（数据是 `models.json` 的 `hidden` 标记；机制见共享层 `hiddenModelIds`）。 */
+function hiddenIds(): Set<string> {
+  return hiddenModelIds(import.meta.url);
+}
+
+/**
+ * 对外暴露的模型 id（短名最前；被别名覆盖的原始 id 不再重复暴露）。
+ *
+ * `hidden` 的条目不暴露，**指向它的别名一并撤下** —— 短名不该成为绕过隐藏策略的后门。
+ */
 export function exposedIds(): string[] {
-  const ids = currentEntries().map((e) => e.id);
-  const aliases = loadAliases();
+  const hidden = hiddenIds();
+  const ids = currentEntries()
+    // 归一化口径一并判：池层会把 `-Official` 这类尾饰变体归一进同一家族
+    .filter((e) => !hidden.has(e.id.toLowerCase()) && !hidden.has(canonicalModelId(e.id)))
+    .map((e) => e.id);
+  const aliases = loadAliases().filter(([, slug]) => !hidden.has(slug.toLowerCase()));
   const all =
     aliases.length === 0
       ? ids
@@ -460,6 +474,10 @@ export function exposedIds(): string[] {
 
 /** 短名 → 上游 slug；未知名称**原样返回**。 */
 export function resolveModel(name: string): string {
+  // 每条对话请求的选路都经过这里：顺手种入快照（磁盘缓存先顶上 + 每进程一次后台刷新）。
+  // 不然新进程只发对话（不访问 /v1/models 与控制台）时，upstream 的档位 /
+  // max_output 注册表没人 publish，max_tokens 拉满在第一条请求上是空转的（实测踩过）。
+  ensureRefresh();
   for (const [short, slug] of loadAliases()) {
     if (short === name) return slug;
   }

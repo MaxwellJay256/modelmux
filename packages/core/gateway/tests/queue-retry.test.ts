@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { clearChannels, setChannel, type ChannelConfig, type Channel } from "../dist/runtime/channel.js";
+import { registerChannelSupply } from "./registry-seed.ts";
 import * as gateway from "../dist/http/server.js";
 import * as paths from "../dist/runtime/paths.js";
 
@@ -184,7 +185,7 @@ function makeChannel(): Channel {
       resolveConfig: () => ({ baseUrl: "http://127.0.0.1:1" }),
       newTranslator: translator,
     },
-    catalog: { exposedIds: () => ["glm-5.3-flash"], resolveModel: (n: string) => n },
+    catalog: { exposedIds: () => ["deepseek-v4.1-flash"], resolveModel: (n: string) => n },
     billing: {
       CreditsError: class CreditsError extends Error {},
       fetchCredits: async () => ({ ok: true, total: {}, packages: [] }),
@@ -196,12 +197,9 @@ async function chat(addr: string, stream: boolean): Promise<{ status: number; te
   const resp = await fetch(`http://${addr}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // 旧行为：裸模型名 `glm-5.3-flash`（网关跨渠道匹配候选）。
-    // 新行为：池 id 必须是 `<cid>/<模型>` 形态，渠道由请求方显式指定 ——
-    //   裸名一律 400 unknown_model（见 src/pool/pool-targets.ts:473 asPoolModel
-    //   与 src/http/chat/relay.ts:867 的 400 分支）。
+    // 对外模型是 deepseek 裸名；渠道由网关按账号池剩余额度挑
     body: JSON.stringify({
-      model: `${CID}/glm-5.3-flash`,
+      model: "deepseek-v4.1-flash",
       messages: [{ role: "user", content: "hi" }],
       stream,
     }),
@@ -218,6 +216,8 @@ describe("排队重试（10605）", () => {
   before(async () => {
     root = mkdtempSync(join(tmpdir(), "modelmux-queue-"));
     process.env["MODELMUX_HOME"] = root;
+  registerChannelSupply("queuechan", ["deepseek-v4.1-flash"]);
+
     upstream = await fakeUpstream(2); // 前 2 次排队，第 3 次成功
     process.env["MB_TEST_UPSTREAM"] = upstream.url;
 
@@ -241,22 +241,31 @@ describe("排队重试（10605）", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("流式：前两次排队帧被吞掉，第三次出内容；客户端只看到一次完整响应", async () => {
+  it("流式：上游一说排队就放弃该候选，不再等 —— 单渠道时如实失败", async () => {
     upstream.captured.length = 0;
     logs.length = 0;
-    const { status, text } = await chat(gw.addr, true);
-    assert.equal(status, 200, `排队重试后应当成功（日志: ${logs.join(" | ")}）`);
-    assert.ok(text.includes("queued-ok"), `最终返回的是成功那次的内容（实际: ${text.slice(0, 300)}）`);
-    assert.ok(!text.includes("10605"), "排队帧不能透传给客户端");
-    assert.equal(upstream.captured.length, 3, `上游被打了 3 次（2 次排队 + 1 次成功），日志: ${logs.join(" | ")}`);
+    const { status } = await chat(gw.addr, true);
+    // 语义变更（2026-11-08）：排队请求一律不接受，直接换下一个候选。
+    // 本用例只有一个渠道，所以最终是 503 而不是「排队两轮后成功」。
+    assert.equal(status, 503, `排队应直接放弃（日志: ${logs.join(" | ")}）`);
+    // 关键：只打上游 1 次 —— 早先是 3 次（排队 2 次 + 成功 1 次），说明还在干等
+    assert.equal(
+      upstream.captured.length,
+      1,
+      `排队后不该重试同一渠道（实际打了 ${upstream.captured.length} 次，日志: ${logs.join(" | ")}）`,
+    );
+    assert.ok(
+      logs.some((l) => l.includes("switching to next candidate")),
+      `日志应记录换渠道意图（实际: ${logs.join(" | ")}）`,
+    );
   });
 
-  it("非流式：同样能穿过排队帧拿到聚合结果", async () => {
-    // 计数器已耗尽排队次数，这次直接成功——验证非流式路径不破坏正常流程
-    const { status, text } = await chat(gw.addr, false);
-    assert.equal(status, 200, `非流式应当成功（日志: ${logs.join(" | ")}）`);
-    const payload = JSON.parse(text) as { choices?: Array<{ message?: { content?: string } }> };
-    assert.ok(payload.choices?.[0]?.message?.content?.includes("queued-ok"));
+  it("非流式：同样不重试同一渠道", async () => {
+    upstream.captured.length = 0;
+    logs.length = 0;
+    const { status } = await chat(gw.addr, false);
+    assert.equal(status, 503, `非流式排队也应直接放弃（日志: ${logs.join(" | ")}）`);
+    assert.equal(upstream.captured.length, 1, "排队后不该重试同一渠道");
   });
 });
 
@@ -271,6 +280,8 @@ describe("上游 HTTP 200 + 流内业务错误帧（非排队）", () => {
   before(async () => {
     root = mkdtempSync(join(tmpdir(), "modelmux-instream-err-"));
     process.env["MODELMUX_HOME"] = root;
+
+    registerChannelSupply(CID, ["deepseek-v4.1-flash"]);
     upstream = await fakeUpstreamError();
     process.env["MB_TEST_UPSTREAM"] = upstream.url;
 
@@ -313,7 +324,7 @@ describe("上游 HTTP 200 + 流内业务错误帧（非排队）", () => {
 describe("排队探测消费掉的帧一个都不能丢（回归）", () => {
   // 症状：ZCode 报 `model.tool_input.normalize_failed`（Bash 工具参数 JSON 语法错误）
   // —— tool_call 的 arguments 分片在流中被吞掉一段，拼出来就是坏 JSON。
-  // 两个丢帧向量都出在 `consumeQueueProbe` 退出点（qoder/qodercn 专用路径）：
+  // 两个丢帧向量都出在 `consumeQueueProbe` 退出点（qoder 系上游专用路径）：
   //   A. 同一 TCP 块里多帧，探测在第一帧（内容）处 return，同块剩余帧被丢；
   //   B. 翻译器缓冲里的**半行**随探测实例一起丢弃，转发层换了新实例接不上残行，整帧丢失。
   let root = "";
@@ -324,6 +335,8 @@ describe("排队探测消费掉的帧一个都不能丢（回归）", () => {
   before(async () => {
     root = mkdtempSync(join(tmpdir(), "modelmux-frame-split-"));
     process.env["MODELMUX_HOME"] = root;
+
+    registerChannelSupply(CID, ["deepseek-v4.1-flash"]);
     upstream = await fakeUpstreamFrameSplit();
     process.env["MB_TEST_UPSTREAM"] = upstream.url;
 

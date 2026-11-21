@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 文档归属检查（规则见 `docs/AGENTS.md`）。
+ * 文档归属检查（规则见根 `AGENTS.md` 的「文档」节）。
  *
  * **`.md` 只有五类落点**：
  *   1. `docs/`                       —— 契约与规范（仓库级唯一文档层）
@@ -78,10 +78,10 @@ function walk(dir, out = []) {
     return out;
   }
   for (const entry of entries) {
-    if (entry.name.startsWith(".") && entry.name !== ".") {
-      // 跳过所有隐藏目录（.git 等），但隐藏文件仍要检查
-      if (entry.isDirectory()) continue;
-    }
+    // 只按 SKIP_DIRS 剪枝，**不按 `.` 开头剪**：`.agents/skills/` 下有十几份 md
+    // （命令手册、协议参考），它们同样要过落点 / 死链 / 源码引用可达三关。
+    // 早先这里把任何 `.` 开头的目录整体 continue，等于让整棵技能文档树对文档规则
+    // 假绿灯 —— `ALLOWED` 里为 `.agents/skills/**` 写的规则也成了永远匹配不到的死代码。
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
@@ -109,8 +109,8 @@ for (const rel of candidates) {
   const stray = /^packages\/core\/channels\/[a-z0-9-]+\/docs\//.test(rel);
   problems.push(
     stray
-      ? `${rel} —— 渠道文档不在包内（改放 docs/channels/<cid>/，规则见 docs/AGENTS.md）`
-      : `${rel} —— md 落点不合法（规则见 docs/AGENTS.md）`,
+      ? `${rel} —— 渠道文档不在包内（改放 docs/channels/<cid>/，规则见根 AGENTS.md 的「文档」节）`
+      : `${rel} —— md 落点不合法（规则见根 AGENTS.md 的「文档」节）`,
   );
 }
 
@@ -123,7 +123,7 @@ if (existsSync(CHANNELS_DIR)) {
     const doc = join(CHANNEL_DOCS_DIR, entry.name, "PROTOCOL.md");
     if (!existsSync(doc)) {
       problems.push(
-        `docs/channels/${entry.name}/PROTOCOL.md —— 缺渠道协议规格（渠道文档统一在 docs/channels/，规则见 docs/AGENTS.md）`,
+        `docs/channels/${entry.name}/PROTOCOL.md —— 缺渠道协议规格（渠道文档统一在 docs/channels/，规则见根 AGENTS.md 的「文档」节）`,
       );
       continue;
     }
@@ -261,7 +261,7 @@ const channelIndex = readText(join(CHANNEL_DOCS_DIR, "README.md"));
 for (const name of readdirSync(join(workspaceRoot, "docs"))) {
   if (!name.toLowerCase().endsWith(".md") || name === "README.md") continue;
   if (!docsIndex.includes(name)) {
-    problems.push(`docs/${name} —— 未登记到 docs/README.md 的文档表（规则见 docs/AGENTS.md）`);
+    problems.push(`docs/${name} —— 未登记到 docs/README.md 的文档表（规则见根 AGENTS.md 的「文档」节）`);
   }
 }
 
@@ -269,12 +269,12 @@ for (const name of readdirSync(join(workspaceRoot, "docs"))) {
 for (const cid of channelIds) {
   if (!docsIndex.includes(`channels/${cid}/`)) {
     problems.push(
-      `docs/channels/${cid}/ —— 未登记到 docs/README.md 的渠道表（规则见 docs/AGENTS.md）`,
+      `docs/channels/${cid}/ —— 未登记到 docs/README.md 的渠道表（规则见根 AGENTS.md 的「文档」节）`,
     );
   }
   if (!channelIndex.includes(`/${cid}/`)) {
     problems.push(
-      `docs/channels/${cid}/ —— 未登记到 docs/channels/README.md 的渠道一览（规则见 docs/AGENTS.md）`,
+      `docs/channels/${cid}/ —— 未登记到 docs/channels/README.md 的渠道一览（规则见根 AGENTS.md 的「文档」节）`,
     );
   }
 }
@@ -304,12 +304,12 @@ for (const name of readdirSync(skillsDir)) {
   }
 }
 
-// 4) 命令清单的唯一事实源是 AGENTS.md —— 已知重复点不得再内联
+// 4) 命令清单的唯一事实源是 CONTRACT-TS.md §9 —— 已知重复点不得再内联
 //
 // 为什么查：同一组命令写两遍必然漂移（改一处忘另一处）。已修的那处是
 // `docs/LOGGING.md` 的「CLI 检索」：原先内联 12 条 `mx log` 命令，与
-// `log-triage` 技能的清单近乎逐字重复。事实源已定为 `AGENTS.md` 的
-// 「常见任务速查」表 + 各技能的判读流程，文档只保留独有规则。
+// CONTRACT-TS.md §9 的「命令速查」表近乎逐字重复。事实源就是 §9，
+// LOGGING.md 只保留日志独有的解析规则与判读流程。
 //
 // 判据刻意**收窄**：只查 `docs/LOGGING.md` 里的 `mx log` 行内命令。
 // 不做「所有文档命令都必须进 AGENTS.md」这种全量校验 —— 命令太多、形态太杂，
@@ -321,9 +321,9 @@ const inlineLogCmd = loggingText
   .filter((line) => /^\s*(mx log\b|`mx log\b)/.test(line));
 if (inlineLogCmd.length > 0) {
   problems.push(
-    `${LOGGING_MD}: 不得内联 \`mx log\` 命令清单（与 log-triage 技能重复，会漂移）。\n` +
+    `${LOGGING_MD}: 不得内联 \`mx log\` 命令清单（与 CONTRACT-TS.md §9 重复，会漂移）。\n` +
       `     命中 ${inlineLogCmd.length} 行，例：${inlineLogCmd[0]?.trim().slice(0, 80) ?? ""}\n` +
-      `     改法：换成一行指向 \`log-triage\` 技能，只保留该文档独有的解析规则。`,
+      `     改法：换成一行指向 CONTRACT-TS.md §9，只保留该文档独有的解析规则。`,
   );
 }
 
@@ -345,6 +345,58 @@ if (agentsMdBytes > AGENTS_MD_MAX_BYTES) {
       `     改法：把低频细则下沉到 docs/ 或 .agents/skills/，根文件只留摘要与指针 —— ` +
       `拆分先例见 docs/WORKFLOW.md。`,
   );
+}
+
+// 5b) 被引用的「唯一事实源」必须真实存在
+//
+// 为什么查：两份文档互相指认对方持有同一份内容时，两处都以为对方在维护它 ——
+// 实际谁都没有，读者两头扑空。已发生过一次：契约里写着「动作命令的唯一事实源
+// 在 AGENTS.md 的『常见任务速查』表」，而那张表在根文件瘦身时被删掉（未搬迁），
+// AGENTS.md 反过来又指向它，形成闭环；两边都不含那张表，
+// 且没有任何检查会失败（2026-11-07 实测）。
+//
+// 判据：出现「唯一事实源」且同句提到另一个文件时，该文件必须存在，且被点名的章节
+// （「」内的中文标题）必须在该文件里真的出现。只查这一个词，不做语义推断。
+const SOURCE_OF_TRUTH_RE = /唯一事实源/;
+for (const rel of candidates) {
+  if (!rel.endsWith(".md")) continue;
+  const text = readText(join(workspaceRoot, ...rel.split("/")));
+  for (const line of text.split(/\r?\n/)) {
+    if (!SOURCE_OF_TRUTH_RE.test(line)) continue;
+    // 同行提到的仓库内文件（形如 `path/to/file.md` 或 AGENTS.md）
+    const refs = [...line.matchAll(/`([A-Za-z0-9._/-]+\.md)`|(?<![\w`/-])([A-Za-z0-9._-]+\.md)\b/g)]
+      .map((m) => m[1] ?? m[2])
+      .filter((f) => f && f !== rel);
+    // 「」里点名的章节标题 —— 只在该行同时出现结构词时才判定，否则「」里多半是
+    // 原则 / 术语名（如「事实在文档、导航在头部」），拿它去文件里找必然误报。
+    const NAMES_SECTION_RE = /(节|章|表|§)/;
+    const sections = NAMES_SECTION_RE.test(line)
+      ? [...line.matchAll(/[「『]([^」』]{2,40})[」』]/g)].map((m) => m[1])
+      : [];
+    for (const ref of refs) {
+      const base = ref.split("/").pop();
+      const target =
+        candidates.find((c) => c === ref) ??
+        candidates.find((c) => c.split("/").pop() === base);
+      if (!target) {
+        problems.push(
+          `${rel}: 声明「唯一事实源」指向 \`${ref}\`，但仓库里没有这个 md。\n` +
+            `     改法：把内容落到真实存在的归属文档，或改指真正持有它的那份文件。`,
+        );
+        continue;
+      }
+      const targetText = readText(join(workspaceRoot, ...target.split("/")));
+      for (const section of sections) {
+        if (!targetText.includes(section)) {
+          problems.push(
+            `${rel}: 声明「唯一事实源」在 \`${target}\` 的「${section}」，但该文件里没有这一节。\n` +
+              `     内容被删或改名后引用即成死链（双方都以为对方在维护它）。\n` +
+              `     改法：指向实际持有该内容的文件与章节。`,
+          );
+        }
+      }
+    }
+  }
 }
 
 // ── 6) 渠道环境变量口径：渠道 src 读的 env 必须在文档里有提及 ────────────────
@@ -381,6 +433,46 @@ for (const [name, loc] of envUsages) {
       `${loc} —— 渠道环境变量 ${name} 未见于任何文档（运维面变量统一进 docs/channels/<cid>/PROTOCOL.md 的「环境变量」）`,
     );
   }
+}
+
+// ── 7) 仓库根只放工程入口与门面文件 ────────────────────────────────────────
+// 为什么查：验收 / 探测脚本跑在仓库根时，产出的文件会被 `git add -A` 一并提交
+//（发生过：客户端验收写的 `cc-e2e.txt` 进了 main）。根目录只留工具按固定路径读的
+// 门面与工程配置；临时与验收产物写 `.tmp/`（全局规则「临时文件」）。
+const ROOT_FILES_ALLOWED = new Set([
+  "AGENTS.md",
+  "LICENSE",
+  "README.md",
+  "Dockerfile",
+  "docker-compose.yml",
+  "docker-nginx.conf",
+  ".dockerignore",
+  ".env.example",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "tsconfig.base.json",
+  ".gitattributes",
+  ".gitignore",
+]);
+const rootFiles = readdirSync(workspaceRoot, { withFileTypes: true })
+  .filter((entry) => entry.isFile())
+  .map((entry) => entry.name)
+  // `.git` 在主工作树是**目录**、在 linked worktree 是**文件**（指向共享 git 目录的
+  // 指针）。上面 `walk()` 靠 `SKIP_DIRS` 跳过的只是目录形态，这里是显式扫文件，
+  // 于是 worktree 的 `.git` 被当成「仓库根多放的文件」——worktree 里 `npm test` 恒红，
+  // 且失败在第 3 个校验器，其后全部校验器与测试都不会执行。
+  // 本地推送门禁（`gate.sh` 在干净 clone 里跑）与 CI 都是目录形态，看不见这个问题。
+  .filter((name) => name !== ".git")
+  .filter((name) => !ROOT_FILES_ALLOWED.has(name));
+const rootIgnored = gitIgnored(rootFiles); // 本机私有（.env / .zcodeignore 等）：不归仓库管
+for (const name of rootFiles) {
+  if (rootIgnored.has(name)) continue;
+  problems.push(
+    `${name} —— 仓库根不放这类文件。允许的根文件：${[...ROOT_FILES_ALLOWED].join(" / ")}。\n` +
+      `     临时与验收产物写 .tmp/（全局规则「临时文件」），别让 \`git add -A\` 顺手提交；\n` +
+      `     刻意新增的工程文件请加进 scripts/verify-docs.mjs 的 ROOT_FILES_ALLOWED。`,
+  );
 }
 
 if (problems.length > 0) {
