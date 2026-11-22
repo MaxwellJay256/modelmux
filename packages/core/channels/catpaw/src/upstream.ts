@@ -696,18 +696,19 @@ export function buildChatBody(
 export async function prepareChat(body: Record<string, unknown>): Promise<void> {
   const conversationId = sharedLogin.str(body["__conversationId"]);
   const round = body["__roundBody"] as Record<string, unknown> | undefined;
-  if (!conversationId || !round) return;
+  if (!conversationId || !round) {
+    // 没有会话/轮次要准备：本函数不会发任何请求，body 随后会被原样发上游 ——
+    // 内部字段必须在这里也摘掉，否则 `__images`（可能是 base64 图片）与
+    // `__roundBody` 会漏进上游请求体，同时破坏「返回后 body 即最终请求体」的不变量。
+    // 这条分支不涉及重试（没有 round/event 可重跑），删掉是安全的。
+    delete body["__images"];
+    delete body["__roundBody"];
+    return;
+  }
 
   // 待转存的图片：客户端分片里的 URL（data:/http(s)）都要先转成自家对象存储的
   // 公网引用 —— conversation 协议吃 URL，上游会自己来拉。
   const pendingImages = body["__images"] as string[] | undefined;
-  delete body["__images"];
-
-  // 内部字段不能发给上游：在这里就地摘掉（网关随后发的就是同一个对象）。
-  // 用 `__` 前缀 + 显式删除，而不是另开一张旁路表 —— 让「body 就是最终请求体」
-  // 这条不变量在 prepareChat 返回后立即成立，不依赖调用顺序。
-  delete body["__conversationId"];
-  delete body["__roundBody"];
 
   if (pendingImages && pendingImages.length > 0) {
     const credential = loadCredential();
@@ -731,6 +732,18 @@ export async function prepareChat(body: Record<string, unknown>): Promise<void> 
     { conversationId, eventType: "conversation", data: { status: "running" } },
     FETCH_TIMEOUT_MS,
   );
+
+  // 内部字段不能发给上游：在**成功之后**就地摘掉（网关随后发的就是同一个对象）。
+  // 用 `__` 前缀 + 显式删除，而不是另开一张旁路表 —— 让「body 就是最终请求体」
+  // 这条不变量在 prepareChat 返回后立即成立，不依赖调用顺序。
+  //
+  // 时机是这里而非开头：`attempt.ts` 的 `handlePrepareUnauthorized` 在 round/event
+  // 撞 401 且刷新成功后会拿**同一个 body** 再调一次本函数。开头就删会让第二次读到
+  // 空 conversationId 直接 return —— round/event 不再执行，只发 turn，上游回
+  // 「会话未在执行中」，图片也在第一次就被摘掉了。
+  delete body["__images"];
+  delete body["__conversationId"];
+  delete body["__roundBody"];
 }
 
 /**

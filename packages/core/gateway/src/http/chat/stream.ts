@@ -47,7 +47,13 @@ const FIRST_BYTE_HEARTBEAT_MS = 5_000;
  * 两条线型（openai / custom）必须同口径 —— 否则同一个上游故障，换条线型客户端
  * 就从「收到结构化错误」变成「连接被静默掐断」。入站协议编码器在场时错误帧也走协议形态。
  */
-function relayError(res: ServerResponse, logger: (m: string) => void, err: unknown, cid?: string): void {
+function relayError(
+  res: ServerResponse,
+  logger: (m: string) => void,
+  err: unknown,
+  cid?: string,
+  ensureHead?: () => void,
+): void {
   const code = (err as { code?: string } | null)?.code;
   const name = (err as { name?: string } | null)?.name;
   if (code === "ECONNRESET" || code === "EPIPE" || code === "ERR_STREAM_PREMATURE_CLOSE") {
@@ -59,6 +65,10 @@ function relayError(res: ServerResponse, logger: (m: string) => void, err: unkno
   const sink = sinkOf(res);
   const writeError = (errorCode: string, message: string): void => {
     if (res.writableEnded) return;
+    // 必须先落响应头：直接 res.write() 会隐式提交一个 200 —— 既没有
+    // `Content-Type: text/event-stream`，也让 `forward.ts` 的「零产出且未写头 →
+    // 换下一条候选」判据失效，本该重试的请求变成一条头不合法的 200 错误流。
+    ensureHead?.();
     if (sink) sink.writeError(errorCode, message);
     else res.write(`data: ${JSON.stringify({ error: { code: errorCode, message } })}\n\n`);
   };
@@ -292,12 +302,19 @@ export async function relayStream(
       produced = Math.max(produced, relayed.produced);
       disconnected = relayed.disconnected;
     } catch (err) {
-      relayError(res, logger, err, cid);
+      relayError(res, logger, err, cid, ensureHead);
     } finally {
       // 无编码器时 sse-stream.relay 自己 end；有编码器时收尾事件在这里补。
-      // 零产出**且还没写头**时不能 end：上层要拿这条候选去换下一条（见 ensureHead）。
-      sink?.finish();
-      if (sink && !res.writableEnded && (produced > 0 || res.headersSent)) res.end();
+      //
+      // 零产出 + 未写头 = 这条候选没接住请求（上游 200 空流）。此时
+      // **不能**调 sink.finish()：协议编码器在「还没开始」时会补首事件
+      // （anthropic 的 message_start / responses 的 response.created），一写就落了
+      // 响应头，`forward.ts` 的「零产出且未写头 → 换下一条候选」窗口随之失效，
+      // 客户端拿到一条空的成功响应。判定与收尾统一交给 forward.ts 的 empty-stream 分支。
+      // 客户端已断开（没有任何字节写出）同理跳过：没有收件人，写了也只是噪声。
+      const wrapUp = produced > 0 || res.headersSent;
+      if (wrapUp) sink?.finish();
+      if (sink && !res.writableEnded && wrapUp) res.end();
     }
     return { produced, disconnected };
   }
@@ -394,7 +411,7 @@ export async function relayStream(
       deliver(buf);
     }
   } catch (err) {
-    relayError(res, logger, err, cid);
+    relayError(res, logger, err, cid, ensureHead);
     errored = true;
   } finally {
     // 客户端断开或上游异常时也要触发翻译器收尾（渠道可在 finish 里回报会话完成）

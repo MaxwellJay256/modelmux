@@ -1,15 +1,15 @@
 /**
  * 仪表盘页（`/web/` 首页）：**当下快照 + 区间用量**两层。
  *
- * 快照（今日 KPI / 接入盒 / 模型池）走 `/api/overview`，3-5 秒轮询；
+ * 快照（今日 KPI / 模型池）走 `/api/overview`，3-5 秒轮询；
  * 用量（Token 活动 / 每日趋势 / 模型用量）走 `/api/usage`，只在切区间或手动刷新时重取。
  * 口径：控制台里「请求」恒指模型请求（`/v1/chat/completions`）——请求日志、用量区块、
  *   今日 KPI 三处同源，见 docs/USAGE-STATS.md。
- * 无 hover 信息：详情一律点击后落固定区域；lg 双列 / md 单列，不新增依赖。
+ * 无 hover 信息：详情一律点击后落固定区域。
  */
 
 import { useEffect, useRef, useState, type ReactElement } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   AlertTriangle,
@@ -17,21 +17,19 @@ import {
   Flame,
   Gauge,
   Layers,
-  PlugZap,
   Timer,
   Wifi,
 } from "lucide-react";
 import { KpiCard } from "../components/KpiCard";
 import { PageHeader } from "../components/PageHeader";
 import { Segmented } from "../components/Segmented";
-import { Switch } from "../components/Switch";
 import { useToast } from "../components/Toast";
 import { Heatmap, type HeatGranularity } from "../components/usage/Heatmap";
 import { ModelDonut } from "../components/usage/ModelDonut";
 import { TrendChart } from "../components/usage/TrendChart";
 import { api } from "../lib/api";
 import { errorText, formatTokens, formatDuration, formatRate } from "../lib/log-format";
-import type { IntegrationUpdate, UsageRange } from "../lib/types";
+import type { UsageRange } from "../lib/types";
 
 /** 区间选项（驱动下方「用量」三块，不影响今日快照）。
  *
@@ -80,139 +78,13 @@ function storedRange(): UsageRange {
 const MAX_SERIES = 6;
 
 // ---------------------------------------------------------------------------
-// 一键接入：开关式卡片（开 = 已接入写入客户端配置；关 = 还原到接入前）
-// ---------------------------------------------------------------------------
-
-/** 接入目标（与后端 `IntegrationTarget` 同形）。 */
-type IntegrationTarget = "zcode" | "dsh";
-
-/** 每个客户端在卡片上展示的静态信息（图标缩写 / 名称 / 接入会写的配置文件）。 */
-const INTEGRATE_CLIENTS: Array<{
-  target: IntegrationTarget;
-  icon: string;
-  name: string;
-}> = [
-  { target: "zcode", icon: "zc", name: "zcode" },
-  { target: "dsh", icon: "ds", name: "dsh" },
-];
-
-/** 开关操作中态：哪个目标在跑哪种动作（并行点两张卡互不误标）。 */
-interface PendingAction {
-  target: IntegrationTarget;
-  action: "integrate" | "restore";
-}
-
-/** 更新差异的可读措辞（进 aria-label；直显按钮方案保持卡面极简，正文不放差异）。 */
-function updateDiffLabel(update: IntegrationUpdate): string {
-  const parts: string[] = [];
-  if (update.added.length > 0) parts.push(`新增 ${update.added.join("、")}`);
-  if (update.removed.length > 0) parts.push(`移除 ${update.removed.join("、")}`);
-  return parts.join("；") || "模型清单有变化";
-}
-
-/**
- * 开关式接入卡片：开关就是状态本身 —— 开 = 已接入（写入客户端配置），关 = 还原到
- * 接入前（自动备份可反悔）。操作中开关禁用并停在目标位置，失败弹回原位 + 红字
- * 原因 + 描边转红：只弹 toast 会让人以为状态变了。
- */
-function IntegrateSwitchCard({
-  target,
-  icon,
-  name,
-  integrated,
-  pending,
-  error,
-  update,
-  onToggle,
-  onUpdate,
-}: {
-  target: IntegrationTarget;
-  icon: string;
-  name: string;
-  integrated: boolean;
-  /** 该卡片的操作中态（null = 空闲）。 */
-  pending: PendingAction | null;
-  /** 最近一次操作的失败原因（null = 无）。 */
-  error: string | null;
-  /** 模型有更新明细（null = 无；仅在已接入且空闲时展示更新按钮）。 */
-  update: IntegrationUpdate | null;
-  onToggle: () => void;
-  /** 点「更新」= 重跑同一条接入路径，把客户端清单刷成当前对外模型。 */
-  onUpdate: () => void;
-}): ReactElement {
-  const busy = pending !== null;
-  const failed = error !== null;
-  /** 操作中开关**先走到目标位置**（接入中停在开、还原中停在关），完成后再由快照定稿。 */
-  const shown = pending ? pending.action === "integrate" : integrated;
-  const stateText = pending
-    ? pending.action === "integrate"
-      ? "接入中…"
-      : "还原中…"
-    : failed
-      ? integrated
-        ? "还原失败"
-        : "接入失败"
-      : integrated
-        ? "已接入"
-        : "未接入";
-  const stateClass = pending
-    ? "text-warn"
-    : failed
-      ? "text-danger"
-      : integrated
-        ? "text-free"
-        : "text-ink-faint";
-  return (
-    <div
-      className={`relative rounded-xl border bg-raised p-3 transition-colors ${
-        failed ? "border-danger/45" : "border-line"
-      } ${busy ? "opacity-70" : ""}`}
-    >
-      <div className="flex items-center gap-2.5">
-        <span className="grid h-[26px] w-[26px] flex-none place-items-center rounded-lg bg-overlay text-xs font-medium text-ink">
-          {icon}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[13px] font-medium text-ink">{name}</div>
-        </div>
-        <span className={`flex-none text-xs ${stateClass}`}>{stateText}</span>
-        {/*
-          「有更新」直显按钮：接入后对外模型清单变了才出现（判据在服务端 diff 好下发）。
-          中性描边 + 一颗 warn 语义点（不再铺 warn 淡底 —— 浅色下_warn/10 发灰、
-          深色下又偏土，不如只留一个点交代「有变化」）。点击重跑接入，成功后随快照消失。
-        */}
-        {!busy && integrated && update !== null && (
-          <button
-            type="button"
-            onClick={onUpdate}
-            aria-label={`${name} 模型有更新（${updateDiffLabel(update)}），点击更新接入`}
-            className="tap inline-flex flex-none items-center gap-1.5 rounded-lg border border-line bg-overlay px-2.5 py-[3px] text-xs text-ink transition-colors hover:border-line-strong"
-          >
-            <span className="h-1.5 w-1.5 flex-none rounded-full bg-warn" aria-hidden="true" />
-            更新
-          </button>
-        )}
-        <Switch
-          checked={shown}
-          disabled={busy}
-          onChange={onToggle}
-          label={`${name} ${stateText}，点击${shown ? "还原" : "接入"}`}
-        />
-      </div>
-      {failed && <div className="mt-2 break-words text-xs text-danger">{error}</div>}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // 主组件
 // ---------------------------------------------------------------------------
 
 export function Dashboard(): ReactElement {
   const toast = useToast();
 
-  // 状态快照：模型清单 / 网关错误 / 加载判定都读它（base_url / 版本等配置类信息已收进设置页）——
-  // 读 `["state"]` 的共享缓存，轮询归 `Layout` 所有
+  // 状态快照：网关错误 / 加载判定都读它 —— 读 `["state"]` 的共享缓存，轮询归布局层所有
   const stateQuery = useQuery({
     queryKey: ["state"],
     queryFn: api.getState,
@@ -247,8 +119,7 @@ export function Dashboard(): ReactElement {
    *
    * `placeholderData: prev` 是**切区间不闪**的关键：`queryKey` 带 `range`，换区间就是
    * 一个新 key —— 不加 placeholder 时 react-query 会先清成 `undefined`，一整屏卡片
-   * 瞬间塌成骨架再弹回来，观感像故障。保留上一份数据后，新数据到达前界面数字不动，
-   * 只在右上角用「切换中」小点提示（见下方 `rangePending`）。
+   * 瞬间塌成骨架再弹回来，观感像故障。保留上一份数据后，新数据到达前界面数字不动。
    */
   const usageQuery = useQuery({
     queryKey: ["usage", range],
@@ -256,75 +127,14 @@ export function Dashboard(): ReactElement {
     placeholderData: (prev) => prev,
   });
   const rangeStats = usageQuery.data;
-  /** 正在取新区间数据：数字还是旧的，用来决定是否显示过渡指示。 */
-  const rangePending = usageQuery.isFetching && usageQuery.isPlaceholderData;
-
-  // 开关式接入：操作中态与每卡失败原因（键 = target）。结果同时走右下角 toast
-  // （命令信封 ok:false 是 200 响应，onSuccess 不代表成功）+ 卡上红字（最新一次）。
-  const queryClient = useQueryClient();
-  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
-  const [integrateErrors, setIntegrateErrors] = useState<Partial<Record<IntegrationTarget, string>>>({});
-  const clearError = (target: IntegrationTarget): void =>
-    setIntegrateErrors((prev) => {
-      const next = { ...prev };
-      delete next[target];
-      return next;
-    });
-
-  // 接入（开）：把该客户端的模型清单改成网关的对外模型名。
-  const integrateMutation = useMutation({
-    mutationFn: (target: IntegrationTarget) => api.commands.integrate(target),
-    onMutate: (target) => setPendingAction({ target, action: "integrate" }),
-    onSuccess: (data, target) => {
-      if (data.ok === false) {
-        setIntegrateErrors((prev) => ({ ...prev, [target]: String(data.error ?? "未完成任何改动") }));
-        toast.error(`接入失败：${String(data.error ?? "未完成任何改动")}`);
-        return;
-      }
-      clearError(target);
-      toast.success(`已接入 ${target}`);
-      // warnings 是「有东西没做成」（备份清单读不出 / 备份未登记）：不说出来就成了
-      // 「已接入」的假象
-      for (const note of Array.isArray(data.warnings) ? data.warnings : []) {
-        toast.info(typeof note === "string" ? note : String(note));
-      }
-      void queryClient.invalidateQueries({ queryKey: ["state"] });
-    },
-    onError: (err, target) => {
-      setIntegrateErrors((prev) => ({ ...prev, [target]: errorText(err) }));
-      toast.error(`接入失败：${errorText(err)}`);
-    },
-    onSettled: () => setPendingAction(null),
-  });
-
   /**
-   * 还原（关）：把目标恢复成接入前的样子（后端取该目标**最新一次**备份，
-   * 并在还原前先把当前状态再备份一份，可反悔）。
+   * 正在取新区间数据：数字还是旧的。
+   *
+   * 切区间的视觉口径：Segmented 药丸 150ms 过渡到新选中项的同时，区间数据区
+   * **同步**淡到半透明（同一拍）；新数据到达后恢复实色（新数字）。
+   * 两拍之间有连续的透明度信号，不再是「框先变、数字若干 ms 后跳变」的割裂感。
    */
-  const restoreMutation = useMutation({
-    mutationFn: (target: IntegrationTarget) => api.commands.restore(target),
-    onMutate: (target) => setPendingAction({ target, action: "restore" }),
-    onSuccess: (data, target) => {
-      if (data.ok === false) {
-        setIntegrateErrors((prev) => ({ ...prev, [target]: String(data.error ?? "没有可用的接入备份") }));
-        toast.error(`还原失败：${String(data.error ?? "没有可用的接入备份")}`);
-        return;
-      }
-      clearError(target);
-      toast.success(`已还原 ${target}`);
-      // 跳过的条目 / 缺失的备份文件必须说出来 —— 否则「已还原」是假象。
-      // 这是真警告而不是计数，保留逐条提示。
-      for (const note of Array.isArray(data.notes) ? data.notes : []) {
-        toast.info(typeof note === "string" ? note : String(note));
-      }
-      void queryClient.invalidateQueries({ queryKey: ["state"] });
-    },
-    onError: (err, target) => {
-      setIntegrateErrors((prev) => ({ ...prev, [target]: errorText(err) }));
-      toast.error(`还原失败：${errorText(err)}`);
-    },
-    onSettled: () => setPendingAction(null),
-  });
+  const rangePending = usageQuery.isFetching && usageQuery.isPlaceholderData;
 
     // 热力图独立取**一年**（52 周的日历不随区间变化，与 ZCode 同构）。
   const [grain, setGrain] = useState<HeatGranularity>("daily");
@@ -396,38 +206,23 @@ export function Dashboard(): ReactElement {
     <div className="space-y-5 pb-10">
       <PageHeader
         title="仪表盘"
-        description="Token 活动恒看一年"
         actions={
           <div className="flex items-center gap-2">
-            {/*
-              切换过渡指示：数据还是上一区间的（`placeholderData` 保住的），这里只
-              用一个淡入淡出的小圆点说明「新数字在路上」。不用骨架、不用遮罩 ——
-              数字不动才不会闪，提示只补一句「正在更新」。
-            */}
-            <span
-              className={`h-1.5 w-1.5 rounded-full bg-ink transition-opacity duration-300 ${
-                rangePending ? "animate-pulse opacity-100" : "opacity-0"
-              }`}
-              aria-hidden="true"
-            />
-            <span
-              className={`text-xs text-ink-faint transition-opacity duration-300 ${
-                rangePending ? "opacity-100" : "opacity-0"
-              }`}
-              aria-live="polite"
-            >
-              更新中
-            </span>
+            {/* 区间切换的过渡只靠数字自身淡入（placeholderData 保住旧数字不闪），不放「更新中」文案 */}
             <Segmented items={RANGES} value={range} onChange={setRange} label="用量区间" />
           </div>
         }
       />
 
-      {/* ① KPI：全部随区间变化（窄屏 2 列 / lg 3 列 / 2xl 一行六格） */}
-      {/* KPI：窄屏 2 列 / lg 3 列 / 2xl 一行六格（移除「当前连续」后正好六张）——
-          1366 笔记本（xl 档）六列时每列 ~210px，tokens 副行折行把卡高撑乱；
-          2xl（≥1536）起才一行六格，1366 落 3 列 × 2 行，副行单行不折。 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 2xl:grid-cols-6">
+      {/* KPI：全部随区间变化（窄屏 2 列 / lg 3 列 / 2xl 一行六格）；切区间时同步淡到
+          半透明、新数据到达恢复实色（与 Segmented 药丸过渡同一拍，见 rangePending）。
+          2xl（≥1536）起才一行六格：1366 笔记本（xl 档）若六列，每列 ~210px，tokens 副行
+          折行把卡高撑乱；1366 落 3 列 × 2 行，副行单行不折。 */}
+      <div
+        className={`grid grid-cols-2 gap-3 transition-opacity duration-200 lg:grid-cols-3 2xl:grid-cols-6 ${
+          rangePending ? "opacity-55" : "opacity-100"
+        }`}
+      >
         <KpiCard
           icon={Wifi}
           label={`${rangeWord}请求 · 成功率`}
@@ -484,67 +279,38 @@ export function Dashboard(): ReactElement {
         />
       </div>
 
-      {/* ③ Token 趋势：按模型分色。区间选择器在**页头**（整页一个控制点）——
+      {/* Token 趋势：按模型分色。区间选择器在**页头**（整页一个控制点）——
           它驱动 KPI / 趋势 / 模型用量三块，紧贴 KPI 与用量明细，
           让「区间 → 数字 → 趋势」连成一条自上而下的读序。 */}
-      <section className="panel p-4">
+      <section
+        className={`panel p-4 transition-opacity duration-200 ${rangePending ? "opacity-55" : "opacity-100"}`}
+      >
         <div className="panel-title mb-3">
           <Activity className="h-4 w-4 text-ink-faint" />
           Token 趋势
         </div>
         {/*
           图表按**容器实测宽度**渲染（组件内 ResizeObserver）；横轴标签按像素步长
-          抽稀，窄屏不再需要 600px 最小宽硬扛 —— 早期那层 `min-w-[600px]` 已随
-          抽稀上线移除（2026-11-15）。极端视口（<300px）由组件内部横向滚动兜底。
+          抽稀，极端视口（<300px）由组件内部横向滚动兜底。
         */}
         <TrendChart daily={rangeStats?.daily ?? []} series={series} />
       </section>
 
-      {/* ① 模型用量（左，区间聚合）+ 对外模型清单（右，同一行等高）
-          用量卡占 8 列放环形 + 图例；清单卡占 4 列只列模型名与规格。
-          两卡都内容顶对齐：行高由较高一侧决定时，多余留白沉在矮卡底部，
-          而不是堆成一条空带。 */}
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-        <section className="panel flex flex-col p-4 lg:col-span-8">
-          <div className="panel-title mb-3">
-            <Layers className="h-4 w-4 text-ink-faint" />
-            模型用量
-          </div>
-          {/* 只画有 tokens 的模型：`models` 里现在还包含「只有失败请求」的（它们 tokens 为 0），
-              那是模型列表健康度要的，画进环形图会多出一堆 0% 图例。 */}
-          <ModelDonut models={(rangeStats?.models ?? []).filter((m) => m.tokens > 0)} />
-        </section>
-        {/* ② 一键接入（4 列窄卡）：开关式卡片 —— 开 = 已接入（写客户端配置），关 = 还原到接入前 */}
-        <section className="panel flex flex-col p-4 lg:col-span-4">
-          <div className="panel-title mb-3">
-            <PlugZap className="h-4 w-4 text-ink-faint" />
-            一键接入
-          </div>
-          {/* flex-1 + content-center：两张开关卡垂直居中吃掉等高带来的余量，
-              不再在卡底堆出一整块空白 */}
-          <div className="grid flex-1 grid-cols-1 content-center gap-2.5">
-            {INTEGRATE_CLIENTS.map(({ target, icon, name }) => (
-              <IntegrateSwitchCard
-                key={target}
-                target={target}
-                icon={icon}
-                name={name}
-                integrated={state?.integrations?.[target] === true}
-                pending={pendingAction?.target === target ? pendingAction : null}
-                error={integrateErrors[target] ?? null}
-                update={state?.integrations?.[target] ? state?.integration_updates?.[target] ?? null : null}
-                onToggle={() => {
-                  if (state?.integrations?.[target]) restoreMutation.mutate(target);
-                  else integrateMutation.mutate(target);
-                }}
-                onUpdate={() => integrateMutation.mutate(target)}
-              />
-            ))}
-          </div>
-        </section>
-      </div>
+      <section
+        className={`panel flex flex-col p-4 transition-opacity duration-200 ${
+          rangePending ? "opacity-55" : "opacity-100"
+        }`}
+      >
+        <div className="panel-title mb-3">
+          <Layers className="h-4 w-4 text-ink-faint" />
+          模型用量
+        </div>
+        {/* 只画有 tokens 的模型：`models` 里现在还包含「只有失败请求」的（它们 tokens 为 0），
+            那是模型列表健康度要的，画进环形图会多出一堆 0% 图例。 */}
+        <ModelDonut models={(rangeStats?.models ?? []).filter((m) => m.tokens > 0)} />
+      </section>
 
-      {/* ② Token 活动：日历热力图（每日 / 每周 / 累计）；点击格子 → 详情落下方固定区（不用 hover） */}
+      {/* Token 活动：日历热力图（每日 / 每周 / 累计）；点击格子 → 详情落下方固定区（不用 hover） */}
       <section className="panel p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="panel-title">
@@ -569,26 +335,18 @@ export function Dashboard(): ReactElement {
 
 function DashboardSkeleton(): ReactElement {
   return (
+    // 通用加载占位：只保节奏（页头 + 卡片块），不逐块对应页面分区
+    //（Accounts 页空态复用本骨架，逐块对应会让两页互相牵制）。
     <div className="space-y-5" aria-hidden="true">
-      {/* 接入盒骨架 */}
-      <div className="h-28 animate-pulse rounded-2xl border border-line bg-raised" />
-      {/* KPI 骨架：四格 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        {[0, 1, 2, 3].map((i) => (
+      <div className="h-16 animate-pulse rounded-2xl border border-line bg-raised" />
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 2xl:grid-cols-6">
+        {[0, 1, 2, 3, 4, 5].map((i) => (
           <div key={i} className="h-20 animate-pulse rounded-xl border border-line bg-raised" />
         ))}
       </div>
-      {/* 双列骨架 */}
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-        <div className="space-y-5 lg:col-span-8">
-          <div className="h-48 animate-pulse rounded-2xl border border-line bg-raised" />
-          <div className="h-36 animate-pulse rounded-2xl border border-line bg-raised" />
-        </div>
-        <div className="space-y-5 lg:col-span-4">
-          <div className="h-44 animate-pulse rounded-2xl border border-line bg-raised" />
-          <div className="h-36 animate-pulse rounded-2xl border border-line bg-raised" />
-        </div>
-      </div>
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="h-56 animate-pulse rounded-2xl border border-line bg-raised" />
+      ))}
     </div>
   );
 }

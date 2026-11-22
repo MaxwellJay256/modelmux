@@ -14,6 +14,7 @@ import type { ServerResponse } from "node:http";
 import { getChannel, hasChannel, channelCapabilities, type Channel, type StreamTranslator } from "../../runtime/channel.js";
 import {
   hasUsableAccount,
+  isNotLoggedIn,
   markActiveHealth,
   noteAccountFailure,
   noteAccountQuotaExhausted,
@@ -42,7 +43,6 @@ import { relayUpstream } from "./forward.js";
 import type { PoolCandidate } from "../../pool/pool-targets.js";
 import { getChannelModelMeta } from "../../pool/pool-targets.js";
 
-/** 一次失败的错误三元组：状态码 + 错误码 + 文案（回给客户端的信封内容）。 */
 /**
  * 客户端可见的 503 文案。
  *
@@ -55,6 +55,7 @@ function unavailableMessage(detail: string): string {
   return text === "" ? "no available account for this request" : `no available account for this request（${text}）`;
 }
 
+/** 一次失败的错误三元组：状态码 + 错误码 + 文案（回给客户端的信封内容）。 */
 export interface ChatError {
   status: number;
   code: string;
@@ -177,7 +178,13 @@ async function tryRefreshCredential(
     await inChannel(channel, () => channel.cred.refresh(credential));
     return { kind: "ok" };
   } catch (err) {
-    if (isUpstreamUnauthorized(channel, err)) return { kind: "unauthorized", error: String(err) };
+    // 两种终态都算「凭据真失效」：
+    //   - `UpstreamUnauthorized`：渠道在建连前置里认出了上游的鉴权拒绝；
+    //   - `NotLoggedInError`：刷新途中发现凭据本身已不可用（codebuddycn / qwenworkcn
+    //     抛的是它）。只认前者会让这类渠道的坏令牌被无限重试、永不标 `unauthorized`。
+    if (isUpstreamUnauthorized(channel, err) || isNotLoggedIn(channel, err)) {
+      return { kind: "unauthorized", error: String(err) };
+    }
     logger(`token refresh failed: ${String(err)}`);
     return { kind: "failed", error: String(err) };
   }
@@ -347,8 +354,7 @@ async function reopenForProbe(
  *
  * 探测消费掉的帧记进 `state.frames`，翻译器记进 `state.translator`：
  *   转发层必须**原序**交出这些帧，并**接着用同一个**翻译器实例（半行缓冲在里面）。
- * 排队期间**不发任何可见文案**（只发一次 SSE 响应头 + 空 role 帧建立流，见
- *   `writeQueueHeaders`）—— 排队进度文案不展示。
+ * 排队期间**不发任何可见文案**：响应头由转发层首字节统一写出，排队进度文案不展示。
  * 每轮开头检查客户端断连：排队可能长达数分钟，客户端（60s 超时）走人后
  *   继续轮询上游纯属浪费（实测断连后空转 4 分钟、白打 22 次上游请求）。
  *
@@ -412,7 +418,8 @@ async function runQueueProbe(
     // 重试分支，不再向外记状态。但它**要落一笔日志**：控制台靠这个字段给模型打「排队」标签，
     // 而耗时反推区分不了「上游慢」和「上游排队」（见 `noteQueued`）。
     if (probe.queued) noteQueued(res);
-    if (!probe.queued || probe.hasContent) {      // 上游 200 但流**空着结束**（零帧、无排队帧）同样是瞬时故障：重试一次再认输
+    // 上游 200 但流**空着结束**（零帧、无排队帧）同样是瞬时故障：重试一次再认输
+    if (!probe.queued || probe.hasContent) {
       if (!probe.queued && !probe.hasContent && probe.frames.length === 0) {
         const next = await reopenForProbe(env, state, call, "upstream stream ended with no frames");
         if (next) {
@@ -585,6 +592,16 @@ export async function attemptCandidate(
     markActiveHealth("unauthorized", cid);
     return { kind: "retry", error: { status: 502, code: "upstream_unauthenticated", message: outcome.error } };
   }
+  // 凭据读盘故障：记连败（瞬时故障可自愈）但**不标 unauthorized** —— 那是终态，
+  // 重新登录修不了权限 / 占用问题；让路由在熔断前继续尝试，账号状态由真实鉴权决定。
+  if (outcome.kind === "cred_error") {
+    logThrottled(logger, `chat:cred-error:${cid}`, `channel ${cid} credential unreadable: ${outcome.error}`);
+    noteFailure(cid, activeKeyOf(cid));
+    return {
+      kind: "retry",
+      error: { status: 503, code: "credential_unreadable", message: unavailableMessage(outcome.error) },
+    };
+  }
   // 冷却中：本地短路，**未打上游**。额度耗尽不是故障（`account-pool.ts` 的
   // `noteAccountQuotaExhausted` 刻意不动 `fail_streak`），故这里也**不记任何连败** ——
   // 记了就会在冷却窗口内被 3 连败熔断打成 `error`，连免费模型一起锁死且无自动恢复
@@ -613,10 +630,12 @@ export async function attemptCandidate(
   }
   // error 终态短路：已标 error，再记连败只会虚增 fail_streak（2026-10-24 实测被刷到 11）。
   if (outcome.kind === "account_error") {
-    logThrottled(logger, `chat:not-logged-in:${cid}`, `channel ${cid} not logged in: ${outcome.error}`);
+    // 独立节流键：与真·未登录共用 `chat:not-logged-in:${cid}` 会让先到者占住槽位，
+    // 另一种故障在节流窗口内静默丢日志（两种故障互相吞）
+    logThrottled(logger, `chat:account-error:${cid}`, `account tripped (channel ${cid}): ${outcome.error}`);
     return {
       kind: "retry",
-      error: { status: 503, code: "not_authenticated", message: unavailableMessage(outcome.error) },
+      error: { status: 503, code: "account_tripped", message: unavailableMessage(outcome.error) },
     };
   }
   let call = outcome.call;

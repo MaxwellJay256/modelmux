@@ -1,9 +1,9 @@
 /**
- * 设置弹窗：顶栏齿轮打开，左锚点（通用 / 外观 / 关于）+ 右内容。
+ * 设置弹窗：顶栏齿轮打开，左锚点分区 + 右内容。
  *
  * 与「添加账号」登录弹窗同一套 Radix Dialog 骨架，但关闭策略相反：
  * 设置不是流程态，ESC 与点遮罩都应当关闭（登录弹窗刻意不关）。
- * 右列用小字分组标签分节（偏好设置 / 显示 / 信息），行首带图标；
+ * 右列用小字分组标签分节，行首带图标；
  * 窄屏（<sm）锚点折成顶部一行横滑，不挤压内容列。
  */
 
@@ -95,16 +95,14 @@ function IntervalRow({
   icon,
   page,
   title,
-  description,
 }: {
   icon: IconType;
   page: RefreshPage;
   title: string;
-  description: string;
 }): ReactElement {
   const { interval, options, select } = useRefreshInterval(page);
   return (
-    <ModalRow icon={icon} title={title} description={description}>
+    <ModalRow icon={icon} title={title}>
       <Segmented
         items={options.map((ms) => ({ key: String(ms), label: `${ms / 1000}s` }))}
         value={String(interval)}
@@ -117,9 +115,9 @@ function IntervalRow({
 
 
 /**
- * 网关状态行：原顶栏「运行中」信号迁入设置弹窗。
+ * 网关状态行：只读展示网关存活状态。
  *
- * 只读（与旧 GatewayStatus 同口径）：控制台本身就是网关进程的一部分，从页面启停
+ * 只读的原因：控制台本身就是网关进程的一部分，从页面启停
  * 网关会让页面当场不可达 —— 启停一律走本机终端 `mx`。
  */
 const STATE_LABEL: Record<string, string> = {
@@ -147,7 +145,7 @@ function GatewayRow(): ReactElement {
 }
 
 export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }): ReactElement {
-  // `["state"]` 轮询归布局层所有，这里只订阅同一份缓存（同 GatewayStatus）
+  // `["state"]` 轮询归布局层所有，这里只订阅同一份缓存
   const state = useQuery({ queryKey: ["state"], queryFn: api.getState });
   const qc = useQueryClient();
   const toast = useToast();
@@ -302,7 +300,7 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                   <div className="mb-3 mt-6 text-xs font-medium text-ink-faint">偏好设置</div>
                   <div className="divide-y divide-line">
                     {CAN_AUTOSTART && (
-                      <ModalRow icon={Power} title="开机自启动" description="登录 Windows 后自动启动并收进托盘">
+                      <ModalRow icon={Power} title="开机自启动">
                         <Switch
                           checked={autostart === true}
                           disabled={autostart === null}
@@ -311,8 +309,8 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                         />
                       </ModalRow>
                     )}
-                    <IntervalRow icon={RefreshCw} page="accounts" title="账号池刷新间隔" description="渠道卡与额度的刷新节奏" />
-                    <IntervalRow icon={ScrollText} page="logs" title="请求日志刷新间隔" description="日志列表与统计的刷新节奏" />
+                    <IntervalRow icon={RefreshCw} page="accounts" title="账号池刷新间隔" />
+                    <IntervalRow icon={ScrollText} page="logs" title="请求日志刷新间隔" />
                   </div>
                 </div>
               )}
@@ -321,7 +319,7 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                 <div>
                   <div className="mb-3 text-xs font-medium text-ink-faint">渠道开关</div>
                   <p className="mb-3 text-xs text-ink-faint">
-                    关闭的渠道从账号池隐藏、不参与选路；凭据与登录态保留，勾回来即恢复。
+                    关闭的渠道不参与选路，凭据保留。
                   </p>
                   <div className="divide-y divide-line">
                     {(state.data?.channel_toggles ?? []).map((t) => (
@@ -344,7 +342,7 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                 <div>
                   <div className="mb-3 text-xs font-medium text-ink-faint">显示</div>
                   <div className="divide-y divide-line">
-                    <ModalRow icon={Palette} title="主题" description="跟随系统或固定深浅">
+                    <ModalRow icon={Palette} title="主题">
                       <Segmented items={THEME_ITEMS} value={mode} onChange={select} label="主题模式" />
                     </ModalRow>
                   </div>
@@ -356,14 +354,14 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                   <div className="mb-3 text-xs font-medium text-ink-faint">信息</div>
                   <div className="divide-y divide-line">
                     {base_url && (
-                      <ModalRow icon={Server} title="网关地址" description="客户端接入地址">
+                      <ModalRow icon={Server} title="网关地址">
                         <span className="inline-flex max-w-full items-center gap-1 overflow-hidden rounded-lg border border-line bg-canvas py-0.5 pl-2.5 pr-0.5 font-mono text-xs text-ink-soft">
                           <span className="truncate">{base_url}</span>
                           <CopyButton value={base_url} label="复制 base_url" />
                         </span>
                       </ModalRow>
                     )}
-                    <ModalRow icon={GithubMark} title="GitHub" description="源码仓库与版本发布">
+                    <ModalRow icon={GithubMark} title="GitHub">
                       <a
                         href={REPO_URL}
                         target="_blank"
@@ -375,7 +373,7 @@ export function SettingsModal({ open, onOpenChange }: { open: boolean; onOpenCha
                       </a>
                     </ModalRow>
                     {IS_DESKTOP && webUrl && (
-                      <ModalRow icon={ExternalLink} title="Web 控制台" description="在默认浏览器打开本页">
+                      <ModalRow icon={ExternalLink} title="Web 控制台">
                         <a
                           href={webUrl}
                           target="_blank"

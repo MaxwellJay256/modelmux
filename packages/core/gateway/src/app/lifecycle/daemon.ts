@@ -486,14 +486,21 @@ export async function status(
   // 凭证：渠道级只报该渠道；仓库级逐渠道（顶层 present = 任一有凭证）
   const list = scopeChannels(scope);
   const perChannel = list.map((channel) => {
+    // 三态：有 / 未登录 / 读取失败。读盘故障不能折叠成「未登录」—— 诊断命令是用户
+    // 自查的第一入口，显示「无」会引导他白跑一遍 login（修不了权限问题）。
     let present = false;
+    let readError: string | null = null;
     try {
       runInChannel(channel.config.cid, () => channel.cred.load());
       present = true;
-    } catch {
-      present = false;
+    } catch (err) {
+      const isNotLoggedIn = err instanceof channel.cred.NotLoggedInError;
+      if (!isNotLoggedIn) {
+        readError = String(err);
+        console.error(`[status] credential unreadable (${channel.config.cid}): ${String(err)}`);
+      }
     }
-    return { cid: channel.config.cid, display: channel.upstream.DISPLAY_NAME, present };
+    return { cid: channel.config.cid, display: channel.upstream.DISPLAY_NAME, present, read_error: readError };
   });
   const credentialsPresent = perChannel.some((c) => c.present);
 
@@ -620,13 +627,19 @@ export async function models(
   return 0;
 }
 
+/** 凭据读盘故障（EACCES / EPERM / EBUSY / EIO）：与「未登录」区分，引导修权限而非重新登录。 */
+function credentialReadFailure(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === "EACCES" || code === "EPERM" || code === "EBUSY" || code === "EIO";
+}
+
 /**
  * 查询账号剩余额度（直接走上游 billing，不经本地网关）。
  *
  * 仓库级（多渠道）时逐渠道查询：某个渠道没有额度端点或未登录只影响它自己。
  *
  * `--accounts`（或单渠道池内 ≥2 个账号）时**逐账号**再查一遍，一个人读的额度
- * 必须能分辨「哪个账号还剩多少」—— 额度是账号级的（见 docs/ACCOUNT-ROTATION.md §1）。
+ * 忁须能分辨「哪个账号还剩多少」—— 额度是账号级的（见 docs/ACCOUNT-ROTATION.md §1）。
  */
 export async function credits(options: { json?: boolean; cid?: string; accounts?: boolean } = {}): Promise<number> {
   const scope = scopeOf(options.cid);
@@ -656,7 +669,13 @@ export async function credits(options: { json?: boolean; cid?: string; accounts?
       }
     } catch (err) {
       failures += 1;
-      const hint = err instanceof cred.NotLoggedInError ? `，运行 ${label} login` : "";
+      // 三类错误三种引导：未登录 → 去登录；读盘故障 → 修权限 / 占用（重新登录修不了）；
+      // 其余（上游异常等）如实显示，不加误导性提示
+      const hint = err instanceof cred.NotLoggedInError
+        ? `，运行 ${label} login`
+        : credentialReadFailure(err)
+          ? `，凭据文件不可读（权限 / 占用），恢复后重试`
+          : "";
       const error = `${String(err)}${hint}`;
       results.push({ cid: channel.config.cid, ok: false, error });
       if (list.length === 1) {
@@ -896,17 +915,27 @@ export function readAppended(path: string, offset: number): { text: string; offs
   if (size === offset) return { text: "", offset };
   const len = size - offset;
   const buf = Buffer.alloc(len);
+  let filled = 0;
   try {
     const fd = openSync(path, "r");
     try {
-      readSync(fd, buf, 0, len, offset);
+      // `readSync` 允许短读（statSync 与 read 之间文件被轮转/截断、信号中断）：必须按
+      // **实际**读到的字节数截断缓冲区，否则尾部补零会被当成日志内容输出
+      // （与 supervisor.ts 的 readLastLogLine 同一口径）
+      while (filled < len) {
+        const n = readSync(fd, buf, filled, len - filled, offset + filled);
+        if (n <= 0) break;
+        filled += n;
+      }
     } finally {
       closeSync(fd);
     }
   } catch {
     return { text: "", offset };
   }
-  const nl = buf.lastIndexOf(0x0a);
+  if (filled <= 0) return { text: "", offset };
+  // 只在**真正读到**的字节里找末行边界：缓冲区尾部可能仍是零填充
+  const nl = buf.subarray(0, filled).lastIndexOf(0x0a);
   if (nl === -1) return { text: "", offset };
   return { text: buf.subarray(0, nl + 1).toString("utf8"), offset: offset + nl + 1 };
 }

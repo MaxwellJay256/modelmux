@@ -15,6 +15,7 @@ import {
 import type { QuotaPeriod } from "../lib/account-status";
 import { LoginModal } from "../components/LoginModal";
 import { buildModelRows, ModelRows } from "../components/ModelListCard";
+import { IntegratePanel } from "../components/IntegratePanel";
 import { PageHeader } from "../components/PageHeader";
 import { useRefreshInterval } from "../lib/refresh-interval";
 import { Select } from "../components/Select";
@@ -74,7 +75,7 @@ const SUMMARY_ORDER: Array<{ key: AccountStatus; label: string; dot: string }> =
  * 账号池页（渠道管理中枢）。
  *
  * 添加账号走**模态弹窗**（步骤化引导，仅关闭键可关）；账本按「渠道 × 账号」展示；
- * 授权链接 / 登录状态只出现在弹窗里，不再泄漏到其他页面。
+ * 授权链接 / 登录状态只出现在弹窗里。
  */
 export function Accounts(): ReactElement {
   const qc = useQueryClient();
@@ -246,7 +247,7 @@ export function Accounts(): ReactElement {
     const snapshot = state.data;
     if (!snapshot) return;
     // 登录结果读 `login_result`（`ui_state` 只表示网关状态，已不承载 done/error）。
-    // 回落分支兼容还没升级的后端。
+    // 回落分支仅防御异常载荷（当前后端的 ui_state 不承载登录结果）。
     const result =
       snapshot.login_result ?? (snapshot.ui_state === "done" ? "done" : snapshot.ui_state === "error" ? "error" : "idle");
     // 先见到中间态（不是 done/error）才算「本轮真的在跑」—— 否则那是上一次登录留下的结果
@@ -310,9 +311,9 @@ export function Accounts(): ReactElement {
 
   const loginChannels = logins.data ?? [];
   const snapshot = state.data;
-  /** 模型级渠道偏好（下拉的选项与选中项都来自快照，后端 5 秒一轮）。 */
+  /** 模型级渠道偏好（下拉的选项与选中项都来自快照，轮询归布局层所有）。 */
   const modelPrefs = snapshot?.model_prefs ?? [];
-  // 对外模型清单：与仪表盘原「模型列表」卡同口径（state 快照的 meta + 7 日 usage 的 TPS）
+  // 对外模型清单：state 快照的 meta + 7 日 usage 的 TPS（buildModelRows 组装）
   const modelRows = useMemo(
     () => buildModelRows(snapshot?.models, usageQuery.data?.models),
     [snapshot, usageQuery.data],
@@ -341,13 +342,12 @@ export function Accounts(): ReactElement {
 
   return (
     <div className="space-y-5 pb-10">
-      <PageHeader title="账号池" description="各渠道的凭据与额度" />
+      <PageHeader title="账号池" />
 
       {/*
         三态分开渲染：加载中 / **查询失败** / 确实没有账号池。
-        此前只有「loading 或 空串」，于是命令失败（HTTP 400，`post()` 抛错）与
-        「真的没有池」渲染成同一句「先添加账号」—— 良性空态把排查入口整个盖掉了
-        （同文件的 `billing` 查询专门为这个理由加了 `isError` 守卫，这里漏了）。
+        命令失败（HTTP 400，`post()` 抛错）若与「真的没有池」渲染成同一句
+        「先添加账号」，良性空态会把排查入口整个盖掉（同文件的 `billing` 查询同此口径）。
       */}
       {pools.isError && list.length === 0 ? (
         <div className="rounded-xl border border-line p-5 text-sm">
@@ -370,7 +370,7 @@ export function Accounts(): ReactElement {
               每个统计都是一个 chip（中性底 + 圆角 + `whitespace-nowrap`）——
               纯文字加竖线分隔在窄屏折行后像是「错位的两行」，chip 换行时逐行对齐，
               且标签与数字永远在同一个视觉单元里。 */}
-          {/* 吸顶：账号多时向下滚动仍能看到计数与筛选结果（背景铺满容器宽，内容不透出） */}
+          {/* 吸顶：账号多时向下滚动仍能看到计数（背景铺满容器宽，内容不透出） */}
           <div className="sticky top-0 z-20 -mx-4 flex flex-wrap items-center gap-1.5 bg-canvas px-4 py-2 sm:-mx-6 sm:px-6">
             <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-overlay/50 px-2.5 py-1 text-xs text-ink-soft">
               共 <span className="font-mono font-medium text-ink">{list.length}</span> 渠道 ·{" "}
@@ -399,57 +399,56 @@ export function Accounts(): ReactElement {
             段落**恒渲染**：模型清单由服务端从家族表派生（不再依赖 `/v1/models`
             的轮询结果），刚起进程 / 上游抖动时也不会整段消失，用户始终有处设置。
           */}
-          {/* 渠道偏好（左）+ 对外模型清单（右）一排两卡：偏好管「走哪家」，清单管「对外有什么」。
-              `lg` 起两卡**等宽 + 等高**（grid 默认 stretch）：清单只有两行内容，
-              吃掉剩余宽度时行内右侧空一大片；偏好卡被压到 264px 时模型名与下拉挤在一起。
-              等宽后两卡都不空旷，上下边缘也对齐。 */}
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          {/* 渠道偏好 + 对外模型清单**合并一卡**：偏好管「走哪家」，清单管「对外有什么」。
+              内部 lg 起左右两列（等宽），窄屏上下堆叠 —— 外壳一张卡，视觉上是一个整体。 */}
           <section className="panel p-3 min-w-0">
-            <h2 className="mb-2 text-xs font-medium text-ink-soft">渠道偏好</h2>
-            <div className="flex flex-col gap-2">
-              {modelPrefs.map((pref) => (
-                // 一个模型一行：「模型 → 偏好渠道」横着读，flex 两端对齐。
-                // 为什么不再分桌面/窄屏两套排布：此前桌面 176px 定列居中、窄屏两列网格
-                // 左对齐，模型名与下拉的对齐靠分支逻辑撑着，每加一档断点就错位一次
-                // （2026-11-14 实拍）；单行两端全档位同构，多模型按行自动扩展。
-                <div key={pref.model} className="flex items-center gap-3">
-                  <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{pref.model}</span>
-                  {/* 下拉定宽靠右（fixedWidth 按最长渠道名量宽）：切换选项时按钮不位移，
-                      名称截断让位；nowrap 防文字折行把高度顶高 */}
-                  <div className="flex-none [&_button]:whitespace-nowrap">
-                    <Select
-                      value={pref.preferred ?? ""}
-                      onChange={(cid) => setPref.mutate({ model: pref.model, cid })}
-                      label={`模型 ${pref.model} 优先渠道`}
-                      fixedWidth
-                      options={[
-                        { value: "", label: "自动" },
-                        ...pref.channels.map((cid) => ({ value: cid, label: cid })),
-                      ]}
-                    />
-                  </div>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <div className="min-w-0">
+                <h2 className="mb-2 text-xs font-medium text-ink-soft">渠道偏好</h2>
+                <div className="flex flex-col gap-2">
+                  {modelPrefs.map((pref) => (
+                    // 一个模型一行：「模型 → 偏好渠道」横着读，flex 两端对齐。
+                    // 单行两端全档位同构，多模型按行自动扩展。
+                    <div key={pref.model} className="flex items-center gap-3">
+                      <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{pref.model}</span>
+                      {/* 下拉定宽靠右（fixedWidth 按最长渠道名量宽）：切换选项时按钮不位移，
+                          名称截断让位；nowrap 防文字折行把高度顶高 */}
+                      <div className="flex-none [&_button]:whitespace-nowrap">
+                        <Select
+                          value={pref.preferred ?? ""}
+                          onChange={(cid) => setPref.mutate({ model: pref.model, cid })}
+                          label={`模型 ${pref.model} 优先渠道`}
+                          fixedWidth
+                          options={[
+                            { value: "", label: "自动" },
+                            ...pref.channels.map((cid) => ({ value: cid, label: cid })),
+                          ]}
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
+                {modelPrefs.every((pref) => pref.channels.length === 0) && (
+                  <p className="mt-2 text-xs text-ink-faint">
+                    池里暂无可路由的模型：先添加账号，或检查渠道是否已登录。
+                  </p>
+                )}
+              </div>
+              <div className="min-w-0 lg:border-l lg:border-line lg:pl-4">
+                <h2 className="mb-2 text-xs font-medium text-ink-soft">模型清单</h2>
+                <ModelRows rows={modelRows} />
+              </div>
             </div>
-            {modelPrefs.every((pref) => pref.channels.length === 0) && (
-              <p className="mt-2 text-xs text-ink-faint">
-                池里暂无可路由的模型：先添加账号，或检查渠道是否已登录。
-              </p>
-            )}
           </section>
-            <section className="panel p-3 min-w-0">
-              <h2 className="mb-2 text-xs font-medium text-ink-soft">模型清单</h2>
-              <ModelRows rows={modelRows} />
-            </section>
-          </div>
+
+          <IntegratePanel />
 
           {/*
-          {/*
-            渠道卡按**列**分发（瀑布流），不用 CSS Grid 的自动多列。
+            渠道卡按**列**分发（瀑布流，逐列轮流塞卡），不用 CSS Grid 的自动多列。
 
             为什么换：网格的行轨道高度 = 行内最高那张卡，一张卡展开就在同行另两张下方
             顶出一大片空白（实测展开 loomy 后该行 275px、另两张 140px，留 135px 白带）。
-            `items-start` 只阻止卡片被拉伸，治不了行高。改成「算列数 → 轮询分发」后，
+            `items-start` 只阻止卡片被拉伸，治不了行高。改成「算列数 → 轮流分发」后，
             每列是独立纵向流，任何一张卡长高只把**同一列**下面的卡往下推，没有白带。
 
             列数按容器实测宽算（`columnCount`，单卡最小 340px）：不写死断点，

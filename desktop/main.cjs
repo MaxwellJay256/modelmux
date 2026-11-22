@@ -27,13 +27,19 @@ const PORT = 4412;
 const BASE = `http://${HOST}:${PORT}`;
 
 /**
- * 存储根：`~/.modelmux`（共享层在 `MODELMUX_HOME` 未设时的默认值）。
+ * 存储根：`MODELMUX_HOME` > `~/.modelmux`（与共享层 `paths.resolveRoot` 同口径）。
  *
- * 安装版固定用它 —— 换机迁移靠整目录拷贝 `~/.modelmux`，不另设便携分支：
- * electron-builder 的 NSIS 安装器不设 `PORTABLE_EXECUTABLE_DIR`，便携打包壳又已废弃
- * （每次启动全量解压，见 docs/DESKTOP-APP.md），留着分支只会制造「配置了不生效」的坑。
+ * 必须认 `MODELMUX_HOME`：壳 fork 网关时把整个 `process.env` 传下去，所以网关会落在
+ * 变量指向的目录；壳自己若硬算 `~/.modelmux`，写的 `watchdog.pause` / 读的
+ * `setting.json` 就落到了网关与守护都不会看的地方 —— 托盘「退出 modelmux」会被外层
+ * 守护在下一轮重新拉起（用户明确要停，结果停不掉），启动主题也会读错文件。
+ *
+ * 不设便携分支：electron-builder 的 NSIS 安装器不设 `PORTABLE_EXECUTABLE_DIR`，
+ * 便携打包壳又已废弃（每次启动全量解压，见 docs/DESKTOP-APP.md）。
  */
 function homeDir() {
+  const override = process.env.MODELMUX_HOME;
+  if (typeof override === "string" && override.trim() !== "") return override;
   return path.join(os.homedir(), ".modelmux");
 }
 
@@ -181,7 +187,7 @@ if (!gotLock) {
     else startGateway();
     refreshTrayMenu();
 
-    await createWindow();
+    await ensureWindow();
 
     app.on("activate", () => {
       showWindow();
@@ -277,6 +283,20 @@ function startGateway() {
     if (/port \d+ is held/i.test(text)) gatewayFailureHint = text;
   });
 
+  // spawn 本身失败（exe 不可执行 / EACCES / 打包后脚本缺失）只触发 `error`，
+  // **不会**触发 `exit` —— 没有监听时它是主进程的未捕获异常，壳直接崩，用户连
+  // 错误页都看不到。这里记下原因并清掉状态；页面由 `waitForGateway` 走错误页。
+  child.on("error", (err) => {
+    console.error("[gateway] spawn failed:", err);
+    gatewayFailureHint = `无法启动网关进程：${String(err)}`;
+    if (gateway === child) {
+      gateway = null;
+      ownsGateway = false;
+    }
+    gatewayHealthy = false;
+    refreshTrayMenu();
+  });
+
   child.on("exit", (code, signal) => {
     if (gateway === child) {
       gateway = null;
@@ -352,10 +372,20 @@ function refreshTrayMenu() {
   );
 }
 
+/**
+ * 建窗单飞锁。
+ *
+ * `showWindow` 在 `win === null` 时重建窗口，而 `whenReady` 的主流程也会
+ * `await createWindow()`。启动空窗期（健康探测最长 3s）里用户再点一次快捷方式，
+ * 两条路径会各建一个 BrowserWindow —— 后者覆盖模块级 `win`，前者成为孤儿窗口
+ * （可见，但关闭按钮关的是另一个，且永不被销毁）。
+ */
+let creatingWindow = null;
+
 /** 显示并聚焦主窗口（窗口被关掉过就重建）。 */
 function showWindow() {
   if (!win) {
-    void createWindow();
+    void ensureWindow();
     return;
   }
   if (win.isMinimized()) win.restore();
@@ -416,6 +446,23 @@ function registerWindowIpc() {
   });
   // 系统深浅变化 → 窗口背景跟随（resize 边缘与首帧不再露出深色残边）
   nativeTheme.on("updated", () => win?.setBackgroundColor(windowBackground()));
+}
+
+/**
+ * 保证窗口存在（单飞）：并发调用共享同一次建窗，不会建出两个 BrowserWindow。
+ *
+ * 见 `creatingWindow` 的说明 —— 启动空窗期里 `showWindow` 与主流程会同时要求建窗。
+ */
+async function ensureWindow() {
+  if (win) return;
+  if (creatingWindow) {
+    await creatingWindow;
+    return;
+  }
+  creatingWindow = createWindow().finally(() => {
+    creatingWindow = null;
+  });
+  await creatingWindow;
 }
 
 async function createWindow() {

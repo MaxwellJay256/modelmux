@@ -12,6 +12,7 @@
 import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -44,8 +45,8 @@ import { writeAtomicFile } from "./secret-file.js";
  */
 export type AccessOutcome = "success" | "failure";
 
-/** 候选被剔除的原因（选路快照用）。 */
-export type RouteSkipReason = "auth" | "window" | "unauthorized" | "cooling";
+/** 候选被剔除的原因（选路快照用）；`cred_error` = 凭据读盘故障（与「未登录」区分）。 */
+export type RouteSkipReason = "auth" | "cred_error" | "window" | "unauthorized" | "cooling";
 
 /**
  * 一次请求的**选路快照**（落进访问日志，控制台展开详情可见）。
@@ -71,7 +72,7 @@ export interface RequestLog {
   method: string;
   path: string;
   startAt: number;
-  /** 客户端请求的模型 —— **规范 deepseek 名**（如 `deepseek-v4.1-flash`；别名已归并）。 */
+  /** 客户端请求的模型 —— **规范家族表裸名**（如 `deepseek-v4.1-flash`；别名已归并）。 */
   model?: string;
   /** 入站协议名（anthropic / responses；chat 透传路径不落字段）。 */
   protocol?: string;
@@ -461,9 +462,9 @@ export function finishRequestLog(log: RequestLog, status: number): void {
     log.outcome = status >= 200 && status < 400 ? "success" : "failure";
     if (status < 200) log.error ??= "no_status";
   }
-  // 成功的健康检查 / 模型轮询 / 指标抓取不记访问日志：Web 控制台每 5 秒拉一次 /v1/models、
-  // Prometheus 定时刮 /metrics，记下来只会把真正的 chat 请求淹没。失败与慢请求仍然记录。
-  const routine = log.path === "/health" || log.path === "/v1/models" || log.path === "/metrics";
+  // 成功的健康检查 / 模型轮询不记访问日志：Web 控制台每几秒拉一次 /v1/models，
+  // 记下来只会把真正的 chat 请求淹没。失败与慢请求仍然记录。
+  const routine = log.path === "/health" || log.path === "/v1/models";
   if (routine && log.outcome === "success" && !slowVerdictOfLog(log).slow) return;
   appendAccessFile(log.outcome, log);
 }
@@ -815,7 +816,6 @@ export interface AccessEntry {
  */
 export const MODEL_REQUEST_PATHS = ["/v1/chat/completions", "/v1/messages", "/v1/responses"] as const;
 
-/** 旧常量（OpenAI 路径）；统计口径已换成 `isModelRequestPath`。 */
 
 /** 是否为模型请求路径（统计只看是不是模型调用，不分协议）。 */
 export function isModelRequestPath(path: string | undefined): boolean {
@@ -923,7 +923,7 @@ function strArray(value: unknown): string[] | undefined {
   return value.every((v) => typeof v === "string") ? (value as string[]) : undefined;
 }
 
-const ROUTE_SKIP_REASONS: readonly RouteSkipReason[] = ["auth", "window", "unauthorized", "cooling"];
+const ROUTE_SKIP_REASONS: readonly RouteSkipReason[] = ["auth", "cred_error", "window", "unauthorized", "cooling"];
 
 function isSkipReason(value: string | undefined): value is RouteSkipReason {
   return value !== undefined && (ROUTE_SKIP_REASONS as readonly string[]).includes(value);
@@ -1038,8 +1038,17 @@ function readTail(file: string, maxBytes: number): { text: string; truncated: bo
     if (length <= 0) return { text: "", truncated: false };
     fd = openSync(file, "r");
     const buf = Buffer.alloc(length);
-    const read = readSync(fd, buf, 0, length, start);
-    let text = buf.subarray(0, read).toString("utf8");
+    // `readSync` 允许短读（statSync 与 read 之间文件被轮转/截断、信号中断）：必须按
+    // **实际**读到的字节数截断缓冲区，否则尾部补零会被当成日志内容解析
+    // （与 supervisor.ts 的 readLastLogLine 同一口径）
+    let filled = 0;
+    while (filled < length) {
+      const n = readSync(fd, buf, filled, length - filled, start + filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    if (filled <= 0) return { text: "", truncated: true };
+    let text = buf.subarray(0, filled).toString("utf8");
     if (start > 0) {
       const nl = text.indexOf("\n");
       if (nl < 0) return { text: "", truncated: true };
@@ -1746,6 +1755,7 @@ function appendPayload(record: AppendPayloadInput): void {
     }
     pruneOnce();
     const file = join(dir, "payload.log");
+    const firstWrite = !existsSync(file);
     rotateIfNeeded(file);
     payloadSeq += 1;
     const { data, bytes, truncated, invalidBytes, ...rest } = record;
@@ -1758,6 +1768,16 @@ function appendPayload(record: AppendPayloadInput): void {
       ...packBody(data, invalidBytes),
     });
     appendFileSync(file, `${line}\n`, "utf8");
+    // 首次 append 才创建文件，上面那轮 `enforcePermissions` 管不到它 —— 补一次 chmod，
+    // 否则含用户 prompt 的正文落成 umask 默认权限（通常 0644），被备份/同步工具
+    // 复制出去时权限即泄漏（父目录 0700 只掩护了本机访问）
+    if (firstWrite) {
+      try {
+        chmodSync(file, 0o600);
+      } catch {
+        /* Windows 上 chmod 不生效，忽略 */
+      }
+    }
   } catch {
     /* 抓包是旁路，写失败绝不影响请求 */
   }

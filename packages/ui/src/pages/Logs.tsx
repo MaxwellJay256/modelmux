@@ -45,8 +45,9 @@ import { Select, type SelectOption } from "../components/Select";
 import { Skeleton } from "./Dashboard";
 
 /** 选路剔除原因的展示文案（与后端 `RouteSkipReason` 一一对应）。 */
-const ROUTE_SKIP_LABEL: Record<"auth" | "window" | "unauthorized" | "cooling", string> = {
+const ROUTE_SKIP_LABEL: Record<"auth" | "cred_error" | "window" | "unauthorized" | "cooling", string> = {
   auth: "未登录",
+  cred_error: "凭据读取失败",
   window: "超窗",
   unauthorized: "凭据失效",
   cooling: "冷却中",
@@ -800,7 +801,7 @@ export function Logs(): ReactElement {
   useEffect(() => {
     if (pageNum > totalPages) setPageNum(totalPages);
   }, [pageNum, totalPages]);
-  const dirty = date !== "" || outcome !== "" || cid !== "" || model !== "";
+  const dirty = date !== "all" || outcome !== "" || cid !== "" || model !== "";
   /** 筛选变化必须回第 1 页：偏移量是跟着筛选走的。 */
   const resetToFirstPage = (): void => setPageNum(1);
   /** 每页条数变化：持久记忆 + 回第 1 页（偏移量跟着 pageSize 走）。 */
@@ -820,7 +821,7 @@ export function Logs(): ReactElement {
   // （`overflow-hidden`）并给内层确定高度，纵向滚动只属于下方表格区（见 LogTable）。
   return (
     <div className="flex h-full min-h-0 flex-col gap-4">
-      <PageHeader title="请求日志" description="每次模型请求的明细" />
+      <PageHeader title="请求日志" />
 
       {/* 统计条 + 筛选栏：页面已不滚动，天然常驻可见，不再需要 sticky */}
       <div className="panel space-y-3 p-3">

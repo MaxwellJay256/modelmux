@@ -444,6 +444,14 @@ async function startCallbackServer(port = CALLBACK_PORT): Promise<CallbackServer
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    // 只认回调路径：登录期间任何命中该端口的请求（浏览器预取、重复登录、探测）都会
+    // 走到这里，而 `flat` 里没有 token —— 不校验就等于「任意请求即可终结本次登录」，
+    // 本次登录会立刻失败在 `parseCallback` 的「no token」上（raccoon 校验 pathname）。
+    if (url.pathname !== CALLBACK_PATH) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("not found");
+      return;
+    }
     const flat: Record<string, string> = {};
     for (const [key, value] of url.searchParams) {
       if (!(key in flat)) flat[key] = value; // 同名参数取第一个
@@ -621,6 +629,8 @@ function persistSync(c: Credentials): void {
  * 从磁盘读取凭据。
  *
  * 文件缺失 / JSON 损坏 / access_token 为空时抛 NotLoggedInError。
+ * 读盘故障（EACCES / EBUSY 等）保持原始错误上抛 —— 折叠成「未登录」会误导用户白跑
+ * 重新登录，而重新登录修不了权限问题。
  * 老凭据缺设备指纹时就地补齐并同步回写（设备指纹是请求硬需求），
  * 而不是拒绝整条凭据。
  */
@@ -628,8 +638,9 @@ export function load(): Credentials {
   let raw: string;
   try {
     raw = readFileSync(credentialsPath(), "utf8");
-  } catch {
-    throw new NotLoggedInError();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") throw new NotLoggedInError();
+    throw err;
   }
   let data: unknown;
   try {

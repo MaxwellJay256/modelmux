@@ -122,7 +122,7 @@ export interface UiSnapshot {
   /**
    * 对外模型池的**「模型 × 渠道」矩阵**：一个模型可能由多个渠道供给。
    *
-   * 模型 id 是 deepseek 裸名（不再有 `<cid>/` 前缀）；渠道凭 `cid` 列展示，
+   * 模型 id 是家族表裸名；渠道凭 `cid` 列展示，
    * 元数据取**该渠道**的值（同一模型在不同渠道倍率/规格可能不同）。
    */
   models: Array<{
@@ -360,8 +360,20 @@ function isLocalDirect(req: import("node:http").IncomingMessage): boolean {
 function isLoopbackHostHeader(req: import("node:http").IncomingMessage): boolean {
   const raw = req.headers["host"];
   if (typeof raw !== "string" || raw === "") return false;
-  const hostname = raw.split(":")[0]?.toLowerCase() ?? "";
-  return LOOPBACK_HOSTS.has(hostname) || LOOPBACK_HOSTS.has(`[${hostname}]`);
+  // IPv6 字面量形如 `[::1]:4412`：先取方括号段，按 `:` 切会把 `[::1]` 切成 `[`。
+  // 括号之后只允许空或 `:port` —— 否则 `[::1]evil.example` 这类畸形头会命中回环，
+  // 把「Host 必须是本机」的门禁让开。
+  const close = raw.startsWith("[") ? raw.indexOf("]") : -1;
+  let hostname: string;
+  if (close > 0) {
+    const rest = raw.slice(close + 1);
+    if (rest !== "" && !rest.startsWith(":")) return false;
+    hostname = raw.slice(0, close + 1);
+  } else {
+    hostname = raw.split(":")[0] ?? "";
+  }
+  const lowered = hostname.toLowerCase();
+  return LOOPBACK_HOSTS.has(lowered) || LOOPBACK_HOSTS.has(`[${lowered}]`);
 }
 
 /** 写操作同源校验（比对 host:port，避免只比 hostname 时跨端口请求被放行）。 */
@@ -382,25 +394,17 @@ function isSameOrigin(req: import("node:http").IncomingMessage, host: string): b
 /** 回环地址名单：本机直连判定与 Host / Origin 校验共用。 */
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
+/**
+ * `/api/commands` 请求体上限（字节）。
+ *
+ * 实际负载最大的是粘贴回调链接（一整条 URL）与短信验证码，16 KiB 有三个数量级余量。
+ * 这个端点没有鉴权（admin 判定在 body 解析之后才做），不设限就是一个可无限上传的
+ * 内存放大器 —— 与 `/api/theme` 的 1 KiB 上限同一道防线。
+ */
+const COMMAND_BODY_MAX = 16 * 1024;
+
 /** 总览里已留痕过「账号读取失败」的渠道（进程生命周期内一次）：防止 5s 轮询刷屏。 */
 const overviewAccountFailures = new Set<string>();
-
-/** 读一次 JSON 请求体（供 /api/providers 的 POST 用；超限按截断处理）。 */
-function readBody(req: import("node:http").IncomingMessage, onBody: (body: Record<string, unknown>) => void): void {
-  let body = "";
-  req.on("data", (chunk) => {
-    body += String(chunk);
-  });
-  req.on("end", () => {
-    let parsed: Record<string, unknown> = {};
-    try {
-      parsed = JSON.parse(body || "{}") as Record<string, unknown>;
-    } catch {
-      appendGateway("console body parse failed");
-    }
-    onBody(parsed);
-  });
-}
 
 /**
  * 把 console 路由体抽成**可挂载的 handler**，供两种形态复用：
@@ -429,12 +433,20 @@ export function createConsoleHandler(
     }
     const p = (suffix: string): string => `${prefix}${suffix}`;
 
-    // —— API 前置：Host 必须是本机 ——
+    // —— API 前置：必须是本机（对端回环 + Host 回环）——
     //
-    // 挡的是 DNS rebinding：浏览器把攻击者域名解析到 127.0.0.1 后，socket 对端必然是
-    // 回环（`isLocalDirect` 恒真），只有 Host / Origin 还保留着攻击者域名。所有 API
-    // （含只读的 state）都走这条；静态资源与 SPA 页面不校验，它们不含敏感数据。
+    // 两道判据缺一不可：
+    //   ① `isLocalDirect`（socket 对端）挡「网关绑到非回环地址」的远程访问 ——
+    //      远程客户端可以自带 `Host: 127.0.0.1` 把 Host 校验骗过去，只有对端地址不能伪造。
+    //   ② `isLoopbackHostHeader` 挡 DNS rebinding —— 那种情形对端必然是回环，
+    //      只有 Host / Origin 还留着攻击者域名。
+    // 所有 API（含只读的 state）都走这条；静态资源与 SPA 页面不校验，它们不含敏感数据。
     if (path.startsWith(p("/api/"))) {
+      if (!isLocalDirect(req)) {
+        appendGateway(`console api rejected non-loopback peer: ${req.socket.remoteAddress ?? "(none)"}`);
+        json(res, { ok: false, error: "请求来源主机被拒绝" }, 403);
+        return;
+      }
       if (!isLoopbackHostHeader(req)) {
         appendGateway(`console api rejected non-loopback Host: ${String(req.headers["host"] ?? "(none)")}`);
         json(res, { ok: false, error: "请求来源主机被拒绝" }, 403);
@@ -552,11 +564,26 @@ export function createConsoleHandler(
         json(res, { ok: false, error: "use POST" }, 405);
         return;
       }
+      // 同源校验：本路由无鉴权，缺它恶意网页可用 simple request 跨源打进来
+      if (!isSameOrigin(req, host)) {
+        json(res, { ok: false, error: "cross-origin rejected" }, 403);
+        return;
+      }
       let body = "";
+      let tooLarge = false;
       req.on("data", (chunk) => {
+        // 体积上限：theme 只需几字节，不设限时无鉴权端点可被无限上传吃爆内存
+        if (body.length > 1024) {
+          tooLarge = true;
+          return;
+        }
         body += String(chunk);
       });
       req.on("end", () => {
+        if (tooLarge) {
+          json(res, { ok: false, error: "body too large" }, 413);
+          return;
+        }
         let mode: unknown;
         try {
           mode = (JSON.parse(body || "{}") as Record<string, unknown>)["mode"];
@@ -583,6 +610,10 @@ export function createConsoleHandler(
         json(res, { ok: false, error: "use POST" }, 405);
         return;
       }
+      if (!isSameOrigin(req, host)) {
+        json(res, { ok: false, error: "cross-origin rejected" }, 403);
+        return;
+      }
       if (!bridge.retryLogin) {
         json(res, { ok: false, error: "not ready" }, 503);
         return;
@@ -604,10 +635,23 @@ export function createConsoleHandler(
         return;
       }
       let body = "";
+      let tooLarge = false;
       req.on("data", (chunk) => {
+        // 体积上限：命令体最大的是粘贴回调链接 / 短信验证码，几 KiB 足够。
+        // 不设限时无鉴权端点（admin 判定在解析之后）可被无限上传吃爆内存 ——
+        // 与 /api/theme 同一道防线。
+        if (tooLarge) return;
+        if (body.length + chunk.length > COMMAND_BODY_MAX) {
+          tooLarge = true;
+          return;
+        }
         body += String(chunk);
       });
       req.on("end", () => {
+        if (tooLarge) {
+          json(res, { ok: false, error: "body too large" }, 413);
+          return;
+        }
         void (async () => {
           let parsed: { action?: unknown; cid?: unknown; args?: unknown };
           try {

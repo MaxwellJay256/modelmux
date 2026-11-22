@@ -53,12 +53,11 @@ function chatHostRotator(channel: Channel): (() => boolean) | undefined {
 // ── 路由 ──────────────────────────────────────────────────────────────────────
 
 /**
- * API key 预检：guard 未注入（默认本机形态）直通，请求路径零变化。
+ * API key 预检：guard 未注入（仅测试 / 漏装配，装配点 store-bootstrap）直通。
  *
- * 启用后依次判：key 是否有效 → 模型是否在白名单 → 每分钟请求上限。
- * 白名单与限流都对**归一后的对外模型名**判定（角色名/别名先过家族表）。
- * 模型解析不出来（未知模型）时不拦 —— 让下游照常回 400 unknown_model，
- * 避免鉴权层把一个明确的路由错误伪装成权限错误。
+ * 只判「key 是否有效」：无效回 401。模型白名单与每分钟限流是多租户时代的产物，
+ * 本机单人形态没有第二个租户可限，已从契约面移除 —— 路由错误（未知模型）由
+ * 下游照常回 400，鉴权层不再掺和模型解析。
  */
 let guardMissingWarned = false;
 
@@ -69,46 +68,49 @@ function noteGuardMissing(): void {
   console.error("[modelmux] api key guard 未装配：对话端点当前不校验 API key（仅测试 / 漏装配时出现）");
 }
 
+/**
+ * 从请求头取 API key。
+ *
+ * 两种形态都要认：OpenAI 系客户端发 `Authorization: Bearer <key>`，
+ * 而 Anthropic 官方 SDK（含 Claude Code 配 `ANTHROPIC_API_KEY`）默认发
+ * `x-api-key: <key>`、完全不带 Authorization —— 只认前者会让「key 正确也回 401」，
+ * 且表现为「能数 token（该端点免鉴权）、不能对话」的怪象。
+ */
+function apiKeyOf(req: IncomingMessage): string | null {
+  const auth = String(req.headers.authorization ?? "");
+  if (auth.startsWith("Bearer ")) {
+    const bearer = auth.slice(7).trim();
+    if (bearer !== "") return bearer;
+  }
+  const raw = req.headers["x-api-key"];
+  const single = Array.isArray(raw) ? raw[0] : raw;
+  const key = typeof single === "string" ? single.trim() : "";
+  return key === "" ? null : key;
+}
+
 async function withApiKeyGuard(
   req: IncomingMessage,
   res: ServerResponse,
-  model: string,
   next: () => Promise<void>,
 ): Promise<void> {
   const guard = apiKeyGuard();
   if (guard === null) {
-    // 门禁未装配：放行，但**不静默** —— 每个进程只告警一次，并在启动自检里点명。
+    // 门禁未装配：放行，但**不静默** —— 每个进程只告警一次。
     //
     // 为什么不直接拒绝：本机形态的装配点是 `store-bootstrap.bootstrapStore()`，
     // 而大量单元 / 集成用例直接 `makeApp()` 起服务（不跑 bootstrap），一刀切 503
-    // 会让这些用例整体失效。真正要防的是「生产路径漏装配还无人知晓」，所以这里
-    // 留痕；同时 `assertApiKeyGuardInstalled()` 供启动流程断言。
+    // 会让这些用例整体失效。真正要防的是「生产路径漏装配还无人知晓」，所以这里留痕。
     noteGuardMissing();
     await next();
     return;
   }
-  const resolved = resolveInboundModel(model);
-  const canonical = resolved.target ?? null;
-  const auth = String(req.headers.authorization ?? "");
-  const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
-  const decision = await guard.check(apiKey, canonical);
+  const decision = await guard.check(apiKeyOf(req));
   if (!decision.ok) {
-    const code = decision.reason === "invalid" ? 401 : decision.reason === "forbidden" ? 403 : 429;
-    const type =
-      decision.reason === "invalid" ? "authentication_error" : decision.reason === "forbidden" ? "permission_error" : "rate_limit_error";
-    writeJsonError(res, code, type, decision.message);
+    writeJsonError(res, 401, "authentication_error", decision.message);
     return;
   }
   await next();
 }
-
-/**
- * 失败后**允许**先查账单再换号的错误码。
- *
- * 集合本体在 `pool/account-rotate.ts` —— 产出点（`attempt.ts` 的额度短路与上游额度
- * 错误体）、判据（那里的快照例外）、这里三处必须共用同一份定义。
- * 2026-11-02 的教训：改名只改了产出点，这里留旧码，自动换号静默失效。
- */
 
 export async function handleChat(
   req: IncomingMessage,
@@ -118,8 +120,8 @@ export async function handleChat(
   // A 段：请求解析与校验（已应答则直接返回）
   const parsed = await parseChatRequest(req, res);
   if (!parsed) return;
-  // 统计与正文快照在门禁通过后补记（此前在解析阶段落盘，被拒请求的明文会长期留盘）
-  await withApiKeyGuard(req, res, parsed.model, () => {
+  // 统计与正文快照在门禁通过后补记：未通过门禁的请求（401）明文不落盘
+  await withApiKeyGuard(req, res, () => {
     noteAfterAuth(res, parsed.payload, parsed.model, parsed.messages, parsed.raw);
     return dispatchChat(parsed, res, opts, null);
   });
@@ -201,7 +203,7 @@ export async function handleMessages(
   const model = resolved.target;
   attachProtocol(res, anthropicProtocol, model);
   // 补记放在门禁通过之后（未认证 / 模型非法的请求不留正文）
-  await withApiKeyGuard(req, res, model, () => {
+  await withApiKeyGuard(req, res, () => {
     noteAfterAuth(res, text.payload, model, text.messages, parsedBody.raw);
     return dispatchChat(
       {
@@ -240,7 +242,7 @@ export async function handleResponses(
   const model = resolved.target;
   attachProtocol(res, responsesProtocol, model);
   // 补记放在门禁通过之后（未认证 / 模型非法的请求不留正文）
-  await withApiKeyGuard(req, res, model, () => {
+  await withApiKeyGuard(req, res, () => {
     noteAfterAuth(res, text.payload, model, text.messages, parsedBody.raw);
     return dispatchChat(
       {
