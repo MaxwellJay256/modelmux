@@ -127,10 +127,15 @@ if (existsSync(CHANNELS_DIR)) {
       );
       continue;
     }
-    // 两个必备节（docs/channels/README.md「写作分工」：每渠道必须成节存在，便于横向对照）
-    for (const section of ["### 怎么测这个渠道", "### 端到端测试覆盖"]) {
-      if (!readText(doc).includes(section)) {
-        problems.push(`docs/channels/${entry.name}/PROTOCOL.md —— 缺必备节「${section}」`);
+    // 两个必备节（docs/channels/README.md「写作分工」：每渠道必须成节存在，便于横向对照）。
+    // 判据是「节存在」，只约束行首与可选编号前缀；节名之后允许空白、括号、冒号这类
+    // 补充说明（`### 怎么测这个渠道（附示例）` 算数），但必须是词边界 ——
+    // 否则 `### 怎么测这个渠道的常见误区`、`### 端到端测试覆盖率统计` 这类并非目标节的
+    // 标题也会被判定为「节存在」，真正缺失或改名的节就此漏过。
+    for (const section of ["怎么测这个渠道", "端到端测试覆盖"]) {
+      const pattern = new RegExp(`^#{3,4}\\s+(?:[\\d.]+\\s+)?${section}(?=[\\s（(：:]|$)`, "m");
+      if (!pattern.test(readText(doc))) {
+        problems.push(`docs/channels/${entry.name}/PROTOCOL.md —— 缺必备节「### ${section}」`);
       }
     }
   }
@@ -242,6 +247,430 @@ function checkSourceRefs(rel) {
 for (const rel of candidates) {
   if (ignored.has(rel)) continue;
   for (const d of checkSourceRefs(rel)) problems.push(`${rel}  ->  ${d}`);
+}
+
+// ── 章节层级：编号必须落在对应标题级别 ──────────────────────────────────────
+// 失效形态（2026-11 渠道文档整治实测，七篇里五篇命中）：
+//   ① h2 带 `1.1` 形态的二级编号 —— 小节被提升成与父节同级，目录里层级是反的；
+//   ② h3 带 `1.1.1` 形态 —— 同上，差一级；
+//   ③ h4 无三级编号 —— 并列小标题无法被引用，也无从在目录里定位；
+//   ④ 有编号的 h2 标题超长 —— 编号存在的意义是「能被一句话指代」，塞进 file:line 就废了。
+// 只查有编号的文档（整篇用陈述式标题的文档不受约束），避免逼所有人改标题风格。
+// 围栏判定按 CommonMark：``` 开的围栏只能被 ``` 关，~~~ 开的只能被 ~~~ 关，
+// 且关闭标记不短于开启标记。只按「行首是 ``` 或 ~~~」翻转的话，``` 围栏里出现一行
+// `~~~` 就会提前关闭，其后的代码被当正文（漏检）或正文被当代码（误报）。
+// 「有没有编号」的预判与标题收集共用同一批非围栏行 —— 预判若直接扫原始行，
+// 文档里一段示例代码含 `## 1.` 就会让整篇被当成编号文档，随后所有未编号 h4 全部误报。
+function checkHeadingLevels(rel) {
+  const abs = join(workspaceRoot, rel);
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const prose = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+  text.split("\n").forEach((line, i) => {
+    const m = /^(`{3,}|~{3,})/.exec(line.trim());
+    if (m) {
+      if (fenceChar === "") {
+        fenceChar = m[1][0];
+        fenceLen = m[1].length;
+      } else if (m[1][0] === fenceChar && m[1].length >= fenceLen) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      return;
+    }
+    if (fenceChar === "") prose.push({ line, no: i + 1 });
+  });
+
+  if (!prose.some((p) => /^## \d+\./.test(p.line))) return [];
+
+  // 有编号 h2 的文档，h3 也必须编号 —— 同一篇里「有的小节编号、有的不编号」最难查：
+  // 读者按编号找得到 §5.1，却找不到紧挨着的「窗口聚合必须加权」是第几节。
+  // 例外：h3 是清单项（渠道名、文件名等并列实体）时不该编号，这类标题短且无动词短语，
+  // 无法机械区分 —— 故只在同节已有编号 h3 时才要求兄弟 h3 也编号。
+  const numberedH3Parents = new Set();
+  for (const { line } of prose) {
+    const m = /^###\s+(\d+)\.(\d+)/.exec(line);
+    if (m) numberedH3Parents.add(m[1]);
+  }
+  const h2Of = [];
+  let cur = "";
+  for (const { line } of prose) {
+    const h2 = /^##\s+(\d+)\./.exec(line);
+    if (h2) cur = h2[1];
+    h2Of.push(cur);
+  }
+
+  const found = [];
+  prose.forEach(({ line, no }, idx) => {
+    const m = /^(#{2,4})\s+(.+)$/.exec(line);
+    if (!m) return;
+    const level = m[1].length;
+    const title = m[2].trim();
+    if (level === 2 && /^\d+\.\d/.test(title)) {
+      found.push(`L${no} 二级标题带小节编号（应为 h3）：${title}`);
+    } else if (level === 3 && /^\d+\.\d+\.\d/.test(title)) {
+      found.push(`L${no} 三级标题带三级编号（应为 h4）：${title}`);
+    } else if (level === 3 && !/^\d+\.\d+/.test(title) && numberedH3Parents.has(h2Of[idx])) {
+      found.push(`L${no} 同节其他 h3 已编号，此条缺二级编号：${title}`);
+    } else if (level === 4 && !/^\d+\.\d+\.\d+/.test(title)) {
+      found.push(`L${no} 四级标题缺三级编号：${title}`);
+    } else if (level === 2 && /^\d+\./.test(title) && title.length > 42) {
+      found.push(`L${no} 编号标题超过 42 字（${title.length}）：${title}`);
+    }
+  });
+  return found;
+}
+
+for (const rel of candidates) {
+  if (ignored.has(rel)) continue;
+  for (const d of checkHeadingLevels(rel)) problems.push(`${rel}  ->  ${d}`);
+}
+
+// ── 表格：单元格里不许装段落 ────────────────────────────────────────────────
+// 表格是并列数据的载体，不是段落容器。一格塞 3 句以上时，读者的眼睛要在
+// 一根竖线里来回找断句 —— 实测最重的一格 276 字，整张表退化成「带竖线的散文」。
+// 只查这一条：≥3 句。列数与行数不设限 —— 模型规格表、字段字典、缺口清单
+// 天然是 6 列 25 行，那正是表格该有的样子，机械限宽会逼作者把数据拆散。
+// 判据可绕过：把论证移到表下，或拆成编号条目。
+const TABLE_SENTENCE_MAX = 2;
+
+function checkTableCells(rel) {
+  const abs = join(workspaceRoot, rel);
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const found = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+  let inTable = false;
+  text.split("\n").forEach((line, i) => {
+    const fm = /^(`{3,}|~{3,})/.exec(line.trim());
+    if (fm) {
+      if (fenceChar === "") {
+        fenceChar = fm[1][0];
+        fenceLen = fm[1].length;
+      } else if (fm[1][0] === fenceChar && fm[1].length >= fenceLen) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      inTable = false;
+      return;
+    }
+    if (fenceChar !== "") return;
+
+    const t = line.trim();
+    if (!(t.startsWith("|") && t.endsWith("|"))) {
+      inTable = false;
+      return;
+    }
+    const cells = t.slice(1, -1).split("|");
+    if (cells.every((c) => /^:?-{2,}:?$/.test(c.trim()))) {
+      inTable = true;
+      return;
+    }
+    if (!inTable) return; // 表头行
+    for (const cell of cells) {
+      const sentences = (cell.match(/。/g) || []).length;
+      if (sentences > TABLE_SENTENCE_MAX) {
+        found.push(
+          `L${i + 1} 表格单元格含 ${sentences} 句（上限 ${TABLE_SENTENCE_MAX}）——` +
+            `把论证移到表下，或拆成编号条目：${cell.trim().slice(0, 40)}…`,
+        );
+        break;
+      }
+    }
+  });
+  return found;
+}
+
+for (const rel of candidates) {
+  if (ignored.has(rel)) continue;
+  for (const d of checkTableCells(rel)) problems.push(`${rel}  ->  ${d}`);
+}
+
+// ── 代码围栏：必须三个反引号以上，且成对 ────────────────────────────────────
+// 两个反引号当围栏不是合法 Markdown —— 渲染器把整块当行内代码，几十行挤成一段。
+// 实测 traecn 一篇里 20 处，其中 19 处写成了 ``。这类错误在源码里看不出来
+// （`` 与 ``` 只差一个字符），只有渲染后才暴露，故机械查。
+function checkFences(rel) {
+  const abs = join(workspaceRoot, rel);
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const found = [];
+  let open = false;
+  let openChar = "";
+  let openLen = 0;
+  text.split("\n").forEach((line, i) => {
+    const t = line.trim();
+    if (/^``[^`]/.test(t)) {
+      found.push(`L${i + 1} 围栏只有两个反引号（Markdown 要求 ≥3）：${t.slice(0, 30)}`);
+      return;
+    }
+    const m = /^(`{3,}|~{3,})/.exec(t);
+    if (!m) return;
+    if (!open) {
+      open = true;
+      openChar = m[1][0];
+      openLen = m[1].length;
+    } else if (m[1][0] === openChar && m[1].length >= openLen) {
+      open = false;
+    }
+  });
+  if (open) found.push(`围栏未闭合（${openChar.repeat(openLen)} 开头后再无同种标记）`);
+  return found;
+}
+
+for (const rel of candidates) {
+  if (ignored.has(rel)) continue;
+  for (const d of checkFences(rel)) problems.push(`${rel}  ->  ${d}`);
+}
+
+// ── 长散文段：连续 5 行以上且 400 字以上 ────────────────────────────────────
+// 这类段落里通常并列着 3~5 条独立规则（实测最长 657 字），读者要在段落里找断句。
+// 判据不是「不许长」，而是「并列的规则要分点」：把段落拆成 1/2/3 或小标题即可通过。
+// 代码块、表格、列表、引用块、标题都不计入连续散文。
+const PROSE_MAX_LINES = 4;
+const PROSE_MAX_CHARS = 399;
+
+function checkProseBlocks(rel) {
+  const abs = join(workspaceRoot, rel);
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const found = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+  let block = { lines: 0, chars: 0, start: 0 };
+
+  const flush = () => {
+    if (block.lines > PROSE_MAX_LINES && block.chars > PROSE_MAX_CHARS) {
+      found.push(
+        `L${block.start} 连续散文 ${block.lines} 行 / ${block.chars} 字 —— ` +
+          `并列规则改 1/2/3 分点或拆小标题`,
+      );
+    }
+    block = { lines: 0, chars: 0, start: 0 };
+  };
+
+  text.split("\n").forEach((line, i) => {
+    const t = line.trim();
+    const fm = /^(`{3,}|~{3,})/.exec(t);
+    if (fm) {
+      if (fenceChar === "") {
+        fenceChar = fm[1][0];
+        fenceLen = fm[1].length;
+      } else if (fm[1][0] === fenceChar && fm[1].length >= fenceLen) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      flush();
+      return;
+    }
+    if (fenceChar !== "") return;
+
+    // 空行 / 标题 / 表格 / 列表 / 引用 / 图片 都打断散文段
+    if (t === "" || /^#{1,6}\s/.test(t) || t.startsWith("|") || t.startsWith(">") || t.startsWith("![")) {
+      flush();
+      return;
+    }
+    if (/^([-*+]|\d+\.)\s/.test(t)) {
+      flush();
+      return;
+    }
+    if (block.lines === 0) block.start = i + 1;
+    block.lines += 1;
+    block.chars += [...t].length;
+  });
+  flush();
+  return found;
+}
+
+for (const rel of candidates) {
+  if (ignored.has(rel)) continue;
+  for (const d of checkProseBlocks(rel)) problems.push(`${rel}  ->  ${d}`);
+}
+
+// ── 章节引用：`文档.md §x.y` 的跨篇引用必须指向真实存在的章节 ────────────────
+// 文档重写会删章节，引用却留在别处 —— 实测 MODEL-SPECS 重写后只留 §0~§4，
+// 5 篇文档仍引用它的 §5 / §6，读者按引用找过去扑空。
+// 只查「链接 + §编号」的跨篇形态；同篇 §x.y 与裸 §x 不查（前者噪声大，后者太泛）。
+const SECTION_REF_RE = /\[([\w.-]+\.md)\]\([^)]*\)\s*(?:的)?\s*§(\d+(?:\.\d+)*)/g;
+
+function collectSections(abs) {
+  const nums = new Set();
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return nums;
+  }
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (const line of text.split("\n")) {
+    const fm = /^(`{3,}|~{3,})/.exec(line.trim());
+    if (fm) {
+      if (fenceChar === "") {
+        fenceChar = fm[1][0];
+        fenceLen = fm[1].length;
+      } else if (fm[1][0] === fenceChar && fm[1].length >= fenceLen) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      continue;
+    }
+    if (fenceChar !== "") continue;
+    const m = /^#{2,4}\s+(\d+(?:\.\d+)*)[.．\s]/.exec(line);
+    if (m) nums.add(m[1]);
+  }
+  return nums;
+}
+
+const sectionCache = new Map();
+function sectionsOf(abs) {
+  if (!sectionCache.has(abs)) sectionCache.set(abs, collectSections(abs));
+  return sectionCache.get(abs);
+}
+
+// 文件名 → 绝对路径。同名文档（每个渠道都有自己的 PROTOCOL.md）必须优先取同目录的那份，
+// 否则渠道 FINDINGS 里的 `PROTOCOL.md §2.4` 会被解析到别的渠道的 PROTOCOL 上去。
+function resolveDocByName(fromAbs, docName) {
+  const sameDir = join(dirname(fromAbs), docName);
+  if (existsSync(sameDir)) return sameDir;
+  for (const abs of candidates) {
+    if (abs.split(/[\\/]/).pop() === docName) return abs;
+  }
+  return null;
+}
+
+function checkSectionRefs(rel) {
+  const abs = join(workspaceRoot, rel);
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const found = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+  text.split("\n").forEach((line, i) => {
+    const fm = /^(`{3,}|~{3,})/.exec(line.trim());
+    if (fm) {
+      if (fenceChar === "") {
+        fenceChar = fm[1][0];
+        fenceLen = fm[1].length;
+      } else if (fm[1][0] === fenceChar && fm[1].length >= fenceLen) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      return;
+    }
+    if (fenceChar !== "") return;
+    for (const m of line.matchAll(SECTION_REF_RE)) {
+      const [, docName, num] = m;
+      const target = resolveDocByName(abs, docName);
+      if (!target) continue; // 链接可达性由 checkLinks 负责
+      const nums = sectionsOf(target);
+      if (nums.size === 0) continue; // 无编号章节的文档不适用
+      const hit = [...nums].some((s) => s === num || s.startsWith(num + "."));
+      if (!hit) {
+        found.push(`L${i + 1} 引用 ${docName} §${num}，该文档无此章节`);
+      }
+    }
+  });
+  return found;
+}
+
+for (const rel of candidates) {
+  if (ignored.has(rel)) continue;
+  for (const d of checkSectionRefs(rel)) problems.push(`${rel}  ->  ${d}`);
+}
+
+// ── 目录锚点：`## 目录` 里列出的链接必须指到真实的二级标题 ──────────────────
+// 加编号、改标题、拆章节都会让锚点失效，而失效的目录点下去只是「不跳转」，
+// 没有任何报错 —— 读者以为文档短，其实是锚点死了。
+// 锚点算法按 GitHub：小写 → 去标点（`/` 直接删、两侧空格各转连字符）→ 空格转 `-`。
+function githubAnchor(title) {
+  return title
+    .toLowerCase()
+    .replace(/[`*_~]/g, "")
+    .replace(/[^\w\u4e00-\u9fa5\s-]/g, "")
+    .replace(/\s/g, "-");
+}
+
+function checkTocAnchors(rel) {
+  const abs = join(workspaceRoot, rel);
+  let text;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const found = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+  let inToc = false;
+  const anchors = new Set();
+  const entries = [];
+
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    const fm = /^(`{3,}|~{3,})/.exec(t);
+    if (fm) {
+      if (fenceChar === "") {
+        fenceChar = fm[1][0];
+        fenceLen = fm[1].length;
+      } else if (fm[1][0] === fenceChar && fm[1].length >= fenceLen) {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      continue;
+    }
+    if (fenceChar !== "") continue;
+
+    if (/^##\s*目录/.test(t)) {
+      inToc = true;
+      continue;
+    }
+    if (/^##\s/.test(t)) {
+      inToc = false;
+      anchors.add(githubAnchor(t.replace(/^##\s+/, "")));
+      continue;
+    }
+    if (inToc) {
+      const m = /\[([^\]]+)\]\(#([^)]+)\)/.exec(t);
+      if (m) entries.push({ text: m[1], anchor: m[2] });
+      else if (t !== "" && !/^[-*\d]/.test(t)) inToc = false;
+    }
+  }
+
+  for (const e of entries) {
+    if (!anchors.has(e.anchor)) {
+      found.push(`目录锚点 #${e.anchor}（${e.text}）无对应二级标题`);
+    }
+  }
+  return found;
+}
+
+for (const rel of candidates) {
+  if (ignored.has(rel)) continue;
+  for (const d of checkTocAnchors(rel)) problems.push(`${rel}  ->  ${d}`);
 }
 
 // ── 索引登记：新增文档必须登记，登记的必须存在 ─────────────────────────────

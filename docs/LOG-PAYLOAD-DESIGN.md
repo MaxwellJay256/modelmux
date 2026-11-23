@@ -1,9 +1,10 @@
 # 日志正文抓取：10MB 上限与截断兜底设计方案
 
-> 状态：**已实施**（2026-10-28）。上限与截断语义已收敛进 [LOGGING.md](./LOGGING.md) §9。
-> **本文提到的 `LogContextDialog.tsx` 已随上下文弹窗一并移除（2026-11-07）** —— §3.3 的 UI 部分
-> 只作设计依据留档；落盘侧（`clipPayload` / `packBody` / 截断语义）仍是当前实现，未受影响。
-> 问题出处：1.1MB 请求 body 被 `clipPayload` 按 256KB 截前段，**最新对话全丢**；截断后 JSON 不完整，上下文弹窗退化成整段原文，消息分类全失效。
+> 设计依据文档：规则已收敛进 [LOGGING.md](./LOGGING.md) §9，本文只保留取舍与实测。
+> §3.3 的 UI 部分对应已移除的上下文弹窗，仅作设计依据；落盘侧（`clipPayload` / `packBody` /
+> 截断语义）是当前实现。
+> 问题出处：1.1MB 请求 body 被 `clipPayload` 按 256KB 截前段，**最新对话全丢**；截断后 JSON
+> 不完整，上下文弹窗退化成整段原文，消息分类全失效。
 
 ## 1. 现状与问题
 
@@ -98,7 +99,7 @@ function clipPayload(body: Buffer | string) {
 3. 回归：256KB 内旧数据读取与弹窗无变化；
 4. `npm test` 全绿 + `npm run gate`。
 
-## 6. 为什么不用别的方式
+## 6. 未采用的方式
 
 - **「消息级折叠 + 保最近 10 条」原方案**（LOG-PAYLOAD-DESIGN 上一稿）：复杂度高
   （解析 JSON、按 role 分类、折叠占位、`clipped` 元信息、UI 联动），而 10MB 上限就

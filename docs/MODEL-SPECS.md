@@ -36,9 +36,9 @@
 {
   "version": 1,
   "models": {
-    "glm-5.3-flash": {
+    "kimi-k3.1-pro": {
       "contextWindow": 1000000,
-      "maxOutputTokens": 393216,
+      "maxOutputTokens": 100000,
       "inputModalities": ["text"],
       "effort": {
         "supportedLevels": ["high", "max"],
@@ -58,19 +58,19 @@
 
 ## 2. 写入方式
 
-### CLI：`mx model spec <模型名>`
+### 2.1 CLI：`mx model spec <模型名>`
 
 ```bash
-mx model spec glm-5.3-flash          # 查全局规格
+mx model spec kimi-k3.1-pro          # 查全局规格
 mx model spec deepseek-v4.1-flash   # 另一个家族成员
-mx model spec glm-5.3-flash --json  # JSON 输出
+mx model spec kimi-k3.1-pro --json  # JSON 输出
 ```
 
-### 手动写入
+### 2.2 手动写入
 
 直接编辑 `~/.modelmux/model-specs.json`，网关在下次请求时自动感知（mtime 缓存刷新），无需重启。
 
-### 联网搜索（推荐流程）
+### 2.3 联网搜索（推荐流程）
 
 1. 搜索 `模型名 + specification context window max output tokens`
 2. 打开官方文档确认数字

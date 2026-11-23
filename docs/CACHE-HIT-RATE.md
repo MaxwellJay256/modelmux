@@ -5,6 +5,17 @@
 实现落点：共享层归一化在 `packages/core/gateway/src/runtime/log-store.ts`（`tokensOf`），
 展示在 `packages/ui/src/lib/log-format.ts` 与各页面。
 
+## 目录
+
+- [1. 官方字段（DeepSeek 明文）](#1-官方字段deepseek-明文)
+- [2. 命中率公式](#2-命中率公式)
+- [3. 计费口径下的指标价值](#3-计费口径下的指标价值)
+- [4. 机制与边界](#4-机制与边界)
+- [5. 各渠道 usage 形态](#5-各渠道-usage-形态)
+- [6. 归一化规则（本仓库口径）](#6-归一化规则本仓库口径)
+- [7. 展示方案（**上游不给比率，展示层按计数折算**）](#7-展示方案上游不给比率展示层按计数折算)
+- [8. 参考来源与性质标注](#8-参考来源与性质标注)
+
 ## 1. 官方字段（DeepSeek 明文）
 
 来源：<https://api-docs.deepseek.com/api/create-chat-completion>、<https://api-docs.deepseek.com/guides/kv_cache>
@@ -32,14 +43,14 @@
 但对 Anthropic 形态不成立 —— 那里 `prompt_tokens`（= `input_tokens`）不含缓存读。
 本仓库统一取 `hit / (hit + miss)`，`miss` 按上游形态归一化（见 §6）。
 
-### 窗口聚合必须加权
+### 2.1 窗口聚合必须加权
 
 ```
 窗口命中率 = Σhit / Σ(hit + miss)        ← 正确
 窗口命中率 ≠ mean(每条请求的命中率)      ← 错误：长请求的权重被抹平
 ```
 
-## 3. 计费（这个指标为什么值得看）
+## 3. 计费口径下的指标价值
 
 命中输入价显著低于未命中（DeepSeek 官方定价页：`deepseek-flash` 命中 $0.003–0.006/M vs
 未命中 $0.15–0.3/M，差约 50x；`deepseek-v4-pro` 命中 $0.022–0.044/M vs 未命中 $0.66–1.32/M，
@@ -56,7 +67,7 @@
 | 流式 usage 只挂在最后一个 content chunk | 官方明文 |
 | 缓存是否按账号 / 端点隔离 | **官方未说明**（不要臆断；统计时按 渠道 × 模型 分组更稳） |
 
-### 导致不可比/误读的坑
+### 4.1 导致不可比或误读的坑
 1. **多轮对话前缀变化**：系统提示 / 工具集 / 历史消息任一处变动 → 前缀断裂 → 命中率骤降
 2. **<64 token 天然 0 命中**：纳入统计会拉低整体，宜单独打标
 3. **缓存过期**：隔夜或低频会话命中率天然偏低，跨时间窗聚合不可比
@@ -74,20 +85,20 @@
 | 渠道 | 有缓存字段 / 总条数 | 出现过的字段签名 | 加权命中率 |
 |---|---|---|---|
 | loomy | 13224 / 13674 | `prompt_tokens_details.cached_tokens` | 98.4% |
-| workbuddy | 4123 / 4227 | 两套风格全给（`prompt_cache_hit_tokens` + `miss` + `prompt_tokens_details.cached_tokens` + 顶层 `cached_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` + `prompt_cache_write_tokens`） | 96.9% |
+| workbuddy | 4123 / 4227 | 两套风格全给（7 个字段，见下） | 96.9% |
 | raccoon | 707 / 814 | `prompt_tokens_details.cached_tokens` | 86.0% |
-| lobsterai | 297 / 319 | `prompt_tokens_details.cached_tokens`；1 条另带 `prompt_cache_hit_tokens` + `miss` | 96.4% |
-| qodercn | 155 / 187 | `prompt_tokens_details.cached_tokens` | 86.1% |
 | catpaw | 0（历史）→ 已映射 | `prompt_tokens_details.cached_tokens` | 见 §5.2 |
 | traecn | **0** | 只有 `prompt_tokens` / `completion_tokens` / `total_tokens` | — |
 
+workbuddy 的 7 个缓存字段：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` / `prompt_tokens_details.cached_tokens` / 顶层 `cached_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` / `prompt_cache_write_tokens`。
+
 要点：
 
-- **缓存字段确实存在，且不是官方直连才有**：14 天 35413 条里 9 个渠道带回缓存字段，
+- **缓存字段确实存在，且不是官方直连才有**：2026-11-09 的 14 天 35413 条里 9 个渠道（含当时在册、现已下线的）带回缓存字段，
   其中多数是第三方聚合上游（loomy / raccoon 等），它们把模型侧的 KV cache 计数透传上来。
 - **字段是自洽的上游统计，不是被中途改写**：全渠道 **0 条 `hit > prompt`、0 条负值**；
   workbuddy 的 4123 条 DeepSeek 形态**全部**满足官方等式 `hit + miss == prompt`。
-- 同一渠道**混合形态**很常见（lobsterai 个别请求多给双字段、loomy 少数请求完全不给）——
+- 同一渠道**混合形态**很常见（loomy 少数请求完全不给缓存字段）——
   归一化必须**逐条按字段判断**，不能按渠道写死。
 - 同一渠道**不同模型**形态也可能不同：实测（2026-10-29）`loomy/spark-x2.6` 的 usage
   只有 `prompt_tokens` / `completion_tokens` / `total_tokens` + `points_consumed`，
@@ -116,11 +127,17 @@
 （用渠道包 `upstream.js` 的 `buildChatBody` / `buildChatHeaders` / `chatUrl` 自己发请求），
 直接看模型返回的**原始帧**：
 
-| 渠道 | 线协议 | 原始返回里的事实 |
+| 渠道 | 线协议 | 观察结果 |
 | --- | --- | --- |
-| workbuddy | openai | 末帧带完整 usage：`prompt_cache_hit_tokens: 0` / `prompt_cache_miss_tokens: 22`（**DeepSeek 形**），同时也有 `prompt_tokens_details.cached_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`；另每帧附带 `quota:{model,percent,reset_at,shared_models}` |
-| loomy | openai | 响应体是 **JSON 信封** `{code, desc, trace_id, data}`，SSE 流在 `data` 里 —— 不是裸 SSE |
-| traecn | custom | 直连回 **401**（`{code, message}`）—— 探针未带刷新后的凭据 |
+| workbuddy | openai | 末帧带完整 usage（DeepSeek 形 + 三种缓存字段），每帧附 `quota` 对象 |
+| loomy | openai | JSON 信封 `{code,desc,trace_id,data}`，SSE 在 `data` 里 |
+| traecn | custom | 直连回 401（探针未带刷新后凭据） |
+
+逐渠道的原始字段细节：
+
+- **workbuddy**：末帧带完整 usage：`prompt_cache_hit_tokens: 0` / `prompt_cache_miss_tokens: 22`（**DeepSeek 形**），同时也有 `prompt_tokens_details.cached_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`；另每帧附带 `quota:{model,percent,reset_at,shared_models}`
+- **loomy**：响应体是 **JSON 信封** `{code, desc, trace_id, data}`，SSE 流在 `data` 里 —— 不是裸 SSE
+- **traecn**：直连回 **401**（`{code, message}`）—— 探针未带刷新后的凭据
 
 结论：§6 的三种缓存形态判定与**真实上游帧**一致；`quota` 对象是上游在对话帧里就给的额度信息，
 与 §5.2 的账单端点是两条独立取数路径。
@@ -143,7 +160,7 @@
 命中率 = hit / (hit + miss)     ← miss 由形态推出，两种写法只有这一种是安全的
 ```
 
-**为什么不能用 `hit / prompt_tokens` 统一算**：③ 的 `input_tokens` 不含缓存读，
+**不能用 `hit / prompt_tokens` 统一算**：③ 的 `input_tokens` 不含缓存读，
 若沿用 `prompt_tokens`（= `input_tokens`）当分母，而 `cache_read` 又接近输入量，
 命中率会被算成接近 100% —— 这正是「满屏 100%」的成因。
 仅当上游只给 `prompt_tokens`、没有 `input_tokens` 时，才退回 `miss = prompt_tokens - hit`
@@ -152,16 +169,16 @@
 - **写缓存不计入命中**：`cache_creation_input_tokens` / `prompt_cache_write_tokens` /
   `cache_write_*_tokens` 语义是**为后续命中做写入**；在形态 ③ 里它是**分母**的一部分。
 - **三种「没有」要分开**，不可混为一谈：
-  | 情况 | 展示 |
-  |---|---|
-  | 无 usage（失败/未采集） | `—`（且不计入分母） |
-  | 有 usage 但无缓存字段（如 traecn） | `—` |
-  | 有缓存字段且 `hit = 0` | `0%`（这是**真实**的零命中） |
-  | 有 `hit` 但推不出分母 | `—`（只给绝对值，不给比率） |
+| 情况 | 展示 |
+|---|---|
+| 无 usage（失败/未采集） | `—`（且不计入分母） |
+| 有 usage 但无缓存字段（如 traecn） | `—` |
+| 有缓存字段且 `hit = 0` | `0%`（这是**真实**的零命中） |
+| 有 `hit` 但推不出分母 | `—`（只给绝对值，不给比率） |
 - **缺失不补 0** —— 把「没采集到」显示成「完全没命中」是错误信息
 - 窗口聚合只收**分母可推**的记录（`Σhit / Σ(hit+miss)`）；无缓存字段的渠道不进分母
 
-### 显示精度：统一两位小数
+### 6.1 显示精度：统一两位小数
 
 | 比率 | 显示 |
 |---|---|

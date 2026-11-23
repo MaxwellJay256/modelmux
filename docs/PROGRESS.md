@@ -23,7 +23,7 @@
 
 | cid | 产品 | 计费 | 签到 | 状态 |
 | --- | --- | --- | --- | --- |
-| catpaw | CatPaw（美团妙手） | 是 | 是 | 在册 |
+| catpaw | CatPaw（美团妙手） | 是 | 否 | 在册（上游无签到接口，只有注册奖励申领） |
 | loomy | Loomy（讯飞） | 是 | 是 | 在册 |
 | qwenworkcn | 千问办公（QwenWorkCN） | 是 | 否 | 在册（上游无签到接口，日额度自动发放） |
 | raccoon | Raccoon（商汤） | 是 | 是 | 在册 |
@@ -33,12 +33,13 @@
 
 全部 7 个渠道均在册（`RETIRED_CIDS` 为空）。
 
-**每个渠道当前供哪些对外模型、剩余额度多少、成功/失败计数**一律以 `mx model list` 与
-`mx status` 的实时输出为准 —— 文档不手抄这份清单，它随账号状态每次变化。
-机械校验：`scripts/verify-contract.mjs` 保证「渠道目录 == 注册清单 ∪ `RETIRED_CIDS`」，
-`packages/cli/tests/pool.test.ts` 另有一份同口径断言。**候选渠道**由渠道目录
-`exposedIds()` 现算 ∪ 注册表 `channels` 声明兜底；对外规格由**统一模型注册表**
-（`~/.modelmux/models.json`）声明，校验见 `scripts/verify-contract.mjs` 的「统一模型注册表」段。
+每个渠道当前供哪些对外模型、剩余额度多少、成功 / 失败计数，一律以 `mx model list` 与 `mx status` 的实时输出为准（文档不手抄，随账号状态每次变化）。
+
+| 项 | 来源与校验 |
+| --- | --- |
+| 渠道目录 | `scripts/verify-contract.mjs` 保证「渠道目录 == 注册清单 ∪ `RETIRED_CIDS`」；`packages/cli/tests/pool.test.ts` 另有同口径断言 |
+| 候选渠道 | 渠道目录 `exposedIds()` 现算 ∪ 注册表 `channels` 声明兜底 |
+| 对外规格 | 统一模型注册表 `~/.modelmux/models.json`（校验见 `verify-contract.mjs` 的「统一模型注册表」段） |
 
 ## 架构落点
 
@@ -59,10 +60,7 @@
 
 ## Web 控制台
 
-- 三页：**仪表盘**（KPI、趋势、模型用量、一键接入）、**账号池**（渠道卡、额度条、切号/删除）、
-  **日志**（访问日志）；设置不是页面，是顶栏齿轮弹窗（网关地址、开机自启动、主题、刷新间隔、版本）。
-  模型清单内联在仪表盘右列，不再有独立的模型列表页
-  （原因见 [WEB-CONSOLE.md](./WEB-CONSOLE.md) 的「模型清单」一节）。
+- 四页：**仪表盘**（KPI、趋势、模型用量、一键接入）、**账号池**（渠道卡、额度条、切号/删除、渠道偏好与模型清单）、**请求日志**、**API Keys**；设置不是页面，是顶栏齿轮弹窗（网关地址、开机自启动、主题、刷新间隔、自动同步间隔、版本）。
 - 控制台只作本机工具（要读本机网关与账号池），不上公网；看真机就 `mx web`。
 - 视觉：Codex/ChatGPT 近黑单色（顶部导航 `#171717` / 主区 `#212121` / 卡片与输入盒 `#2f2f2f`），
   顶部标签导航 + 单列纵向流；配置类信息收在设置弹窗，顶栏只留状态与主题快捷钮。
@@ -79,14 +77,13 @@ Windows 安装版 exe（Electron，NSIS 一键安装）：双击 → 自启网�
 换机迁移整目录拷贝 `~/.modelmux`。构建 `npm run desktop`，规范与路径约束见
 [DESKTOP-APP.md](./DESKTOP-APP.md)。
 
-## 排队重试（上游 200 + 流内排队帧）
+## 排队处理（上游 200 + 流内排队帧）
 
-渠道声明 `upstream.isQueueError(frame)` 后，网关在**响应头发出前**探测并按
-`retryAfterSeconds` 退避重开上游：
+渠道声明 `upstream.isQueueError(frame)` 后，网关在**响应头发出前**探测：
 
-- 单帧退避上限 12 秒，总预算 **120 秒**（`MODELMUX_QUEUE_BUDGET_MS` 可覆盖）。
-- 提醒走 `reasoning_content`（进思考块），每条以空行收尾；超预算时回正文劝换渠道。
-- 排队解除后补一条正文「排队成功，开始生成…」作为分界。
+- 探测到排队帧即**放弃本候选、换下一条**，不按 `retryAfterSeconds` 等待。
+- 探测消费掉的帧按原序交回转发层，且与转发复用同一个翻译器实例。
+- 响应头一旦写出就无法换候选，故探测只在写头前进行。
 
 详见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.4 与 [CONTRACT-TS.md](./CONTRACT-TS.md) §5。
 

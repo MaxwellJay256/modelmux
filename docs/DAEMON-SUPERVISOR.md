@@ -71,7 +71,9 @@ worker 的 IPC 断开走既有 `shutdown()` 优雅停机（资源关闭 + `{"eve
 | `packages/core/gateway/src/runtime/paths.ts` | `workerPidPath` / `FILES.workerPid` |
 | `packages/core/gateway/src/app/cli/index.ts` | 隐藏内部命令 `supervise`（同 `serve` 待遇） |
 
-## 7. 外层守护：supervisor 自己被杀（`scripts/mx-watchdog.mjs`）
+## 7. 外层守护：supervisor 自己被杀
+
+实现见 `scripts/mx-watchdog.mjs`。
 
 §1–§4 那一层只能保证「worker 崩了有人拉回」，**管不了 supervisor 自己消失**（被
 `taskkill /F`、任务管理器、清理工具、误操作杀掉时，`stop` 事件都不会有，实测
@@ -100,18 +102,24 @@ worker 的 IPC 断开走既有 `shutdown()` 优雅停机（资源关闭 + `{"eve
 日志不退出。计划任务没有控制台，异常栈默认流向 stderr 然后一起消失 —— 「静默消失查不出」
 正是这么来的，所以先落盘再退。
 
-**本机注册方式**（一次性动作，不是代码）：`scripts/install-watchdog-task.ps1` 注册计划任务
-`modelmux-gateway-watchdog`：登录触发（延迟 30s）+ **每 1 分钟跑一次 `--once`**、`IgnoreNew`
-防叠实例、允许电池供电、**S4U 非交互登录**；同时删除「启动」快捷方式与旧 `bin/watchdog-login.vbs`。
-S4U 是硬要求：Interactive 登录类型下 `node.exe`（控制台程序）每次触发都新建一个 conhost
-窗口一闪（实测 2026-11-18 桌面抓到）；守护与网关都是纯回环 HTTP / 文件操作，不需要交互桌面。
-为什么是「每分钟 `--once`」而不是常驻 + 失败重启：实测（2026-11-17）`taskkill` 强杀常驻守护
-**不触发** `RestartCount`（任务停在 `Ready`、result=0xFFFFFFFF）—— 常驻进程本身就是「可被杀的
-对象」；一次性探测无常驻可杀，最多漏 1 分钟即补。网关本体被杀同样由下一轮 `--once` 拉回
-（实测 61s 拉起，S4U 改造后复测拉回仍成立且全程无新窗口，2026-11-18；僵尸 `gateway.pid`
-由 `mx start` 幂等逻辑清理）。
+**本机注册方式**（一次性动作，不是代码）：`scripts/install-watchdog-task.ps1` 注册计划任务 `modelmux-gateway-watchdog`。
 
-## 日志布局与实例隔离
+| 项 | 配置 |
+| --- | --- |
+| 触发 | 登录触发（延迟 30s）+ 每 1 分钟跑一次 `--once` |
+| 并发 | `IgnoreNew` 防叠实例 |
+| 供电 | 允许电池供电 |
+| 登录类型 | **S4U 非交互**（硬要求：Interactive 下 `node.exe` 每次触发都闪一个 conhost 窗口，实测 2026-11-18；守护与网关都是纯回环 HTTP / 文件操作，不需要交互桌面） |
+| 清理 | 删除「启动」快捷方式与旧 `bin/watchdog-login.vbs` |
+
+采用每分钟 `--once` 而非常驻：
+
+- 实测（2026-11-17）`taskkill` 强杀常驻守护**不触发** `RestartCount`（任务停在 `Ready`、result=0xFFFFFFFF）—— 常驻进程本身就是可被杀的对象。
+- 一次性探测无常驻可杀，最多漏 1 分钟即补。
+- 网关本体被杀同样由下一轮 `--once` 拉回（实测 61s，S4U 改造后复测仍成立且无新窗口，2026-11-18）。
+- 僵尸 `gateway.pid` 由 `mx start` 幂等逻辑清理。
+
+## 8. 日志布局与实例隔离
 
 - 运行日志的落点、格式、轮转与保留规则见 [LOGGING.md](./LOGGING.md)。
 - **多实例隔离**：调试用的第二实例（如 `serve --addr 127.0.0.1:4413`）使用自己的

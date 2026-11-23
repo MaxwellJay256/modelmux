@@ -2,6 +2,20 @@
 
 本文件描述当前共享包架构。所有渠道的实现都必须遵守本契约。
 
+## 目录
+
+- [0. 一句话架构](#0-一句话架构)
+- [1. 工作区布局](#1-工作区布局)
+- [2. 零运行依赖](#2-零运行依赖)
+- [3. 渠道注册表（共享层与渠道层的唯一接缝）](#3-渠道注册表共享层与渠道层的唯一接缝)
+- [4. 模型池策略](#4-模型池策略)
+- [5. 渠道特有模块的接口契约](#5-渠道特有模块的接口契约)
+- [6. 登录：真实 URL 链路（禁止读本地文件）](#6-登录真实-url-链路禁止读本地文件)
+- [7. 渠道不做测试](#7-渠道不做测试)
+- [8. 陈旧构建：改了代码别忘了重启网关](#8-陈旧构建改了代码别忘了重启网关)
+- [9. CLI 命令形态（动词优先）](#9-cli-命令形态动词优先)
+- [10. 交付检查清单](#10-交付检查清单)
+
 ## 0. 一句话架构
 
 **共享层在 `packages/core/gateway`（工作区名 `@modelmux/gateway`），渠道差异通过
@@ -12,58 +26,44 @@
 ## 1. 工作区布局
 
 ```
-modelmux/                     ← 仓库根 = 工作区根
-├── packages/core/gateway/             ← **共享包** `@modelmux/gateway`
+modelmux/                      ← 仓库根 = 工作区根
+├── packages/core/gateway/     ← 共享包 @modelmux/gateway
 │   └── src/
-│       ├── runtime/   渠道 SDK（13 个源文件）：channel（注册表）/ channel-context（runInChannel）/
-│       │              paths（落点）/ permissions（权限基线）/ account-pool（账号池）/
-│       │              secret-file（原子写盘）/ catalog-cache（目录缓存）/ cli-consts（默认值）/
-│       │              credential-shape（凭据形状归一）/ snapshot（随包快照落点）/
-│       │              logger（日志节流）/ log-store（分层落盘）/ model-specs（模型规格）
-│       ├── pool/      模型池与账本：pool-targets（id 与匹配）/ pool-usage（账本）/
-│       │              model-pool（渠道内解析）/ account-rotate（额度耗尽换号决策）
-│       ├── auth/      登录链路：login / login-flow / auth-flow / auto-signin / signin-ledger /
-│       │              paste-detect（粘贴文本启发式）
-│       ├── http/      网关与转发（19 个源文件）：server（网关入口）/ portfree（端口自愈）/
-│       │              chat/（转发管线）：relay（编排）/ request（请求解析）/ route（池路由）/
-│       │              attempt（单候选尝试）/ forward（转发层）/ stream（帧与中继）/
-│       │              queue（排队探测）/ auth（鉴权链路）/ upstream（建连与空闲守卫）/
-│       │              candidates / errors / channel
-│       │              wire/（协议线）：sse-stream（SSE 规范化）/ openai-normalize（通用 OpenAI 归一化）
-│       │              protocol/（入站协议）：anthropic / responses / count-tokens / types（翻译与回程编码，
-│       │              复用 chat/ 转发管线，见 CLIENT-INTEGRATION.md）
-│       │              console/（控制台）：console / web-command-handler / web-types（控制台类型）
-│       ├── app/       顶层门面与进程编排，两个子目录分工明确：
-│       │              cli/（CLI 门面：index 命令入口 / model 模型组 / channel 渠道动词 /
-│       │              accounts 账号池 / report 落点巡检）
-│       │              lifecycle/（进程生命周期：daemon / headless / supervisor / process /
-│       │              stale-build / web）
-│       └── index.ts   对外的统一出口（55 个源文件合计）
-├── packages/core/channels/                     ← 渠道（每个 = 一个模型池 + 账号池；清单以 mx model list 为准）
-│   └── <cid>/                    ← 结构见下
-├── packages/cli/                 ← **CLI 入口**（bin `modelmux` / `mx`）
-│   └── src/
-│       ├── channels.ts           ← import 全部渠道包（副作用 = setChannel）
-│       └── cli.ts                ← bin 入口：注册全部渠道后调共享 `main()`
-├── docs/                         ← **全部文档**：契约与规范 + 渠道文档（docs/channels/<cid>/）
-└── scripts/                        ← 仓库级脚本与校验器（verify-contract / verify-storage / verify-docs /
-                                    verify-commits / verify-comments / verify-layering / verify-topology /
-                                    verify-references / verify-wiring / copy-ui / mx-watchdog）
+│       ├── runtime/           ← 渠道 SDK：注册表 / 落点 / 权限 / 账号池 / 原子写盘 / 日志 / 设置
+│       ├── pool/              ← 模型池与账本：id 匹配 / 用量账本 / 渠道内解析 / 换号决策
+│       ├── auth/              ← 登录链路：登录流程 / 自动签到 / 台账
+│       ├── http/              ← 网关与转发
+│       │   ├── chat/          ← 转发管线：编排 / 解析 / 路由 / 尝试 / 转发 / 帧中继
+│       │   ├── wire/          ← 协议线：SSE 规范化
+│       │   ├── protocol/      ← 入站协议：anthropic / responses
+│       │   └── console/       ← 控制台 API 与命令面
+│       ├── app/               ← 顶层门面
+│       │   ├── cli/           ← CLI 命令入口
+│       │   └── lifecycle/     ← 进程生命周期：守护 / 前台 / 监督 / 陈旧构建检测
+│       └── index.ts           ← 对外统一出口
+├── packages/core/channels/    ← 渠道包（每个 = 一个模型池 + 账号池；清单以 mx model list 为准）
+│   └── <cid>/                 ← 只实现 7 个文件，见下
+├── packages/cli/              ← CLI 入口（bin modelmux / mx）
+├── packages/ui/               ← Web 控制台（Vite，不进 tsc solution）
+├── desktop/                   ← Windows 安装版壳（Electron，不进 workspaces）
+├── docs/                      ← 全部文档
+└── scripts/                   ← 仓库级脚本与校验器
 ```
 
-`packages/core/channels/<cid>/` 内部（= 一个**池子**）：
+各层文件数以源码为准，本文件不抄清单。
 
-```
-packages/core/channels/<cid>/
-└── src/
-   ├── channel.ts                ← **本渠道装配**：ChannelConfig + 4 个模块 → setChannel()
-   ├── cli.ts                    ← bin 入口：注册本渠道后调共享 `main()`（单渠道调试用）
-   ├── index.ts                  ← 重导出共享层 + 渠道模块
-   ├── cred.ts                   ← **渠道特有**
-   ├── upstream.ts               ← **渠道特有**
-   ├── catalog.ts                ← **渠道特有**
-   └── billing.ts                ← **渠道特有**
-```
+`packages/core/channels/<cid>/src/` 只有 7 个文件：
+
+| 文件 | 职责 |
+| --- | --- |
+| `channel.ts` | 装配：静态配置 + 四个渠道模块，注册进共享层 |
+| `cred.ts` | 凭据：登录 / 刷新 / 落盘形状 |
+| `upstream.ts` | 上游协议：建连 / 请求体 / 流翻译 |
+| `catalog.ts` | 模型目录：拉取 / 解析 / 规格 |
+| `billing.ts` | 账单与签到：额度查询 / 领取 |
+| `cli.ts` | bin 入口：注册本渠道后交共享 CLI |
+| `index.ts` | 包出口 |
+
 
 > **渠道包只放实现**（`src/` 的 7 个文件 + 包配置）；渠道文档统一在
 > [`docs/channels/<cid>/`](./channels/README.md)（`PROTOCOL.md` 协议规格 + 使用与实测 +
@@ -73,8 +73,7 @@ packages/core/channels/<cid>/
 > **对外模型家族**以**裸模型名**对外暴露（见 §4 与 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md)）。
 > 账号池见同文档 §3。
 
-**每个 `packages/core/channels/<cid>/` 的 `src/` 只有 7 个文件。** 任何不在上表里的 `src/*.ts`
-（`server.ts` / `daemon.ts` / `paths.ts` / `sse-stream.ts` …）都是旧副本残留，应删除。
+表外任何 `src/*.ts`（`server.ts` / `daemon.ts` / `paths.ts` / `sse-stream.ts` …）都是旧副本残留，应删除。
 
 ### 1.1 各渠道的共享依赖声明
 
@@ -106,9 +105,11 @@ packages/core/channels/<cid>/
 `esbuild`（仅用于发布构建，见 §2.1）。
 
 **例外**：若渠道协议**必须**某个第三方库，才可加入 `dependencies`，并在 README 与
-代码注释里说明「为什么不能零依赖」。共享包本身**必须零第三方依赖**。
+代码注释里说明这条约束的依据。共享包本身**必须零第三方依赖**。
 
-### 2.1 发布构建：单文件 bundle（`packages/cli/scripts/bundle.mjs`）
+### 2.1 发布构建：单文件 bundle
+
+打包脚本见 `packages/cli/scripts/bundle.mjs`。
 
 `packages/cli` 是**唯一可全局安装/发布的单元**。它的运行时依赖是 workspace 软链
 （`@modelmux/catpaw` → `packages/core/channels/catpaw`），直接 `npm i -g` 会因软链断裂而失败。
@@ -126,15 +127,15 @@ packages/core/channels/<cid>/
   回退分支（`node -e` 等异常启动方式）在 bundle 下同样失效，属已知限制
   （见 `packages/core/gateway/src/app/lifecycle/process.ts` 的 `cliEntry()`）。
 
-#### 发布约定
+#### 2.1.1 发布约定
 
-| 约定 | 原因 |
-| --- | --- |
-| **版本线统一走 `0.1.x`** | 本项目是**自用工具**，不对外承诺版本语义 —— 不搞 1.0 里程碑、不做 semver 承诺。全仓（cli + ui + gateway + **全部渠道**）共用**根 `package.json` 的 `version`**，`scripts/verify-contract.mjs` 强制：漂一个就是红 |
-| **版本号只记一遍** | 唯一真相是**根 `package.json` 的 `version`**。私有 workspace 包（ui / gateway / 各渠道）一律**不带 `version` 字段**；渠道 `src/channel.ts` 不再写版本字面量，改为引用 gateway 导出的 `VERSION` 常量（`packages/core/gateway/src/version.ts`，显示在 `mx --version` 与 `mx path`）。`VERSION` 常量、**可发布**的 cli 清单（npm 要求有 `version`）、desktop 清单与根 lock、`docs/PROGRESS.md` 由 `npm run version:sync`（`scripts/version.mjs`）从根派生 —— **发版只改根一处再跑同步**，`verify-contract` 守漂移 |
-| **`bin` 路径不带 `./` 前缀**（`"mx": "dist/cli.bundle.js"`） | npm 11 的发布归一化（`@npmcli/package-json` 的 `secureAndUnixifyPath`）会把 `./x.js` 判为无效并**整条删除** —— 发布出去的包就没有 `mx` / `modelmux` 命令，而 npm 只打一句含糊的 `was invalid and removed`。实测：带 `./` → 条目被删；不带 → 保留。`scripts/verify-contract.mjs` 已把这条钉住（可发布包的 bin 一律不得以 `./` 开头） |
-| **`prepack` 复制仓库根的 LICENSE 到包根** | npm 只自动收录**包根目录**的 LICENSE，不往父目录找；不复制则 tarball 里没有许可证文本。仓库根是许可证的唯一副本（渠道包不再各带一份），复制件是构建产物（已 gitignore） |
-| **`prepublishOnly` 先跑 `npm run build`** | 发布出去的 `dist/` 必须与当前源码一致；没有它，`npm publish` 会把上一次的构建产物（甚至空目录）发出去 |
+1. **版本线统一走 `0.1.x`**：全仓（cli + ui + gateway + 全部渠道）共用同一个版本号，连续递增不跳号。
+2. **版本号只记一遍**：唯一真相是根 `package.json` 的 `version`。
+   - 私有 workspace 包（ui / gateway / 各渠道）不带 `version` 字段；渠道 `src/channel.ts` 引用 gateway 导出的 `VERSION` 常量（`packages/core/gateway/src/version.ts`，显示在 `mx --version` 与 `mx path`）。
+   - `VERSION` 常量、可发布的 cli 清单、desktop 清单与根 lock、`docs/PROGRESS.md` 由 `npm run version:sync`（`scripts/version.mjs`）从根派生。发版只改根一处再跑同步，`verify-contract` 守漂移。
+3. **`bin` 路径不带 `./` 前缀**（`"mx": "dist/cli.bundle.js"`）：npm 11 发布时做归一化，带前缀会被改写。
+4. **`prepack` 复制仓库根的 LICENSE 到包根**：npm 只收录包根目录的 LICENSE，仓库根是许可证的唯一副本。
+5. **`prepublishOnly` 先跑 `npm run build`**：发布的 `dist/` 与当前源码一致。
 
 发布前的自检：`cd packages/cli && npm publish --dry-run` —— 输出里除「需要登录」外**不应有任何
 `npm warn publish`**；有任何一条都先修掉再发。
@@ -216,7 +217,9 @@ interface Channel {
 
 ## 4. 模型池策略
 
-### 4.1 对外 id：模型家族裸模型名（`model-family.ts` + `model-registry.ts`）
+### 4.1 对外 id：模型家族裸模型名
+
+两份数据源是 `model-family.ts` 与 `model-registry.ts`。
 
 网关对外只做**家族表里声明的模型**，id 形态是**裸模型名**（表见
 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2）。客户端只认对外名单里的名字：
@@ -241,7 +244,9 @@ interface Channel {
 
 > 渠道不再由请求方指定 —— 「哪家出」是网关的调度决策（档位 → 剩余额度 → 冷却 → 顺延）。
 
-#### 4.1.1 Claude Desktop 角色名（`DESKTOP_ROLE_MODELS`）
+#### 4.1.1 Claude Desktop 角色名
+
+映射表是 `DESKTOP_ROLE_MODELS`。
 
 Claude Desktop 直连网关时只会发 `claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`
 这类**真实 Anthropic 模型名**：它的 `inferenceModels[].name` 必须过校验器，自造名、
@@ -254,8 +259,8 @@ Claude Desktop 直连网关时只会发 `claude-sonnet-4-5` / `claude-opus-4-5` 
 - 角色名**不是**家族名的通配：`claude-opus-9-9`、`claude-sonnet-4-5-20260101` 仍返回 400，
   不引入「任何 `claude-*` 都放行」的口子。
 - 协议入站（`/v1/messages`、`/v1/responses`）**不得**把家族外名字静默改写成「有货的
-  第一个池模型」—— 那会让跑错模型的请求看起来成功（事故记录见 `relay.ts` 的
-  `poolModelOrNull` 注释）。
+  第一个池模型」—— 那会让跑错模型的请求看起来成功（依据见 `relay.ts` 的
+  `resolveInboundModel` 注释）。
 
 ---
 
@@ -264,7 +269,7 @@ Claude Desktop 直连网关时只会发 `claude-sonnet-4-5` / `claude-opus-4-5` 
 共享层的 `gateway.ts` / `headless.ts` / `daemon.ts` / `auth-flow.ts` 按这套接口调用渠道模块。
 **导出签名以 `packages/core/gateway/src/runtime/channel.ts` 的类型定义与各渠道实现为准** ——
 `tsc -b` 就是签名的校验器，本文不抄写签名（抄写必漂移）。本节只记录**编译器管不到的语义约定**：
-行为契约、禁止事项、与「为什么」。
+行为契约、禁止事项与判据依据。
 
 > 类型定义在 `packages/core/gateway/src/runtime/channel.ts`（`CredModule` / `UpstreamModule` /
 > `CatalogModule` / `BillingModule`）。凭据/配置的具体形态各渠道不同，故这些位置用
@@ -365,70 +370,130 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 
 ### 5.2 `upstream.ts`
 
-**可选钩子的语义**（路由相关的两项见 `POOL-ARCHITECTURE.md` §2.4）：
+#### 5.2.1 钩子契约
 
-- `buildChatHeaders?(credential, cfg, body?)`：对话请求的**专用头族**（上游按整组头判定
-  「是否官方客户端」时需要）。缺省时网关回退 `buildHeaders`
-  （`packages/core/gateway/src/http/chat/upstream.ts:137-140`）；普通 OpenAI 兼容渠道无需声明。
-  第三参 `body` 是**网关已序列化的请求体**：**签名类渠道**要用它把 payload 哈希计进签名
+每个钩子只在渠道声明时生效；未声明走默认路径。调用位置由共享层固定，渠道只管实现。
+
+**`buildChatHeaders(credential, cfg, body?)`**
+
+- **时机**：建上游请求头时。
+- **契约**：返回对话请求的专用头族。上游按整组头判定「是否官方客户端」时需要。
+- **缺省**：回退 `buildHeaders`（`packages/core/gateway/src/http/chat/upstream.ts:137-140`）。
+- **第三参 `body`**：网关已序列化的请求体。签名类渠道用它把 payload 哈希计进签名
   （如华为云 `SDK-HMAC-SHA256` 的 `Authorization`）—— 签名覆盖 body 时必须在建头阶段
-  算好，而网关的 `fetch` 只认这组网。不签名的渠道忽略该参数即可（向后兼容）。
-- `prepareChat?(body)`：发上游请求**之前**要完成的异步前置动作，网关会 `await` 它
-  （`packages/core/gateway/src/http/chat/attempt.ts:301-319`）。参数是**网关已经建好的
-  body**（不是 `req`）：渠道必须基于同一个 body 做前置，否则再调一次 `buildChatBody`
-  会生成新的会话 id，前置与对话指向两个会话。返回字符串形态请求体的渠道不走这个钩子
-  （`packages/core/gateway/src/runtime/channel.ts:223`）。
-- `openChatStream?(body)`：**内容不在主 POST 响应体上**的上游（侧信道 SSE / WS）用。声明后
-  网关在建连 `chatUrl` **之前**调它（`packages/core/gateway/src/http/chat/upstream.ts:255-260`），
-  把返回的流当作上游响应体交给翻译器 —— `buildHeaders` / `chatUrlForModel` 不再被调用。
-  返回 `null` 回落默认 POST 路径；入参与 `prepareChat` 同源（网关已经建好的 body），真正的
-  请求现场可放在渠道自己的请求槽里由两个钩子共用。返回流之前抛 `UpstreamUnauthorized`
-  归一成 401 + `authRejected`（走刷新重试链）；其余错误**不**自动重开 —— 这个钩子有上游
-  副作用（真发了一轮对话），重开会让同一提问跑两遍。声明处见
-  `packages/core/gateway/src/runtime/channel.ts:340`。
-- `refreshIfExpired?(credential)`：建头**之前**的异步凭据保鲜，网关在 `buildHeaders` 前
-  `await` 它（`packages/core/gateway/src/http/chat/upstream.ts:139`）。
-  为什么需要：`buildHeaders` 是同步的，无法「先续期再发」；而渠道的预续期若是惰性的
+  算好，而网关的 `fetch` 只认这组头。不签名的渠道忽略即可。
+
+**`prepareChat(body)`**
+
+- **时机**：发上游请求之前，网关 `await` 它（`packages/core/gateway/src/http/chat/attempt.ts:301-319`）。
+- **契约**：完成异步前置动作（建会话、上传附件等），可就地改写传入的 body。
+- **约束**：参数是**网关已经建好的 body**，不是 `req`。必须基于同一个 body 做前置 ——
+  再调一次 `buildChatBody` 会生成新的会话 id，前置与对话指向两个会话。
+- **不适用**：返回字符串形态请求体的渠道（`packages/core/gateway/src/runtime/channel.ts:223`）。
+
+**`openChatStream(body)`**
+
+- **时机**：建连 `chatUrl` 之前（`packages/core/gateway/src/http/chat/upstream.ts:255-260`）。
+- **契约**：返回一个流，网关当作上游响应体交给翻译器。用于内容不在主 POST 响应体上的
+  上游（侧信道 SSE / WS）。声明后 `buildHeaders` / `chatUrlForModel` 不再被调用。
+- **返回 `null`**：回落默认 POST 路径。
+- **入参**：与 `prepareChat` 同源（网关已建好的 body），请求现场可放渠道自己的请求槽里
+  由两个钩子共用。
+- **错误**：抛 `UpstreamUnauthorized` 归一成 401 + `authRejected`（走刷新重试链）；
+  其余错误**不**自动重开 —— 这个钩子有上游副作用（真发了一轮对话），重开会让同一提问跑两遍。
+- **声明处**：`packages/core/gateway/src/runtime/channel.ts:340`。
+
+**`refreshIfExpired(credential)`**
+
+- **时机**：`buildHeaders` 之前，网关 `await` 它（`packages/core/gateway/src/http/chat/upstream.ts:139`）。
+- **为什么需要**：`buildHeaders` 是同步的，无法「先续期再发」；渠道的预续期若是惰性的
   （由请求触发、非阻塞），token 过期后当前请求就会拿着**死 token** 发出去，上游回
   HTTP 200 + 鉴权失效帧，客户端报请求失败 —— 而后台续期其实已经把下一个请求修好了。
-  约定：**只在已过期时阻塞**续期；仍在续期窗口内则保持非阻塞，否则每个请求都要多等
-  一次网络往返。钩子可就地改写传入的 credential（换上新 accessToken），使随后的
-  `buildHeaders` 用上新 token。未声明时网关保持同步行为，不受影响。
-- `chatUrlForModel?(upstreamModel, cfg)`：按**上游模型名**决定对话端点。
-  适用场景：有些上游**每个模型走不同的网关主机**（AStudio 实测：云端模型配置里每行
-  各带一个 `base_url`，主体是 `maas-api.cn-huabei-1.xf-yun.com/v2`，但 `spark-x` 走
-  `spark-api-open.xf-yun.com/agent/v1`）—— 硬编码一个 host 会对部分模型 404
-  （`API endpoint not found`）。声明后网关用它的结果，否则退回 `chatUrl()`。
-  入参是**已经过 `catalog.resolveModel()` 的上游模型名**。
-- `isAuthFailure(status, body)`：对**任何非 200** 的响应都会调用；返回 true 时网关把它归一成
-  401，走「刷新 token → 重试**本账号**」（不切号）。用于上游不用标准状态码表达凭据失效的渠道。
-  完整链路见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.4。
-- `quotaResetAt(bodySnippet)`（**可选**）：从上游**错误体**里认出「额度耗尽 + 下次刷新时刻」
-  （epoch ms；认不出返回 `null`）。共享层命中额度信号后用它定冷却截止，`null` 回落次日本地 0 点。
-  **不要编造时间**：编错会让账号冷却到错误的时刻。语义与判定见 POOL-ARCHITECTURE.md §2.4。
-- `isCapacityError(status, body)`（**可选**）：判定一个**非 200** 响应是否是**上游容量型过载**
-  （推理集群无空闲实例一类）。命中时网关仍记渠道级冷却（候选让给别家），但**不计账号连败** ——
+- **约定**：**只在已过期时阻塞**续期；仍在续期窗口内则保持非阻塞，否则每个请求都要多等
+  一次网络往返。
+- **副作用**：可就地改写传入的 credential（换上新 accessToken），使随后的 `buildHeaders`
+  用上新 token。未声明时网关保持同步行为。
+
+**`chatUrlForModel(upstreamModel, cfg)`**
+
+- **时机**：建连前决定对话端点。
+- **契约**：按**上游模型名**返回端点。适用于「每个模型走不同网关主机」的上游
+  （AStudio 实测：云端模型配置里每行各带一个 `base_url`，主体是
+  `maas-api.cn-huabei-1.xf-yun.com/v2`，但 `spark-x` 走 `spark-api-open.xf-yun.com/agent/v1`）——
+  硬编码一个 host 会对部分模型 404（`API endpoint not found`）。
+- **入参**：已经过 `catalog.resolveModel()` 的上游模型名。
+- **缺省**：退回 `chatUrl()`。
+
+**`isAuthFailure(status, body)`**
+
+- **时机**：对**任何非 200** 的响应都会调用。
+- **契约**：返回 true 时网关把它归一成 401，走「刷新 token → 重试**本账号**」（不切号）。
+- **用途**：上游不用标准状态码表达凭据失效的渠道。
+- **完整链路**：[POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.4。
+
+**`quotaResetAt(bodySnippet)`**
+
+- **时机**：共享层命中额度信号后。
+- **契约**：从上游错误体里认出「额度耗尽 + 下次刷新时刻」（epoch ms），认不出返回 `null`。
+- **用途**：命中时用它定冷却截止；`null` 回落次日本地 0 点。
+- **约束**：**不要编造时间** —— 编错会让账号冷却到错误的时刻。
+- **判定语义**：[POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.4。
+
+**`isCapacityError(status, body)`**
+
+- **时机**：非 200 响应。
+- **契约**：判定是否是**上游容量型过载**（推理集群无空闲实例一类）。
+- **处置**：命中时仍记渠道级冷却（候选让给别家），但**不计账号连败** ——
   这类错误换账号没用，计入连败会把健康账号误熔断（上游排队高峰整批 5xx 的场景）。
-  渠道业务码由渠道声明，共享层不硬编码渠道知识（守卫与 `quotaSignal` 同思路）。
-- `quotaSignal(status, body)`（**可选**）：声明本渠道的**额度信号** —— 共享层只认通用措辞，
-  渠道业务码与专有措辞**必须**经本钩子上报（共享层不许硬编码渠道知识）。
-  - 返回 `usage_limit` = 账户级用量限额（对所有模型生效，含倍率 0 的）→ 一律冷却；
-  - 返回 `balance` = 余额不足（只影响计费用量）→ 只冷却付费模型，免费模型继续打上游；
-  - 认不出返回 `null`。
-  - 守卫：`tests/quota-signal.test.ts` 会扫共享层**可执行代码**里有没有渠道业务码，有就红。
-  - 两类信号的判定与作用范围见 POOL-ARCHITECTURE.md §2.4。
-- `isQueueError(frame)`：只在**响应头发出前**对翻译器产出的错误帧调用；返回 true 表示
-  「这条上游在排队」。网关的策略是**一出现排队就放弃本候选、换下一条**（`switchChannel`）：
-  不等待、不重开同一条流、不向客户端写任何排队相关字节。已吐过内容帧时不换（避免重复内容）。
-  未声明的渠道照旧把错误帧透传给客户端。
-  换候选后若无下一条可用，整条请求以 503 `upstream_queued` 收尾 —— 排队请求永不被接受
-  （2026-11-08 行为，早先那套「按 `retryAfterSeconds` 退避重试 + 进度文案 + 超预算劝换渠道」
-  已全部删除，相关预算常量与文案一并移除）。
-  客户端断开（res `close` 事件，比 `res.destroyed` 可靠）后探测立即止损，
+- **分工**：业务码由渠道声明，共享层不硬编码渠道知识（与 `quotaSignal` 同思路）。
+
+**`quotaSignal(status, body)`**
+
+- **时机**：响应到达后。
+- **契约**：声明本渠道的**额度信号**。共享层只认通用措辞，渠道业务码与专有措辞**必须**
+  经本钩子上报（共享层不许硬编码渠道知识）。
+- **返回值**：
+  1. `usage_limit` = 账户级用量限额（对所有模型生效，含倍率 0 的）→ 一律冷却。
+  2. `balance` = 余额不足（只影响计费用量）→ 只冷却付费模型，免费模型继续打上游。
+  3. `null` = 认不出。
+- **守卫**：`tests/quota-signal.test.ts` 会扫共享层**可执行代码**里有没有渠道业务码，有就红。
+- **判定与作用范围**：[POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.4。
+
+**`isQueueError(frame)`**
+
+- **时机**：**响应头发出前**，对翻译器产出的错误帧调用。
+- **契约**：返回 true 表示「这条上游在排队」。
+- **处置**：一出现排队就放弃本候选、换下一条（`switchChannel`）—— 不等待、不重开同一条流、
+  不向客户端写任何排队相关字节。已吐过内容帧时不换（避免重复内容）。
+- **无下一条可用**：整条请求以 503 `upstream_queued` 收尾，排队请求永不被接受。
+- **已删除的旧机制**：「按 `retryAfterSeconds` 退避重试 + 进度文案 + 超预算劝换渠道」，
+  相关预算常量与文案一并移除。
+- **断连止损**：客户端断开（`res` 的 `close` 事件，比 `res.destroyed` 可靠）后探测立即停止，
   不再打上游 —— 只查 `res.destroyed` 不够：客户端 60s 超时走人后仍会多打一次上游
-  并滞留一个等待轮次（2026-10-24 实测），故探测以 `close` 事件为准。
-- `idleTimeoutMs()`：上游响应头到达后允许的**连续静默上限**（毫秒）；默认值与心跳口径见
-  [LOGGING.md](./LOGGING.md) §6。声明后首帧等待、空闲守卫与排队探测统一放宽。
+  并滞留一个等待轮次（2026-10-24 实测），故以 `close` 事件为准。
+
+**`idleTimeoutMs()`**
+
+- **时机**：上游响应头到达后。
+- **契约**：返回允许的**连续静默上限**（毫秒）。声明后首帧等待、空闲守卫与排队探测统一放宽。
+- **默认值与心跳口径**：[LOGGING.md](./LOGGING.md) §6。
+
+#### 5.2.2 主机轮换钩子
+
+`UpstreamModule` 的可选成员，不实现即跳过。仅 custom 线型且签名不覆盖 host 的渠道适用；
+标准 OpenAI 兼容渠道没有这个概念。
+
+| 钩子 | 作用 |
+| --- | --- |
+| `chatHostCandidates()` | 返回候选主机列表 |
+| `setChatHostOverride(host)` | 本次请求指定主机 |
+| `currentChatHost()` | 读当前主机 |
+| `rememberChatHost()` | 成功后回写记忆 |
+
+多主机上游里个别主机对「200 后零字节 / 断流」是坏的，网关在探测层重试前换下一候选，
+成功后回写记忆。`rememberChatHost` 的**实现是零参**（渠道自己取当前主机）；声明写成
+`rememberChatHost?(host?: string)` 是为了兼容「零参实现」与「共享层带 host 传参」两种形态。
+
 
 **可选主机轮换钩子**（`UpstreamModule` 的**可选成员**，不实现即跳过）：
 
@@ -509,7 +574,7 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 但**不要列出实测用不了的模型** —— 用户选中后拿到空回答，而错误指向「模型」
 而非真实原因，比不列更糟。
 
-#### 目录来源优先级（**所有渠道一致，按此顺序**）
+#### 5.3.1 目录来源优先级（所有渠道一致）
 
 1. **磁盘缓存** `<root>/channels/<cid>/cache/models.json` —— **常态来源**。上次真实拉到的目录，
    由共享层 `readCatalogCache()` / `writeCatalogCache()` 读写（信封
@@ -527,7 +592,7 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 一句话：**第一次 `model list` 把真实目录记到本地，之后一直用那个文件**；
 要更新就 `model <cid> --refresh`。
 
-#### 模型数据必须外置（硬规则）
+#### 5.3.2 模型数据必须外置
 
 `catalog.ts` **不得出现任何模型数据**：模型名、上下文窗口、输出上限、输入/输出模态、
 思考档位、倍率、隐藏标记一律写在渠道包的 `models.json`。`catalog.ts` 只保留三类逻辑：
@@ -552,7 +617,7 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
  `refresh()` —— 共享层据此回报「模型表是内置的」；先补该渠道的 fetch/parse，
  缓存才有意义。
 
-#### `refresh()`：显式刷新的契约
+#### 5.3.3 `refresh()`：显式刷新的契约
 
 有远端目录层的渠道**必须**实现 `refresh()`（CLI 的 `model <cid> --refresh` 与网关每日目录保鲜调它）：
 
@@ -567,7 +632,7 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 共享层负责的（渠道不用管）：缓存命中判断、失败时回落内置表、退出码、
 以及告诉用户这次看的是哪份数据。
 
-#### 目录对账与失败回退（共享层）
+#### 5.3.4 目录对账与失败回退（共享层）
 
 上游会下线或改名模型，而本地缓存不会自己变 —— 定期对账是发现失效 id 的唯一途径。
 
@@ -583,9 +648,9 @@ Web 控制台的用户提交经 `submitPastedCallback` → `takePastedCallback`
 写路径：`writeChannelModels()` 内部先快照再原子写；回退用 `rollbackChannelModels()`。
 渠道不需要自己实现快照或回退。
 
-#### `modelSpec()`：已知模型规格（**可选钩子**）
+#### 5.3.5 `modelSpec()`：已知模型规格（可选钩子）
 
-上游目录**普遍只下发部分字段**（哪些字段各渠道不同，见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.6）—— 对上游没声明的字段，网关 `/v1/models` 只能给兜底值（取值见 [MODEL-SPECS.md](./MODEL-SPECS.md) §5），
+上游目录**普遍只下发部分字段**（哪些字段各渠道不同，见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.6）—— 对上游没声明的字段，网关 `/v1/models` 只能给兜底值（取值见 [MODEL-CATALOG.md](./MODEL-CATALOG.md) §4），
 而兜底值不是任何模型的真实上限。这类渠道**可以**实现：
 
 ```ts
@@ -608,7 +673,7 @@ modelSpec?(modelId: string): {
   走这条通道的档位来源标 `spec`，与上游运行时声明的 `upstream` 区分开。
 - **`multiplier` 只填实测值**：云端/上游没给的就是未知 ——
   省略该字段，不要让池层填占位数字（客户端会按它算钱）。
-  实测案例见 [MODEL-SPECS.md](./MODEL-SPECS.md) §4.2（AStudio：7 个模型里只有 2 个有实测倍率）。
+  实测案例见 [MODEL-SPECS.md](./MODEL-SPECS.md) §3（AStudio：7 个模型里只有 2 个有实测倍率）。
   **倍率不走「跨渠道兜底」那一层**：倍率是渠道自己的计费口径，
   拿兄弟渠道的值去填等于编造（窗口/输出/档位可以，倍率不行）。
 - **取值优先级：本渠道上游目录 > 本渠道声明（本钩子）> 跨渠道兜底 > 占位值**：
@@ -616,12 +681,12 @@ modelSpec?(modelId: string): {
   （数值取 min / 档位取交集，只填缺值，且标 `sources: "cross"`）——
   口径见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.7。所以这条钩子**依然值得实现**：
   它比跨渠道推断更准（那是别的渠道被上游裁剪过的值）。
-  三层来源与兜底值口径见 [MODEL-SPECS.md](./MODEL-SPECS.md) §5。
+  三层来源与兜底值口径见 [MODEL-CATALOG.md](./MODEL-CATALOG.md) §4。
 - 共享层**不许出现模型名** → 这张表必须放在**渠道包**里
   （`packages/core/channels/<cid>/src/catalog.ts`），不能上提到 gateway。
 - 池层怎么用它见 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §2.6。
 
-#### 渠道内部：`catalog` 与 `upstream` 的依赖方向
+#### 5.3.6 渠道内部依赖方向（`catalog` 与 `upstream`）
 
 渠道包内 **`catalog` → `upstream` 是既有方向**（`catalog` 要调 `upstream.fetchModels()`
 拉目录）。因此 **`upstream` 不得反向 import `catalog`** —— ESM 环依赖下模块初始化
@@ -651,15 +716,17 @@ upstream.setModelMetaLookup((key) => catalog.metaOfKey(key));
 直接调用时使用。各渠道叫法不同（`check-in` / `signin` / 活动 `claim` / 上游自动发），统一收敛成
 `status()` + `claim()` 两个动作；`claim()` 必须是幂等的或至少可安全重复调用。
 
-**额度数字（「今天签到领到多少」）**：`claim()` / `status()` 可回 `reward: {amount, unit}`
-（渠道自报的发放额）；`status().dailyReward`（可选）是**每日发放额度**的公布值，
-适用于「签到动作本身就是当日额度发放」的渠道（loomy 每天 5000，上游不回报入账额）。
-`status()` **不接受 credential**（拿的是当前生效账号）：`perAccount` 渠道只能用它取
-与账号无关的字段（如 `dailyReward`），不要把账号相关的数字写进别的账号的台账。
-两者都没有时共享层用**领取前后各查一次额度的差值**补；仍拿不到才用**跨额度窗口对比**
-（最弱口径，界面标「估算」）。`status().resetAt` / `windowStartsAt`（可选）声明当前签到窗口的
-结束与开始时刻（epoch ms）—— 日界不是本地 0 点的渠道（qoder 系上游是 10:00 UTC+8）必须给，
-否则当天活动永远领不到。
+**额度数字（「今天签到领到多少」）**取值的四档来源：
+
+| 档 | 来源 | 说明 |
+| --- | --- | --- |
+| 1 | `claim()` / `status()` 的 `reward: {amount, unit}` | 渠道自报的发放额 |
+| 2 | `status().dailyReward` | 每日发放额度的公布值，适用于「签到即当日额度发放」的渠道（loomy 每天 5000） |
+| 3 | 领取前后各查一次额度的差值 | 前两档都没有时由共享层补 |
+| 4 | 跨额度窗口对比 | 最弱口径，界面标「估算」 |
+
+- `status()` **不接受 credential**（拿的是当前生效账号）：`perAccount` 渠道只能用它取与账号无关的字段（如 `dailyReward`），不要把账号相关的数字写进别的账号的台账。
+- `status().resetAt` / `windowStartsAt`（可选）声明当前签到窗口的结束与开始时刻（epoch ms）。日界不是本地 0 点的渠道（qoder 系上游是 10:00 UTC+8）必须给，否则当天活动永远领不到。
 口径与有界重试规则见 [`POOL-ARCHITECTURE.md`](./POOL-ARCHITECTURE.md) §3.6。
 
 **「查不到」不能显示成 0**：有额度能力但查询失败时抛 `CreditsError`，而不是返回 `remain: 0`。
@@ -923,7 +990,7 @@ mx <组名> <子命令> [参数]        # 命令组
 
 本文件只保留**别处没有的内容**：
 
-- `§0 语法铁律`（动词优先、为什么 `mx <cid> <动词>` 不可用）
+- `§0 语法铁律`（动词优先、`mx <cid> <动词>` 不可用的依据）
 - `§2 常用工作流`（具体步骤、参数、坑）
 - `credentials.json` 不见了但账号池里还有货的处置（见下）
 
@@ -1012,7 +1079,7 @@ mx log --kind lifecycle --lines 30
 mx web                     # 确保网关在跑 -> 打印 http://127.0.0.1:4412/web/
 ```
 
-排查「为什么慢 / 为什么失败 / 网关挂了」时看 [LOGGING.md](./LOGGING.md) §10「故障分诊」，
+排查慢请求 / 失败 / 网关挂掉时看 [LOGGING.md](./LOGGING.md) §10「故障分诊」，
 不要在本文件里重复展开日志字段与错误码。
 
 

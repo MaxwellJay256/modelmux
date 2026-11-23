@@ -24,6 +24,7 @@ import { QUOTA_EXHAUSTED_CODE } from "../../pool/account-rotate.js";
 import { resolvePoolModel } from "../../pool/model-pool.js";
 import { FAIL_COOLDOWN_MS, noteFailure, noteSuccess } from "../../pool/pool-usage.js";
 import { logThrottled } from "../../runtime/logger.js";
+import { redactSecrets } from "../../runtime/json-shape.js";
 import { sinkOf } from "../protocol/types.js";
 import { getRequestLog, noteQueued, noteRequestError, noteUpstreamPayload, noteUpstreamReady } from "../../runtime/log-store.js";
 import { inChannel, isCustomWire } from "./channel.js";
@@ -129,8 +130,14 @@ interface ProbeEnv {
  */
 const PASSTHROUGH_SNIPPET_MAX = 300;
 
+/**
+ * 上游错误体摘录：压空白、遮蔽凭据形态、截断。
+ *
+ * 遮蔽逻辑在 `redactSecrets`（共享层）：日志汇聚点 `logLine` 用的是同一个函数，
+ * 两条路径口径一致 —— 只在回客户端的路径上脱敏等于漏了日志那一半。
+ */
 function snippetOf(text: string): string {
-  const trimmed = text.replace(/\s+/g, " ").trim();
+  const trimmed = redactSecrets(text.replace(/\s+/g, " ")).trim();
   return trimmed.length > PASSTHROUGH_SNIPPET_MAX ? `${trimmed.slice(0, PASSTHROUGH_SNIPPET_MAX)}…` : trimmed;
 }
 
@@ -345,6 +352,7 @@ async function reopenForProbe(
   const currentHost = inChannel(channel, () => channel.upstream.currentChatHost?.());
   if (currentHost !== undefined) state.host = currentHost;
   // 旧流已死：释放它再换新流（探测用的 reader 已在 consumeQueueProbe 里 releaseLock）
+  // 释放失败无补救动作：流已不可用，下次建连会覆盖
   await call.body?.cancel().catch(() => {});
   return next;
 }
@@ -375,7 +383,8 @@ async function runQueueProbe(
   for (;;) {
     // 客户端已断开：探测再久也没有收件人，立即止损（释放上游流、结束应答）。
     if (clientGone || res.destroyed || res.writableEnded) {
-      await call.body?.cancel().catch(() => {});
+  // 释放失败无补救动作：流已不可用，下次建连会覆盖
+  await call.body?.cancel().catch(() => {});
       if (res.headersSent) res.end();
       state.failed = true;
       state.error = {
@@ -443,7 +452,8 @@ async function runQueueProbe(
     // 为什么放在预算判断**之前**：预算是「等多久」，而这里根本不该等 ——
     // 先判排队就能连第一轮 delay 也省掉（qoder 实测首轮就要等 15s+）。
     if (probe.queued && !probe.hasContent) {
-      await call.body?.cancel().catch(() => {});
+  // 释放失败无补救动作：流已不可用，下次建连会覆盖
+  await call.body?.cancel().catch(() => {});
       state.switchChannel = true;
       logger(`upstream queued (channel ${cid}) — switching to next candidate without waiting`);
       break;
@@ -672,7 +682,8 @@ export async function attemptCandidate(
     }
     if (state.failed) {
       // 探测层异常：这条流已死，跳过转发层（call.ok 仍是 true，不能让它进转发层）
-      await probedCall.body?.cancel().catch(() => {});
+  // 释放失败无补救动作：流已不可用，下次建连会覆盖
+  await probedCall.body?.cancel().catch(() => {});
       // 客户端已断开：没有应答对象了，直接终局（编排层不再换候选、不再写错误）
       if (state.error.code === "client_disconnected") return { kind: "done" };
       return { kind: "retry", error: state.error };
@@ -849,6 +860,13 @@ export async function attemptCandidate(
         message: `${forwarded.reason} [${cid}]`,
       },
     };
+  }
+  // 聚合路径的流内业务错误（额度 / Plan 权益 / 限流）：响应头还没写，同样换候选。
+  // 记账（冷却账号、补失败）已在 `forward.ts` 就地完成，这里只交出错误给编排层。
+  if (forwarded.kind === "retry") {
+    logger(`upstream business error (channel ${cid}) — switching to next candidate: ${forwarded.error.code}`);
+    noteRequestError(res, forwarded.error.code, forwarded.error.message);
+    return forwarded;
   }
   return { kind: "done" };
 }

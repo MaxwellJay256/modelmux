@@ -3,7 +3,7 @@
 本文件收纳仓库根 [AGENTS.md](../AGENTS.md) 里**低频但必须可查**的内容：worktree 约束、测试细则、
 构建模型、推送门禁、版本与发版、提交信息规范。根 `AGENTS.md` 只留摘要与红线并指向本文件的对应小节。
 
-> **为什么拆出来**：根 `AGENTS.md` 是所有 coding agent 每个会话都会注入的常驻上下文，
+> **拆出来的理由**：根 `AGENTS.md` 是所有 coding agent 每个会话都会注入的常驻上下文，
 > 且 Codex 默认只读其前 32768 字节（`project_doc_max_bytes`），**超出部分会被静默丢弃**。
 > 常驻文件只放每次都要用的规则，低频细则放这里按需查阅。
 
@@ -14,7 +14,6 @@
 - [临时探测脚本](#临时探测脚本)
 - [项目级技能入口软链](#项目级技能入口软链本机)
 - [测试红线](#测试红线)
-- [测试已知隐患](#测试已知隐患)
 - [构建模型](#构建模型)
 - [推送门禁](#推送门禁)
 - [版本与发版](#版本与发版)
@@ -48,8 +47,7 @@
    或在该树里重新 `npm link`。
 5. 工作树产物不入库：`.zcode/` 与 `.agents/worktrees/` 在 `.gitignore` 里
    （`verify-storage` 也因此不会扫到树内产物）。
-6. 并行任务用 `PLAN_ID` 绑定 `.planning/`，不要把计划文件写到别的树。
-7. `.githooks/pre-push` 用 `git rev-parse --show-toplevel` 解析当前工作树；不要在 hook 里
+6. `.githooks/pre-push` 用 `git rev-parse --show-toplevel` 解析当前工作树；不要在 hook 里
    用 hook 文件所在目录推导仓库根（linked worktree 会指到主工作树）。
 
 ## 浏览器视觉校验
@@ -93,13 +91,22 @@
 脚本的**结论**要落文档（渠道 `PROTOCOL.md` / 技能 `references/`）——脚本本身是工具，
 结论才是资产；两者都留，下次既能复用脚本，也知道结论是什么。
 
+**`.tmp/` 里存了真实凭据时收紧权限**：备份、抓包、会话快照可能带明文 token（实测
+`modelmux-backup-*` 里 19 个 JWT，其中 15 个仍在有效期）。这些目录一律不入库，但磁盘上
+仍是明文 —— 用 `icacls <目录> /inheritance:r /grant:r "$(whoami):(OI)(CI)F"` 去掉继承、
+只留当前用户。凭据真过期前不做 relogin 轮换的话，任何能读到工作目录的进程都能拿走。
+
+已收紧的单文件（非本项目渠道的历史探测残留，保留但不再扩权）：
+`codearts-live-backup.json`（含 DPoP 私钥与 refreshToken）、`codex-config.toml.bak`、
+`codex-config-before.toml`。它们不属于任何在册渠道，无需轮换；**不要**把它们打进支持包。
+
 ## 项目级技能入口软链（本机）
 
 Claude Code 只扫 `.claude/skills/`，而本仓技能实体在 `.agents/skills/`（5 个，随仓库分发）。
 为了「一份技能、多工具共用、不复制」，在本机把前者建成指向后者的**符号链接**。
 参照 deepseek-harness 的做法（其 git 内 `.claude/skills -> ../.agents/skills`，mode `120000`）。
 
-**软链不入库**（`.gitignore` 已忽略 `.claude/`）。为什么不做成入库软链：
+**软链不入库**（`.gitignore` 已忽略 `.claude/`）。不做成入库软链的原因：
 
 - Windows 的 git 默认 `core.symlinks=false`，`120000` 会被检出成「**内容为目标路径的文本文件**」，
   于是 `.claude/skills` 不是目录、扫描器得到 0 个技能（实测 2026-11-01：17 字节，内容 `../.agents/skills`）；
@@ -132,31 +139,6 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .tmp/link-claude-skills.ps1 -Remov
    `kill` 只允许针对**自己起的那个实例的 pid**；「挂掉能否拉回」这类验证同理，改在临时端口上做，
    不要拿用户正在使用的 4412 当实验对象。
 
-## 测试已知隐患
-
-### `--test-force-exit` 会静默丢结果（待修，别把「绿」当全跑）
-
-`packages/core/gateway` 的测试命令带 `--test-force-exit`，为的是绕过「用例都过了、进程却退不出去」。
-代价是**子进程被杀之前的结果会丢**：同一命令连跑，用例数会波动，比真实值少。
-
-实测事实（2026-11-07，Node v24.21.0）：
-
-- 带该标志（`npm test` 与推送门禁实际执行的那条）稳定报 `tests 724 / pass 724 / fail 0`、
-  退出码 0 —— 数字稳定，但这正是**中止未被上报**的形态。
-- `accounts.test.ts` / `chat-route.test.ts` / `cli.test.ts` **跑完不退进程**：单独跑各挂到
-  超时（`--test-timeout=20000` 下 exit 124），文件级用例被超时中止，
-  `tests N / pass N-1 / fail 1`，那 1 个 fail 就是文件级中止本身（用例本身全部通过）。
-- **去掉该标志整条命令不会自行结束**：实测全量跑输出停在 `accounts.test.ts` 后
-  持续 5 分钟零字节增长，进程不退出（不是「慢」，是**挂着**）。`--test-timeout`
-  只中止该文件的用例，不解决它留下的 handle，故整套跑不完。
-
-**修法**：查清这 3 个文件为何跑完不退。已排除的方向：import 侧效应（单独 import
-`dist/app/lifecycle/headless.js` 后进程正常退出）、测试内的 `child_process`/`cluster`、
-以及未 `unref` 的定时器（`catalogTimer` / `refresherTimer` / `saveTimer` 均已 `unref`）。
-修掉后去掉 `--test-force-exit`。**在此之前**：怀疑「测试没跑到」时逐个文件跑并**自己加超时**
-（`timeout 60 node --test tests/<file>.test.ts`）—— 整条命令去掉该标志会永久挂住，不能直接复跑；
-单文件跑则能如实报出被中止的那个。
-
 ## 构建模型
 
 1. 根 `tsconfig.json` 是 *solution* 文件（`files: []` + `references` 列出全部包），
@@ -178,8 +160,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .tmp/link-claude-skills.ps1 -Remov
 
 ## 推送门禁
 
-**由钩子自动执行，不需要手动跑**。`.githooks/pre-push` 在**推送发出之前**跑完与 CI 等价的
-命令，不通过就拦下推送。手动跑只剩「提前发现」这一个意义（commit 之后、push 之前就知道红没红）：
+由钩子自动执行，不需要手动跑。`.githooks/pre-push` 在推送发出之前跑完与 CI 等价的命令，不通过就拦下推送。手动跑只剩「提前发现」这一个意义：
 
 ```bash
 npm run gate          # 提前跑：干净 clone → npm ci → npm test
@@ -187,54 +168,55 @@ npm run gate          # 提前跑：干净 clone → npm ci → npm test
 
 实现见 `scripts/gate.sh`（`pre-push` 只是它的薄包装，两者共用同一份逻辑）。
 
-**门禁测的就是「要推的那个提交」**：pre-push 从 git 喂进来的
-`<local-ref> <local-sha> <remote-ref> <remote-sha>` 里取 **remote-ref** 认分支
-（`HEAD:<分支>` 写法的 local-ref 是字面量 `HEAD`，只扫第一个 token 会认不出分支，
-2026-11-13 修），取 **local-sha** 作为待测提交；该 sha 不在任何 ref 上时（游离 HEAD 工作树
-推 `HEAD:<分支>`），门禁在干净 clone 里按 sha `fetch` 精确复现，源仓库已开
-`uploadpack.allowAnySHA1InWant`（由 `scripts/setup-git-hooks.mjs` 接线）。
-分支删除（local-sha 全零）与不含分支引用的推送跳过门禁。
+### 测的是哪个提交
 
-**建 PR 入口焊死在 `npm run pr`**（`scripts/pr-create.mjs`），把「证绿」与「建 PR」做成一个原子动作：
-工作树必须干净、本地 HEAD 必须等于 `origin/<分支>`、门禁回执必须对应当前 HEAD —— 任一不满足即
-禁提 PR（「本地测试不对劲」不存在带病提交的口子）。回执是 `gate.sh` 成功时写进
-`<git-common-dir>/modelmux-gate-stamp` 的 `<sha> <epoch>`；缺失或过期时入口会现场重跑全量门禁，
-而不是放行。绕过入口直接 `gh pr create` 属违规。
+pre-push 从 git 喂入的 `<local-ref> <local-sha> <remote-ref> <remote-sha>` 里取值：
 
-**worktree 里的推送与手动跑不是同一条路径**：`git push` 会向 `pre-push` 注入
-`GIT_DIR`（指向当前 worktree 的 git 目录）等仓库定位变量，它们会污染 `gate.sh`
-内部的 `git clone` 视图 —— 若不清掉，clone 出的仓库缺少待推分支，门禁在 worktree 里
-对**本地新建、尚未推送**的分支恒失败（手动 `npm run gate` 却通过）。
-`gate.sh` 已在开头 `unset` 这类变量；往它里面加 `git` 调用时不要依赖外部仓库定位变量。
+| 取什么 | 用途 |
+| --- | --- |
+| **remote-ref** | 认分支（`HEAD:<分支>` 写法的 local-ref 是字面量 `HEAD`，只扫第一个 token 会认不出分支，2026-11-13 修） |
+| **local-sha** | 待测提交；不在任何 ref 上时（游离 HEAD 工作树推 `HEAD:<分支>`），门禁在干净 clone 里按 sha `fetch` 精确复现 |
 
-**真正不可绕过的是 CI**：钩子能被 `--no-verify` 绕过（按规矩要先说明理由并获同意），
-CI 不能 —— `main` 有分支保护，合并前 `test (node 22)` / `test (node 24)` 必须双绿。
+源仓库已开 `uploadpack.allowAnySHA1InWant`（由 `scripts/setup-git-hooks.mjs` 接线）。分支删除（local-sha 全零）与不含分支引用的推送跳过门禁。
 
-> 为什么不挂 `pre-commit`：门禁要干净 clone + `npm ci` + 全链测试（约 3 分钟），挂在每次提交上
-> 会让所有人开始 `--no-verify` —— **自动挡挂错位置比手动更糟**。`pre-push` 是成本与拦截力的平衡点。
+### 建 PR 的唯一入口
 
-**钩子怎么接上的**：git 默认只读 `.git/hooks/`，不认 `.githooks/`，所以根 `package.json` 的
-`prepare` 在 `npm install` 之后自动执行 `scripts/setup-git-hooks.mjs`，把 `core.hooksPath`
-指过来（幂等；非 git 环境只打印提示，不让安装失败）。**新克隆装完依赖即生效，不需要手动配置**。
-确认没接上时手动补一条：
+建 PR 入口焊死在 `npm run pr`（`scripts/pr-create.mjs`），把「证绿」与「建 PR」做成一个原子动作：
+
+1. 工作树必须干净；
+2. 本地 HEAD 必须等于远端分支（直接问 `git ls-remote`，不读本地 remote-tracking ref）；
+3. 门禁回执必须对应当前 HEAD。
+
+任一不满足即禁提 PR。回执是 `gate.sh` 成功时写进 `<git-common-dir>/modelmux-gate-stamp` 的 `<sha> <epoch>`；缺失或过期时入口会现场重跑全量门禁，而不是放行。绕过入口直接 `gh pr create` 属违规。
+
+### worktree 里的特殊处理
+
+`git push` 会向 `pre-push` 注入 `GIT_DIR`（指向当前 worktree 的 git 目录）等仓库定位变量，它们会污染 `gate.sh` 内部的 `git clone` 视图 —— 若不清掉，clone 出的仓库缺少待推分支，门禁在 worktree 里对本地新建、尚未推送的分支恒失败（手动 `npm run gate` 却通过）。`gate.sh` 已在开头 `unset` 这类变量；往它里面加 `git` 调用时不要依赖外部仓库定位变量。
+
+### 绕过与兜底
+
+- 钩子能被 `--no-verify` 绕过（按规矩要先说明理由并获同意）。
+- 真正不可绕过的是 CI：`main` 有分支保护，合并前 `test (node 22)` / `test (node 24)` 必须双绿。
+- 不挂 `pre-commit`：门禁要干净 clone + `npm ci` + 全链测试（约 3 分钟），挂在每次提交上会让所有人开始 `--no-verify` —— 自动挡挂错位置比手动更糟。`pre-push` 是成本与拦截力的平衡点。
+
+### 钩子如何接上
+
+git 默认只读 `.git/hooks/`，不认 `.githooks/`，所以根 `package.json` 的 `prepare` 在 `npm install` 之后自动执行 `scripts/setup-git-hooks.mjs`，把 `core.hooksPath` 指过来（幂等；非 git 环境只打印提示，不让安装失败）。新克隆装完依赖即生效，不需要手动配置。确认没接上时手动补：
 
 ```bash
 git config core.hooksPath .githooks     # 幂等，与 prepare 等效
 git config --get core.hooksPath         # 应为 .githooks
 ```
 
-一旦接上，**每次 `git push` 都会先跑一遍完整门禁**（干净 clone → `npm ci` → `npm test`，
-约数分钟）。这是本仓的刻意设计：门禁要拦住推送，而不是等 CI 事后发现。
-
-### 为什么必须 clone 到干净目录
+### 必须 clone 到干净目录的原因
 
 | 差异 | 后果 |
 | --- | --- |
 | `verify:commits` 需要完整 git 历史（CI 用 `fetch-depth: 0`） | 浅克隆会漏 |
-| `npm ci` 装**平台原生依赖**（esbuild 等） | 开发机上的残留依赖不代表 CI 能装 |
+| `npm ci` 装平台原生依赖（esbuild 等） | 开发机上的残留依赖不代表 CI 能装 |
 | 开发工作树自带未提交改动与陈旧产物（`dist/`） | 在工作树上跑，测的不是待推的那个提交 |
 
-门禁因此总是 **clone 一份到干净目录**（缺省每次运行各用独立临时目录，`GATE_DIR` 可指定固定落点）再跑。
+门禁因此总是 clone 一份到干净目录（缺省每次运行各用独立临时目录，`GATE_DIR` 可指定固定落点）再跑。
 
 ### 各阶段的强制范围
 
@@ -296,10 +278,13 @@ git config --get core.hooksPath         # 应为 .githooks
 1. `type` 额外允许 `merge`，专供合并提交。
 2. 校验器 `scripts/verify-commits.mjs` 已接入 `npm test`。
 3. **禁止署名类尾注**：提交、PR 描述与 **PR 里的每一条提交**都**不得携带**
-   `Co-Authored-By` / `Co-Developed-By` / `Generated-With` 一类尾注（任何大小写与连字变体）。
-   GitHub 会按尾注邮箱把「协作者」记进仓库贡献者列表，AI 助手（claude / codex / zcode 等）
-   由此上榜；PR 页面上的每条提交即使 squash 后也永久保留尾注，只查 PR 描述会漏
-   （PR #349 事故）。agent 的参与由 git 的 author/committer 与 PR 关联体现，不进消息正文。
+   `Co-Authored-By` / `Co-Developed-By` / `Generated-With` 一类尾注
+   （任何大小写与连字变体）。三条理由：
+   - GitHub 会按尾注邮箱把「协作者」记进仓库贡献者列表，AI 助手（claude / codex / zcode 等）
+     由此上榜。
+   - PR 页面上的每条提交即使 squash 后也永久保留尾注，只查 PR 描述会漏（PR #349 事故）。
+   - agent 的参与由 git 的 author/committer 与 PR 关联体现，不进消息正文。
+
    CI 的 `pull_request` 按 `PR_BASE..PR_HEAD` 逐条扫 PR 内全部提交，端点解析不到或
    范围为空同样报错退出（浅 fetch 造成的空范围是假绿）；校验器对一切违规直接拦。
 4. **合并方式**：

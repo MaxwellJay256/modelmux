@@ -15,17 +15,32 @@ modelmux 的可选 Windows 分发形态：**NSIS 一键安装器**（Electron）
 | 开机自启动 | 经设置弹窗开关读写：注册进 Windows 登录项（HKCU Run 键），命令行固定带 `--hidden`；登录时拉起壳后**静默收进托盘**（不自动显示窗口、不抢前台）。既有实例在跑时重复拉起也保持静默（`second-instance` 见 `--hidden` 即跳过调前台） |
 | 单实例 | 已有实例在跑（含关窗后托盘后台）时，再次启动只把已有窗口调到前台（`second-instance` → 显示窗口 + 先置顶再取消 + `app.focus({steal:true})`）；未拿到锁的实例立即退出，不再走启动流程 |
 | 网关进程 | `ELECTRON_RUN_AS_NODE=1` + 自身 exe 跑 `app/modelmux.mjs`（打包后的 CLI bundle，零第三方运行依赖）—— **不要求用户装 Node** |
-| 窗口 | **1000×720**（最小即默认，不让缩）；**尺寸记忆**：上次退出时的宽高与位置落 `%APPDATA%/modelmux-desktop/window-state.json`（userData），下次启动还原；位置已不在任一屏幕上则回落默认尺寸居中（拔显示器 / 改分辨率后窗口不会「消失」）；**标题栏隐藏**（顶栏即拖拽区，窗口控制钮在顶栏右侧，见下节）；`contextIsolation` + `sandbox` 开，**唯一 preload 是窗口控制桥**（白名单通道）—— 渲染层仍是网关托管的控制台 |
+| 窗口 | **1000×720**（最小即默认）；尺寸记忆；标题栏隐藏（顶栏即拖拽区）；`contextIsolation` + `sandbox` 开，唯一 preload 是窗口控制桥。细节见 [§1.1](#11-窗口与尺寸记忆) |
 | 关窗 | **收起为托盘**（`hide`，不退出）；网关继续在后台接客户端请求，托盘是唯一的可见入口与退出通道 |
 | 托盘 | 常驻通知区；菜单：网关状态（禁用项）/ 打开控制台 / 在浏览器打开 / 退出。单击托盘图标 = 打开控制台 |
 | 退出 | 只走托盘菜单 → `app.isQuitting` → 写 `watchdog.pause`（外层守护不再把网关拉回来）→ `before-quit` → 停**自己起的**网关；复用的网关不受影响 |
 | 启动 | 登录/手动启动时清 `watchdog.pause`：壳在跑 = 明确要网关在，守护恢复保护（与 `mx start` 同口径） |
 | 失败分因 | 端口被占（stderr 线索）≠ 起动超时 ≠ 起来后崩溃，错误页分别说明；主框架加载失败（`did-fail-load`）也落错误页，不让「正在启动」无限转圈 |
 | 崩溃恢复 | 渲染进程崩了（`render-process-gone`）自动重载窗口；网关已死时重载落到错误页 |
-| 网关存活巡检 | 每 10s 探一次 `/health`，**自己起的与复用来的都管**：由通变断 → 换「网关已断开」说明页（控制台与网关同进程，没有骨架可看），托盘状态同步改「未运行」；由断变通 → 自动载回 `/web/`。复用模式下壳不管理对方生命周期（`mx restart`、任务管理器都能把它停掉），没有这层巡检页面既不报错也不恢复（2026-11-15 实测；2026-11-17 真机复验通过：`mx stop` 后约 14s 换「网关已断开」说明页，`mx start` 后约 16s 自动载回控制台） |
+| 网关存活巡检 | 每 10s 探一次 `/health`，自己起的与复用来的都管。细节见 [§1.2](#12-网关存活巡检) |
 | 外链 | 窗口内跳转（`will-navigate`）与新窗口（`setWindowOpenHandler`）都交系统浏览器 —— 窗口绝不导航离开控制台（没有返回键） |
 
-### 前置条件（新机器零依赖）
+### 1.1 窗口与尺寸记忆
+
+- **尺寸**：1000×720，最小即默认，不让缩小。
+- **记忆**：上次退出时的宽高与位置落 `%APPDATA%/modelmux-desktop/window-state.json`（userData），下次启动还原。
+- **越界回落**：位置已不在任一屏幕上则回落默认尺寸居中（拔显示器 / 改分辨率后窗口不会「消失」）。
+- **标题栏隐藏**：顶栏即拖拽区，窗口控制钮在顶栏右侧。
+- **安全边界**：`contextIsolation` + `sandbox` 开，唯一 preload 是窗口控制桥（白名单通道）—— 渲染层仍是网关托管的控制台。
+
+### 1.2 网关存活巡检
+
+- 每 10s 探一次 `/health`，自己起的与复用来的都管。
+- 由通变断：换「网关已断开」说明页（控制台与网关同进程，没有骨架可看），托盘状态同步改「未运行」。
+- 由断变通：自动载回 `/web/`。
+- 复用模式下壳不管理对方生命周期（`mx restart`、任务管理器都能把它停掉），没有这层巡检页面既不报错也不恢复（2026-11-15 实测；2026-11-17 复验：`mx stop` 后约 14s 换说明页，`mx start` 后约 16s 载回）。
+
+### 1.3 前置条件（新机器零依赖）
 
 | 项 | 要求 |
 | --- | --- |
@@ -35,7 +50,7 @@ modelmux 的可选 Windows 分发形态：**NSIS 一键安装器**（Electron）
 | 凭据 | **不随 exe 附带** —— 首次使用需在 Web 控制台逐渠道登录；换机即换凭据 |
 | 网络 | 需要（上游推理与模型目录） |
 
-### 自定义标题栏与拖拽
+### 1.4 自定义标题栏与拖拽
 
 - 标题栏隐藏（`titleBarStyle: "hidden"`）：web 顶栏（LayoutSingle 的 `<header>`）即
   **拖拽区**（`.drag-region`）；顶栏上所有可点子元素（导航 / 主题钮 / 窗口控制钮）
@@ -68,17 +83,17 @@ npm run desktop        # 拷 payload → desktop/app/ → electron-builder nsis
 
 **安装器会自动结束正在运行的 modelmux，不需要手动退出**：`build/installer.nsh` 的
 `customCheckAppRunning`（electron-builder 认可的替换钩子）直接强杀 `modelmux.exe`
-（打两轮防竞态），装完 `runAfterFinish` 拉起新实例。为什么必须强杀：electron-builder
+（打两轮防竞态），装完 `runAfterFinish` 拉起新实例。必须强杀：electron-builder
 默认走「礼貌关闭」（向窗口发 WM_CLOSE 并等待），而壳的关窗语义是**收进托盘**，
-礼貌关闭永远等不到退出，只会弹「modelmux 无法关闭，请手动关闭」—— 重试永远过不去
-（实测 2026-11-12，交互与静默 `/S` 都被挡死）。安装本来就要替换二进制，强杀是唯一
-自洽的行为；托盘「退出」仍是日常的正常退出方式，强杀只发生在安装场景。
+礼貌关闭永远等不到退出，只会弹「modelmux 无法关闭，请手动关闭」—— 重试过不去
+（实测 2026-11-12，交互与静默 `/S` 都被挡死）。托盘「退出」仍是日常的正常退出方式，
+强杀只发生在安装场景。
 
 这个钩子**整体替换**内置检查，内置的「杀不掉就中止」也随之消失，所以在宏里自己
 复查一次（`nsProcess::FindProcess`）：仍存活则提示后中止，不硬装 —— 否则会留下
 「旧文件已删、新文件写不进去」的半装状态。
 
-**为什么是安装器而不是便携单文件**：electron-builder 的 `portable` 目标（NSIS 模板）
+**采用安装器而非便携单文件**：electron-builder 的 `portable` 目标（NSIS 模板）
 每次启动都 `RMDir /r` 删掉 `%TEMP%` 下的解压目录再全量解压 —— 应用运行时再点一次要等
 约 20 秒（冷启动约 6 秒），且删的正是正在运行的程序的文件。装到固定目录后没有解压，
 第二次启动 0.3s 内触发单实例事件、窗口立即前置。
@@ -86,7 +101,7 @@ npm run desktop        # 拷 payload → desktop/app/ → electron-builder nsis
 依赖安装走 `desktop/.npmrc` 的镜像；根 `npm install` **不会**装 Electron
 （`desktop/` 不在 workspaces），首次打包时由 pack 脚本自动补装。
 
-### 图标与版本信息（rcedit afterPack 钩子）
+### 2.1 图标与版本信息（rcedit afterPack 钩子）
 
 内层 exe 的图标与版本信息由 `desktop/after-pack.cjs` 用 `rcedit`（npm 包，自带
 预编译二进制）在打包流程中写入：
@@ -95,10 +110,10 @@ npm run desktop        # 拷 payload → desktop/app/ → electron-builder nsis
 - 同时写 `version-string`（ProductName / FileDescription / FileVersion），
   让任务栏、标题栏、托盘、属性页都用同一品牌标识。
 
-**为什么不交给 electron-builder 的资源改写**：它依赖 winCodeSign 工具包，本机解压该包时
+**资源改写走 `rcedit`**：electron-builder 的资源改写依赖 winCodeSign 工具包，本机解压该包时
 `app-builder` 建目录被拒（`mkdir ...\Cache\winCodeSign\<n>: Access is denied`，
-手动建同名目录却正常）—— 与其跟工具链的缓存路径较劲，不如用 `rcedit` 直接写。
-因此 `win.signAndEditExecutable` 保持 `false`（只跳过它的资源改写，不影响打包）。
+手动建同名目录却正常）。因此 `win.signAndEditExecutable` 保持 `false`（只跳过资源改写，不影响打包），
+图标与版本信息由 `rcedit` 的 afterPack 钩子写入。
 
 ## 3. 路径敏感性（实测，2026-11-10）
 
@@ -119,7 +134,7 @@ Electron 运行时对本机路径敏感，**同一份二进制、同一个脚本
 - **构建不受影响**：electron-builder 只打包不执行 Electron，仓库内构建正常；
   安装包双击安装即可，安装目录由安装器决定（短路径）。
 
-## 4. MotW 与签名（为什么 bluechonk.exe 不弹、有的会弹）
+## 4. MotW 与签名（哪些 exe 会弹安全提示）
 
 「打开文件 - 安全警告」（无法验证发布者）只在文件带 **Mark of the Web**
 （`Zone.Identifier` ADS，浏览器 / 压缩包 / 邮件客户端下载时打的「来自互联网」标签）时弹出。

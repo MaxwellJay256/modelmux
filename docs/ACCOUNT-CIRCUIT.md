@@ -1,7 +1,7 @@
 # 账号熔断自动恢复设计方案
 
-> 状态：**已实施**（2026-10-28）。规则已收敛进 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §3；
-> 本文保留设计依据与实现细节。
+> 设计依据文档：规则已收敛进 [POOL-ARCHITECTURE.md](./POOL-ARCHITECTURE.md) §3，
+> 本文只保留取舍与实测证据。
 > 问题出处：上游 120s header timeout 抖动 → 连败 3 次 → `health: error` 终态 → 人工才能解开。
 
 ## 1. 现状与问题
@@ -14,7 +14,7 @@ ok <──成功──────── noteAccountSuccess       // 只清 fail
                     markActiveHealth("ok")  // 无条件覆盖 health —— 但永远触发不到
 ```
 
-``auth.ts`` 的 `activeAccountIsError(cid)` 在**请求进来时**就短路：
+`auth.ts` 的 `activeAccountIsError(cid)` 在**请求进来时**就短路：
 `error` 账号的所有请求直接回 `account_error`，**不打上游、不记账**。
 因此成功路径（`markActiveHealth("ok")`）永远没有机会执行 —— `error` 是终态。
 
@@ -22,7 +22,7 @@ ok <──成功──────── noteAccountSuccess       // 只清 fail
 （半开试探 / 冷却到期惰性恢复）。后端仍保留 `resetAccount` 命令（等价 `clearAccountState`）作为调用面，
 但 UI 已无入口。
 
-### 1.2 触发源分析（为什么终态不合理）
+### 1.2 触发源分析（终态处置的缺陷）
 
 熔断的三个失败来源，只有一个是真·终态：
 
@@ -125,7 +125,7 @@ ok <──成功──────── noteAccountSuccess       // 只清 fail
 4. `cli/…`：`mx acct list` 的 error 附剩余时间。
 5. 文档：更新 `docs/POOL-ARCHITECTURE.md` §3 账号池状态表；本设计合入后收敛进该文档。
 
-## 7. 为什么不用别的方式
+## 7. 未采用的方式
 
 - 定时器轮询探测：需要额外进程状态，本地网关无必要 —— 「惰性放行」用下一次真实请求当探测。
 - half-open 放行 N 个探针：单用户本地网关并发基本为 1，放行 1 次足够。

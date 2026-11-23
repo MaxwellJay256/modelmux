@@ -22,22 +22,46 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
 const ALLOWLIST = join(HERE, "verify-sensitive.allowlist.txt");
 
-/** 跳过：构建产物 / 依赖 / lockfile / 本检查自己的 allowlist。 */
-const SKIP = /(^|[\\/])(node_modules|dist|\.git|coverage|\.tmp)([\\/]|$)/;
+/**
+ * 跳过：构建产物 / 依赖 / git 内部 / 覆盖率报告。
+ *
+ * `.tmp/` **不在此列**：扫描集来自 `git ls-files`，未跟踪文件本来就进不来；
+ * 把它写进 SKIP 反而是个漏洞 —— 有人 `git add -f .tmp/...` 强推凭据时，
+ * 门禁会因为这行跳过扫描。
+ */
+const SKIP = /(^|[\\/])(node_modules|dist|\.git|coverage)([\\/]|$)/;
 const SKIP_FILE = /(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb)$/;
 
 const PATTERNS = [
   { tag: "手机号", re: /(?<!\d)1[3-9]\d{9}(?!\d)/g },
-  // 只认**引号字面量**：`token: credential.accessToken` 是变量引用，不是泄漏
+  // 只认**引号字面量**：`token: credential.accessToken` 是变量引用，不是泄漏。
+  // 键名两侧的引号必须可选 —— JSON 形态（`"apiKey": "sk-..."`）里引号挡在键名与冒号
+  // 之间，漏掉它会让所有 opaque 令牌（非 JWT 的 accessToken / session）静默通过。
   {
     tag: "密钥字面量",
-    re: /(api[_-]?key|secret|password|access[_-]?key)\s*[:=]\s*["'`][A-Za-z0-9._~+/-]{12,}["']/gi,
+    re: /["']?(api[_-]?key|secret|password|access[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|sessionState)["']?\s*[:=]\s*["'`][A-Za-z0-9._~+/-]{12,}["'`]/gi,
   },
+  // JWT：三段式 base64url，前两段必是 `eyJ` 开头（`{"` 的 base64）。
+  // 7 个渠道全用 JWT 凭据，这是最该拦的一类 —— 原门禁只认 `Bearer` 前缀，
+  // 裸 JWT 粘进文档/测试/源码会全部放行。
+  { tag: "JWT", re: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
   {
     tag: "cookie 键值",
     re: /(sessionid|sid_guard|sid_tt|uid_tt|passport_auth_status|s_v_web_id)=[A-Za-z0-9._%-]{6,}/g,
   },
   { tag: "Bearer 令牌", re: /Bearer\s+[A-Za-z0-9._~+/-]{16,}/g },
+  // 设备指纹：32 位 hex 且**带键名**才算（裸 32 hex 会误伤 hash / 字节串）。
+  // 键名允许被引号包裹（JSON 形态 `"machine_id": "..."`）—— 漏掉引号会漏掉整类。
+  {
+    tag: "设备指纹",
+    re: /["']?(machine[_-]?id|device[_-]?id|machineId|deviceId)["']?\s*[:=]\s*["'`][0-9a-f]{32}["'`]/gi,
+  },
+  // 15 位纯数字（traecn 签到设备号形态），排除全同数字的占位值
+  {
+    tag: "15 位设备号",
+    re: /(?<!\d)[0-9]{15}(?!\d)/g,
+    filter: (s) => !/^(\d)\1+$/.test(s),
+  },
   // 长数字 id（uid 等）：排除全同数字的占位值
   {
     tag: "长数字 id",

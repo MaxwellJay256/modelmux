@@ -3,6 +3,19 @@
 本文件规定 modelmux 运行日志的**落点、格式、判定规则与检索方式**。每条规则都可对照实现
 验证（实现见 `packages/core/gateway/src/runtime/log-store.ts`）。
 
+## 目录
+
+- [1. 总则](#1-总则)
+- [2. 文件清单](#2-文件清单)
+- [3. 访问日志规范](#3-访问日志规范)
+- [4. 生命周期事件规范](#4-生命周期事件规范)
+- [5. 输出路由规则](#5-输出路由规则)
+- [6. 轮转、保留与阈值](#6-轮转保留与阈值)
+- [7. CLI 检索](#7-cli-检索)
+- [8. 安全边界](#8-安全边界)
+- [9. 请求正文抓取（恒开启）](#9-请求正文抓取恒开启)
+- [10. 故障分诊流程](#10-故障分诊流程)
+
 ## 1. 总则
 
 | 编号 | 规则 |
@@ -40,33 +53,35 @@
 
 `access/*` 每行一个 JSON 对象，字段取自 `RequestLog`（`runtime/log-store.ts`）：
 
-| 字段 | 类型 | 含义 | 写入时机 |
-| --- | --- | --- | --- |
-| `ts` | string | 请求**开始**时刻的 ISO 8601（UTC） | 落盘时按 `startAt` 生成 |
-| `id` | string | 请求标识 `req_` + 16 位十六进制；同时写入 `X-Request-Id` 响应头 | 请求进入时 |
-| `method` / `path` | string | HTTP 方法与路径 | 请求进入时 |
-| `startAt` | number | 请求开始的 epoch 毫秒 | 请求进入时 |
-| `model` | string | 请求的模型（**规范 deepseek 名**，如 `deepseek-v4.1-flash`；别名已归并） | 解析出模型后 |
-| `cid` | string | **承接**本次请求的渠道（跨渠道选路后逐次尝试写入，最后一条即服务方） | 候选尝试时（`attemptCandidate`） |
-| `key` | string | 承接请求的**账号 key**（池内账号标识，账号池按它归集「今日 tokens」） | 候选尝试时（`attemptCandidate`） |
-| `stream` | boolean | 是否流式 | 解析出模型后 |
-| `requestBytes` | number | 请求体字节数 | 读入请求体后 |
-| `messageCount` | number | 请求消息条数 | 读入请求体后 |
-| `systemChars` | number | 消息中 system 角色的字符总数 | 读入请求体后 |
-| `toolCount` | number | 请求携带的工具数量 | 读入请求体后 |
-| `upstreamMs` | number | 请求开始到**上游响应头到达**的毫秒数 | 上游响应头到达时 |
-| `ttfbMs` | number | 请求开始到**我们写出首个响应字节**的毫秒数 | 首帧写出时（仅记一次） |
-| `generateMs` | number | **纯生成窗口**：上游首帧到达 → 末帧到达的毫秒数。两个内部时刻（`firstFrameAt` / `lastFrameAt`）不落盘，只留这个差值 | 末帧到达时；只有一个内容帧则不写该字段（= 测不到，不是 0） |
-| `durationMs` | number | 请求总耗时（响应 finish/close 时计） | 响应结束时 |
-| `status` | number | 最终 HTTP 状态码 | 响应结束时 |
-| `outcome` | string | 结果分类，见 §3.2 | 响应结束时 |
-| `error` | string | 错误码（如 `upstream_error`、`upstream_timeout`） | 出错时 |
-| `detail` | string | **网关自身异常详情**（如 500 的真实异常）。只进 `error/*/error.log` 的镜像行，情况见 §5 第 3 条 | `internal_error` 兜底时（`noteRequestDetail`） |
-| `message` | string | 错误说明（**截断到 800 字符**） | 出错时 |
-| `usage` | object | 上游返回的 token 用量（含各家的缓存命中字段，逐渠道形态不同） | 收到 usage 帧（非流式为聚合后） |
-| `queued` | boolean | **进过上游排队**（收到排队帧并等待重试）。只在为真时写，缺省 = 没收到排队帧 | 排队帧到达时（`noteQueued`） |
-| `ua` | string | 客户端 User-Agent（截断 160 字符）。**只在未知路径 404 上写**：`/api/hello` 这类幽灵探针只能靠它认领来源 | 未知路径应答时（`noteRequestUa`） |
-| `route` | object | **选路快照**：`{ est, candidates[], attempts[], skipped[{cid,why}] }`。`est` 是输入估算 token，`candidates` 是全部候选顺序，`attempts` 是本次实际会试的，`skipped.why` 取 `auth` / `window` / `unauthorized` / `cooling`。落它的原因：路由只在内存里发生，事后「这次为什么走了这家」原本无从查证（2026-11-16 排查 qodercn 单次限流失败时确认） | 候选解析完成时（`noteRequestRoute`） |
+| 字段 | 含义 |
+| --- | --- |
+| `ts` | 请求**开始**时刻的 ISO 8601（UTC）；写入：落盘时按 `startAt` 生成 |
+| `id` | 请求标识 `req_` + 16 位十六进制；同时写入 `X-Request-Id` 响应头 |
+| `method / path` | HTTP 方法与路径 |
+| `startAt` | 请求开始的 epoch 毫秒 |
+| `model` | 请求的模型（**规范 deepseek 名**，如 `deepseek-v4.1-flash`；别名已归并）；写入：解析出模型后 |
+| `cid` | **承接**本次请求的渠道（跨渠道选路后逐次尝试写入，最后一条即服务方）；写入：候选尝试时（`attemptCandidate`） |
+| `key` | 承接请求的**账号 key**（池内账号标识，账号池按它归集「今日 tokens」）；写入：候选尝试时（`attemptCandidate`） |
+| `stream` | 是否流式；写入：解析出模型后 |
+| `requestBytes` | 请求体字节数 |
+| `messageCount` | 请求消息条数 |
+| `systemChars` | 消息中 system 角色的字符总数 |
+| `toolCount` | 请求携带的工具数量 |
+| `upstreamMs` | 请求开始到**上游响应头到达**的毫秒数；写入：上游响应头到达时 |
+| `ttfbMs` | 请求开始到**我们写出首个响应字节**的毫秒数；写入：首帧写出时（仅记一次） |
+| `generateMs` | **纯生成窗口**：上游首帧到达 → 末帧到达的毫秒数。两个内部时刻（`firstFrameAt` / `lastFrameAt`）不落盘，只留这个差值；写入：末帧到达时；只有一个内容帧则不写该字段（= 测不到，不是 0） |
+| `durationMs` | 请求总耗时（响应 finish/close 时计） |
+| `status` | 最终 HTTP 状态码 |
+| `outcome` | 结果分类，见 §3.2 |
+| `error` | 错误码（如 `upstream_error`、`upstream_timeout`） |
+| `detail` | **网关自身异常详情**（如 500 的真实异常）。只进 `error/*/error.log` 的镜像行，情况见 §5 第 3 条；写入：`internal_error` 兜底时（`noteRequestDetail`） |
+| `message` | 错误说明（**截断到 800 字符**） |
+| `usage` | 上游返回的 token 用量（含各家的缓存命中字段，逐渠道形态不同）；写入：收到 usage 帧（非流式为聚合后） |
+| `queued` | **进过上游排队**（收到排队帧并等待重试）。只在为真时写，缺省 = 没收到排队帧；写入：排队帧到达时（`noteQueued`） |
+| `ua` | 客户端 User-Agent（截断 160 字符）。**只在未知路径 404 上写**：`/api/hello` 这类幽灵探针只能靠它认领来源；写入：未知路径应答时（`noteRequestUa`） |
+| `route` | **选路快照**：`{ est, candidates[], attempts[], skipped[{cid,why}] }`；写入：候选解析完成时（`noteRequestRoute`） |
+
+`route` 各字段：`est` 是输入估算 token，`candidates` 是全部候选顺序，`attempts` 是本次实际会试的，`skipped.why` 取 `auth` / `window` / `unauthorized` / `cooling`。路由只在内存里发生，落它是为了事后能查「这次走了哪家、为什么」。
 
 > `ttfbMs` 的语义是「**我们**什么时候开始回字节」，不是「上游什么时候开始吐字」：
 > 流式下两者几乎相同（收到首帧即转发），但**非流式下我们收完才写** —— 该值于是 ≈ `durationMs`，
@@ -92,16 +107,16 @@
 | `status < 200` | `other` |
 
 显式标记优先于推导：流内错误、上游错误、超时由 `noteRequestError()` 置为 `failure`。
-**流内业务错误帧**（上游回 HTTP 200 却在 SSE 里投递 `{"error":{…}}`，qoder 系的排队 /
-额度 / 认证都是这个形态）由 `http/chat/stream.ts::noteStreamError` 逐帧记账；非流式请求
-则在聚合后一次性判定（`forward.ts` 的 `firstSseError`）—— 两条路径**同一套判据**。
-在这之前这类帧无声无息地记成 `success`，同一个上游错误会一直重复（实测 qodercn
-`code=112` + `pricingUrl` 额度错误）。额度类业务错误同时冷却账号（`quotaSignal` 判据，
-渠道知识不上共享层；免费模型只记账不冷却）。
-客户端提前断开**不改变分桶**（`noteClientDisconnect()` 与 `close` 回调都只留一句说明）——
-`outcome` 表达的是**服务端这次请求的结果**：上游该回的已经回了（200）就记 `success` ✓，
-说明里带上「客户端提前断开」即可；按 `success.log` 统计成功率才不失真 ✓。
-真没给出状态码（连接在应答前就断了）才是 `other` ✓。
+**流内业务错误帧**（上游回 HTTP 200 却在 SSE 里投递 `{"error":{…}}`，qoder 系的排队 / 额度 / 认证都是这个形态）由两条路径记账，判据相同：
+
+| 路径 | 落点 |
+| --- | --- |
+| 流式 | `http/chat/stream.ts::noteStreamError` 逐帧记账 |
+| 非流式 | `forward.ts` 的 `firstSseError`，聚合后一次性判定 |
+
+- 额度类业务错误同时冷却账号（`quotaSignal` 判据，渠道知识不上共享层；免费模型只记账不冷却）。
+- 客户端提前断开**不改变分桶**：`noteClientDisconnect()` 与 `close` 回调都只留一句说明。`outcome` 表达服务端这次请求的结果——上游该回的已经回了（200）就记 `success`，说明里带上「客户端提前断开」即可，按 `success.log` 统计成功率才不失真。
+- 真没给出状态码（连接在应答前就断了）才记 `other`。
 
 ### 3.3 例外规则
 
@@ -147,13 +162,18 @@
 （`SLOW_MIN_COMPLETION` 只服务「速率慢」判定，均值要的是所有可计算样本）。算不出样本时
 为 `null`（界面显示 `—`，不是 0）。
 
-**统计范围与列表同源**（`queryAccessLogs` 的 `inScope`）：`stats` 只覆盖调用方声明的
-`path` / `paths` **与 `cid`**（渠道下拉仍列路径范围内全部渠道，不随选择塌缩），日志页与控制台总览都传 `MODEL_REQUEST_PATHS`。不这么收口的话，access 日志里
-必然存在的非模型记录（浏览器探测 `GET /.well-known/appspecific/com.chrome.devtools.json` → 404、
-`/health`、`/v1/models`）会把统计条顶成「请求 1 / 失败 1」，而列表只列模型请求、点「失败」一条
-也没有 —— 分段计数与列表必须同源（2026-11-06 实测）。不传路径与渠道时统计覆盖全部（CLI / 排障要全量）。**结果分桶只有成功 / 失败两桶**：历史上的「中断」
-（`other.log`，`status < 200` 才落）实测恒空、界面上也说不清含义，已删；旧机器上的 `other.log`
-读取时按失败计（`legacyOtherFiles`），不再写入。
+**统计范围与列表同源**（`queryAccessLogs` 的 `inScope`）：
+
+1. **覆盖范围**：`stats` 只覆盖调用方声明的 `path` / `paths` 与 `cid`。渠道下拉仍列
+   路径范围内全部渠道，不随选择塌缩。日志页与控制台总览都传 `MODEL_REQUEST_PATHS`。
+2. **不收口的后果**：access 日志里必然存在非模型记录（浏览器探测
+   `GET /.well-known/appspecific/com.chrome.devtools.json` → 404、`/health`、`/v1/models`），
+   会把统计条顶成「请求 1 / 失败 1」，而列表只列模型请求、点「失败」一条也没有
+   （2026-11-06 实测）。分段计数与列表必须同源。
+3. **不传路径与渠道时**：统计覆盖全部（CLI / 排障要全量）。
+4. **分桶只有成功 / 失败两桶**：历史上的「中断」（`other.log`，`status < 200` 才落）
+   实测恒空、界面上也说不清含义，已删。旧机器上的 `other.log` 读取时按失败计
+   （`legacyOtherFiles`），不再写入。
 
 **定位**：命中后按三个耗时字段的组合找原因：
 
@@ -211,7 +231,7 @@ worker 与网关的每一行输出按下列规则落盘（`headless.ts` 的 `log
 | 单文件大小上限 | 10MB | `MODELMUX_LOG_MAX_BYTES` | 每次追加前检查（`rotateIfNeeded`） |
 | 保留天数 | 14 | `MODELMUX_LOG_RETENTION_DAYS` | 每个进程每天首次写入时清理（`pruneOnce`） |
 | 首字慢阈值 | 10000ms（仅流式） | `MODELMUX_SLOW_TTFB_MS` | 写 `slow.log` 与读路径重算（§3.5） |
-| 速率慢阈值 | 30 t/s（生成量 ≥ 20 tokens） | `MODELMUX_SLOW_TPS` | 同上（`MODELMUX_SLOW_MS` 总时长口径已退役） |
+| 速率慢阈值 | 30 t/s（生成量 ≥ 20 tokens） | `MODELMUX_SLOW_TPS` | 同上 |
 | 上游空闲超时 | 120000ms | `MODELMUX_READ_TIMEOUT_MS` | 转发层读上游时 |
 | 抓取单条正文上限 | 10MB | `MODELMUX_LOG_PAYLOAD_MAX_BYTES` | 抓取落盘时（§9）；超限双端保留（头尾各半） |
 | 抓取保留天数 | 3 | `MODELMUX_LOG_PAYLOAD_DAYS` | `pruneOnce` **先**按它清 `payload/`，再走保留期（§9） |
@@ -288,17 +308,21 @@ GBK argv）原样进压缩块，落盘后仍可逐字节复原；呈现层按 UT
 替换符，`invalidBytes` 如实标注数量。**已落盘的旧行**里那些字节已被替换符顶掉、
 无从恢复，因此**不带** `invalidBytes` 标注 —— 无从统计就不猜。
 
-**正文压缩与分块**：**合法 UTF-8 且 < 4KB** 保持明文（压完还要 base64，可能反而变大）；
-其余一律压缩（zstd 优先，Node < 22.15 回落 gzip）—— 无效字节只能活在压缩分支里，
-任何「先转字符串」的动作都会把它们顶掉。超过 1 MiB 的正文按 1 MiB 一块
-**切成多帧**（dsh 的会话日志按批分帧，本仓的「批」就是整条正文，单帧会把「取一片 64 KiB」
-逼成「解压全量」）。块越小开销越大（实测 3.77 MB 正文：256K 块 +15.5%、512K +10.5%、
-1M 仅 +5.4%），1 MiB 是存储开销与局部解码收益的平衡点。读回按 `bodyEnc` 透明解码，
-**三种形态（老行 `body` / 单帧 `bodyB64` / 分块 `bodyChunks`）照旧可读**。
-明文压缩使 `~/.modelmux` 从 78MB 降到 42MB；分块重编码使存量增长约 3.5%
-（`mx log --compact` 一次，判据是形态迁移完成而非变小）。
+**正文压缩与分块**：
 
-之所以不做「内容寻址去重（blob）」，是因为**实测重复率为 0**：2 天 114 条正文
+| 条件 | 处理 |
+| --- | --- |
+| 合法 UTF-8 且 < 4KB | 保持明文（压完还要 base64，可能反而变大） |
+| 其余 | 压缩（zstd 优先，Node < 22.15 回落 gzip） |
+| 超过 1 MiB | 按 1 MiB 一块切成多帧 |
+
+- 无效字节只能活在压缩分支里：任何「先转字符串」的动作都会把它们顶掉。
+- 分块原因：dsh 的会话日志按批分帧，本仓的「批」就是整条正文；单帧会把「取一片 64 KiB」逼成「解压全量」。
+- 块大小取舍（实测 3.77 MB 正文）：256K 块 +15.5%、512K +10.5%、1M 仅 +5.4% —— 1 MiB 是存储开销与局部解码收益的平衡点。
+- 读回按 `bodyEnc` 透明解码，三种形态（老行 `body` / 单帧 `bodyB64` / 分块 `bodyChunks`）都可读。
+- 效果：明文压缩使 `~/.modelmux` 从 78MB 降到 42MB；分块重编码使存量增长约 3.5%（`mx log --compact` 一次，判据是形态迁移完成而非变小）。
+
+不做「内容寻址去重（blob）」：**实测重复率为 0**（2 天 114 条正文
 全部唯一，`client` 与 `upstream` 正文也无一字节相同。去重会多出一层目录与必须配套的 GC，
 收益为零。
 

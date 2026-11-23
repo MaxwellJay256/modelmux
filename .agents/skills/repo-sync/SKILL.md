@@ -52,7 +52,7 @@ git rev-list --left-right --count main...origin/main   # 本地与远端差多�
 | 新增/改名/删除任何 `docs/*.md` | `docs/README.md` 索引（同步更新） |
 | 新增/改名/删除渠道目录 | `docs/README.md` 与 `docs/channels/README.md` 两张表都要登记 |
 
-### 代码注释整改（强制）
+### 1.1 代码注释整改（强制）
 
 **只要动了代码注释，收尾前逐条对照 [`docs/MODULE-COMMENTS.md`](../../../docs/MODULE-COMMENTS.md)
 的三层分工** —— 注释与文档出现双份事实源是最常见的腐化路径：
@@ -71,7 +71,7 @@ git rev-list --left-right --count main...origin/main   # 本地与远端差多�
 R4 TODO/@deprecated 条件）；它只拦零误报的硬违规，语义层（协议事实副本、指向已删文件的过时指针）
 仍需按上面三条人工过一遍。
 
-### md 文档整改（强制，每轮收尾）
+### 1.2 md 文档整改（强制，每轮收尾）
 
 `.md` 只描述**当前状态**：自指变更史、实施状态注解、变更箭头与 TODO 标记都属于历史，归 git。
 每轮收尾先扫一遍、再逐条判断：
@@ -106,15 +106,17 @@ grep -rnE '此前|原先|曾经|旧版|早期|改造前|修复后|结论已反�
    会被引号与换行破坏。
 4. 换行一律 LF；提交前 `git status` / `git diff` 自查，敏感信息（token/密码/密钥/
    .env）绝不入库。
-5. **PR body 与 commit message 用中性客观笔触（持久记录禁止对话式内容）**：档案里不写
-   人称（主人 / 你 / 我）、互动过程（批复 / 拍板 / 反馈 / 指正 / 等你确认 / 需要你配合）、
-   一次性动作（重载窗口 / 刷新页面）、待办口吻（另起任务 / 后续我处理）、emoji 与图形
-   状态符（✅ ❌ ⚠ 等，引用命令真实输出的除外）—— 一律改写成事实本身（「问题：…」
-   「选型：…」「未实现项：…」）；决策依据写结论，不写沟通过程。
-   **squash merge 会把 PR body 写进 main 的 commit body**，所以 PR body 要按 commit
-   message 的标准写；§6 的「需要用户配合的事项」只属于**对话回复**，绝不搬进 PR body。
-   commit message 侧由 `scripts/verify-commits.mjs` 机械拦截（对话词 + emoji）；
-   历史 PR 出现同类表述时一并清理（`gh pr edit` 对已合并 PR 有效）。
+5. **PR body 与 commit message 用中性客观笔触**（持久记录禁止对话式内容）：
+
+   - **不写**：人称（主人 / 你 / 我）、互动过程（批复 / 拍板 / 反馈 / 指正 / 等你确认 /
+     需要你配合）、一次性动作（重载窗口 / 刷新页面）、待办口吻（另起任务 / 后续我处理）、
+     emoji 与图形状态符（✅ ❌ ⚠ 等，引用命令真实输出的除外）。
+   - **改写成事实本身**（「问题：…」「选型：…」「未实现项：…」）；决策依据写结论，
+     不写沟通过程。
+   - **squash merge 会把 PR body 写进 main 的 commit body**，所以 PR body 要按 commit
+     message 的标准写；§6 的「需要用户配合的事项」只属于**对话回复**，绝不搬进 PR body。
+   - **机械拦截**：commit message 侧由 `scripts/verify-commits.mjs` 检查（对话词 + emoji）；
+     历史 PR 出现同类表述时一并清理（`gh pr edit` 对已合并 PR 有效）。
 
 ## 3. 分支 → PR → CI → merge（需要推送时执行）
 
@@ -235,7 +237,7 @@ CI 状态、真机验证结论、分支/工作树/临时文件状态、以及**�
 **边界：本节清单只属于对话回复** —— 配合事项、提醒、待办一律不进 PR body、
 commit message 与任何档案（见 §2 第 5 条；squash 会把 PR body 写进 main 的 commit）。
 
-### Agent 交付说明（每轮变更的固定格式）
+### 6.1 Agent 交付说明（每轮变更的固定格式）
 
 除清单外，每轮代码变更附一段结构化说明 —— 便于复盘、CR 与跨会话对齐：
 
