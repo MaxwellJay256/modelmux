@@ -16,6 +16,7 @@ import {
   ensureDir,
   login as sharedLogin,
   loginFlow,
+  paths,
   prefsPath,
   writeSecretFile,
 } from "@modelmux/gateway";
@@ -89,8 +90,41 @@ export const IDE_VERSION_CODE = "20260811";
 const PLUGIN_VERSION = "2.3.62834";
 export const USER_AGENT = "Trae/0.1.52";
 
-const CALLBACK_PORT = 18080;
+/**
+ * 回调监听端口 / 绑定地址 / 对外地址（三个都能用环境变量覆盖）。
+ *
+ * 默认只绑 `127.0.0.1`：桌面形态下浏览器与网关同机，回环足够且不对外暴露。
+ * 容器部署时浏览器打不到容器的回环（Docker 端口发布 DNAT 到 `eth0`，只监听
+ * `lo` 收不到），必须改绑 `0.0.0.0` 并给出宿主机可达的对外地址。
+ *
+ * `TRAECN_PUBLIC_HOST` 单独存在是因为 `0.0.0.0` 不能出现在授权 URL 里 ——
+ * 上游会把回调地址原样回填进浏览器跳转，写 `0.0.0.0` 就跳不过去。
+ * 实测上游**不校验**回调地址（连 `not-a-url` 都原样回显），故非回环可用。
+ */
+const CALLBACK_PORT = Number(process.env["TRAECN_LOGIN_PORT"] ?? "18080");
+const LISTEN_HOST = process.env["TRAECN_LOGIN_HOST"] ?? "127.0.0.1";
+const PUBLIC_HOST = process.env["TRAECN_PUBLIC_HOST"] ?? LISTEN_HOST;
 const CALLBACK_PATH = "/authorize";
+
+/**
+ * 绑非回环却没给对外地址时直接拒绝启动登录。
+ *
+ * 两者缺一都跑不通：只改 LISTEN_HOST 会让授权 URL 里出现 `0.0.0.0`（浏览器
+ * 跳不过去），而只给 PUBLIC_HOST 又绑在回环上（外部请求打不进来）。配置错误
+ * 在登录开始时报出来，比让用户等到十分钟超时好。
+ */
+function assertCallbackConfig(): void {
+  const loopback = LISTEN_HOST === "127.0.0.1" || LISTEN_HOST === "localhost";
+  if (loopback) return;
+  const publicIsLoopback =
+    PUBLIC_HOST === "127.0.0.1" || PUBLIC_HOST === "localhost" || PUBLIC_HOST === "0.0.0.0";
+  if (publicIsLoopback) {
+    throw new Error(
+      `TRAECN_LOGIN_HOST=${LISTEN_HOST} 绑非回环地址时必须同时设 TRAECN_PUBLIC_HOST 为外部可达的主机名或 IP` +
+        `（0.0.0.0 不能写进授权 URL，浏览器会跳不过去）`,
+    );
+  }
+}
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const HTTP_TIMEOUT_MS = 30_000;
 
@@ -417,7 +451,7 @@ function listenOn(server: Server, port: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const onError = (err: Error): void => reject(err);
     server.once("error", onError);
-    server.listen(port, "127.0.0.1", () => {
+    server.listen(port, LISTEN_HOST, () => {
       server.removeListener("error", onError);
       const address = server.address() as { port: number } | null;
       resolve(address?.port ?? port);
@@ -426,12 +460,20 @@ function listenOn(server: Server, port: number): Promise<number> {
 }
 
 /**
- * 启动本地回调服务器（默认 18080）。
+ * 启动本地回调服务器（默认 `127.0.0.1:18080`）。
  *
  * 端口被占用（EADDRINUSE/EACCES）时回退随机端口 —— 调用方必须用返回的
  * 实际端口重算登录 URL。
+ *
+ * **只认本次登录的 nonce 路径**：绑非回环时同网段任何人都能打到这个端口，
+ * 若不校验就变成登录 CSRF —— 攻击者在自己登录期间抢先 GET
+ * `/authorize?access_token=<他的 token>`，本机就用他的凭据入池，之后所有
+ * 请求与数据都落到他账号上。路径里的 nonce 每次登录重新生成，猜不到。
  */
-async function startCallbackServer(port = CALLBACK_PORT): Promise<CallbackServer> {
+async function startCallbackServer(
+  nonce: string,
+  port = CALLBACK_PORT,
+): Promise<CallbackServer> {
   let resolveParams: (value: Record<string, string>) => void = () => {};
   let rejectParams: (err: Error) => void = () => {};
   const params = new Promise<Record<string, string>>((resolve, reject) => {
@@ -441,13 +483,14 @@ async function startCallbackServer(port = CALLBACK_PORT): Promise<CallbackServer
   // close() 可能早于 wait()：先挂一个吞掉的 catch，避免 unhandled rejection 噪音
   void params.catch(() => {});
   let settled = false;
+  const expectedPath = `${CALLBACK_PATH}/${nonce}`;
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    // 只认回调路径：登录期间任何命中该端口的请求（浏览器预取、重复登录、探测）都会
-    // 走到这里，而 `flat` 里没有 token —— 不校验就等于「任意请求即可终结本次登录」，
-    // 本次登录会立刻失败在 `parseCallback` 的「no token」上（raccoon 校验 pathname）。
-    if (url.pathname !== CALLBACK_PATH) {
+    // 路径必须带本次登录的 nonce：浏览器预取、重复登录、探测、以及同网段的
+    // 注入尝试都因路径不符被挡在 404。`flat` 里没有 token 的请求即使路径对，
+    // 也会在 parseCallback 的「no token」上失败。
+    if (url.pathname !== expectedPath) {
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("not found");
       return;
@@ -510,9 +553,95 @@ async function startCallbackServer(port = CALLBACK_PORT): Promise<CallbackServer
   };
 }
 
+/** 粘贴兜底的轮询周期：与回调服务器并存竞争，谁先到用谁。 */
+const PASTE_POLL_MS = 400;
+
+/**
+ * 等回调：本地监听与粘贴兜底两条通道竞争，先到的胜出。
+ *
+ * 容器部署时浏览器打不到容器回环，本地监听永远等不到 —— 粘贴通道是那时
+ * 唯一能走通的路。桌面形态下两条都在，正常走本地监听，粘贴框空着不影响。
+ */
+async function waitForCallback(
+  callback: CallbackServer,
+  pasteCode: (() => string | undefined) | undefined,
+  nonce: string,
+  timeoutMs: number,
+): Promise<Record<string, string>> {
+  if (typeof pasteCode !== "function") return callback.wait(timeoutMs);
+
+  const deadline = Date.now() + timeoutMs;
+  // 轮询用 unref 定时器：输掉竞争后不必等它自然超时，进程可以直接退出
+  const sleepUnref = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
+  const polling = (async (): Promise<Record<string, string>> => {
+    for (;;) {
+      if (Date.now() >= deadline) throw new Error("waiting for pasted callback timed out");
+      const pasted = pasteCode();
+      const parsed = typeof pasted === "string" ? parsePastedCallback(pasted, nonce, PUBLIC_HOST) : null;
+      if (parsed !== null) return parsed;
+      await sleepUnref(PASTE_POLL_MS);
+    }
+  })();
+
+  // 输掉的一方留着会拖住事件循环（回调服务器已 close / 轮询仍在跑）——
+  // 用 finally 收尾，胜出后立刻停掉另一条。
+  // 输掉的 polling 在超时时会 reject：先挂一个吞掉的 catch，避免 unhandled rejection。
+  void polling.catch(() => {});
+  try {
+    return await Promise.race([callback.wait(timeoutMs), polling]);
+  } finally {
+    callback.close();
+  }
+}
+
 interface LoginOptions {
   onUrl?: (url: string) => void;
   onStatus?: (msg: string) => void;
+  /**
+   * 取走用户粘回的回调链接（共享层在控制台 / CLI 里注入）。
+   *
+   * 回调监听器绑在容器回环上时浏览器打不到，这条是唯一的兜底通道：
+   * 用户把地址栏里那整条 URL 粘回来，同样能解析出 token。
+   */
+  pasteCode?: () => string | undefined;
+}
+
+/**
+ * 从粘贴文本里捞回调参数。
+ *
+ * 三关全过才认，少一关就是登录 CSRF（攻击者诱导用户粘一条他自己的回调，
+ * 本机就以他的身份入池）：
+ *   1. 能解析成 URL；
+ *   2. host 必须是本次登录的对外地址（或回环）；
+ *   3. path 必须是 `CALLBACK_PATH/<本次 nonce>`。
+ */
+function parsePastedCallback(
+  text: string,
+  nonce: string,
+  expectedHost: string,
+): Record<string, string> | null {
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:") return null;
+  const host = url.hostname.toLowerCase();
+  const allowed = new Set([expectedHost.toLowerCase(), "127.0.0.1", "localhost", "[::1]", "::1"]);
+  if (!allowed.has(host)) return null;
+  if (url.pathname !== `${CALLBACK_PATH}/${nonce}`) return null;
+  const flat: Record<string, string> = {};
+  for (const [key, value] of url.searchParams) {
+    if (!(key in flat)) flat[key] = value;
+  }
+  return flat;
 }
 
 /**
@@ -526,17 +655,25 @@ interface LoginOptions {
  */
 export async function login(baseUrl?: string, options: LoginOptions = {}): Promise<Credentials> {
   const { onUrl, onStatus } = options;
+  assertCallbackConfig();
   const machineId = generateMachineId();
   const deviceId = generateDeviceId();
-  const callback = await startCallbackServer();
+  // 每次登录一条独立 nonce：回调路径猜不到，挡同网段的登录注入
+  const nonce = randomBytes(16).toString("hex");
+  const callback = await startCallbackServer(nonce);
   try {
-    const callbackUrl = `http://127.0.0.1:${callback.port}${CALLBACK_PATH}`;
+    const callbackUrl = `http://${PUBLIC_HOST}:${callback.port}${CALLBACK_PATH}/${nonce}`;
     // 授权页固定在 consoleHost（www.trae.cn）；共享层传入的 baseUrl 是 agentHost，误传会导致登录域名错误
     const authorizeUrl = buildAuthorizeUrl(callbackUrl, machineId, deviceId);
     onUrl?.(authorizeUrl); // 拿到 URL 立刻回调（命令行展示，用户自行打开）
-    onStatus?.(`等待授权回调（本地端口 ${callback.port}）…`);
+    // 绑非回环时把风险说清楚：回调带 token，同网段可嗅探
+    onStatus?.(
+      LISTEN_HOST === "127.0.0.1" || LISTEN_HOST === "localhost"
+        ? `等待授权回调（本地端口 ${callback.port}）…`
+        : `等待授权回调（${LISTEN_HOST}:${callback.port}）… 回调地址对本网段可见，只在可信网络使用`,
+    );
 
-    const flat = await callback.wait(LOGIN_TIMEOUT_MS);
+    const flat = await waitForCallback(callback, options.pasteCode, nonce, LOGIN_TIMEOUT_MS);
     const fields = parseCallback(flat);
 
     // 老流程：回调只带 refreshToken（不带 userJwt.Token）→ 先兑换出 access token。
@@ -754,6 +891,39 @@ class ClientMismatchError extends Error {
 }
 
 /**
+ * 旧兑换端点可能已下线的信号。
+ *
+ * 上游已迁 `/trae/api/v3/oauth/ExchangeToken`（新契约带 PKCE + 设备密钥对），
+ * 本仓仍走 `/cloudide/api/v3/...`。旧端点被关掉时，症状与「凭据失效」不同：
+ *
+ * - **404 / 405**：路径没了 —— 凭据可能完全正常，是端点消失；
+ * - **非 JSON 响应**（HTML 错误页 / 网关 502 页）：同理，不是鉴权失败；
+ * - **10101「无效参数」**：新端点用这个码表示缺 DeviceInfo。旧端点用它表示
+ *   client 归属不符（本仓已换线重试）。两者共用码值，故只在换线重试也失败后
+ *   才把「无效参数」形态归到端点变更 —— 归属不符的 10101 已被前一步消化。
+ *
+ * 判据宁可漏报不可误报：这里只做提示，不改变错误类型与重试行为。
+ */
+function looksLikeEndpointGone(status: number, text: string): boolean {
+  if (status === 404 || status === 405) return true;
+  // 非 JSON（HTML 错误页）且状态非 2xx：网关层拒绝，不是业务鉴权
+  const trimmed = text.trim();
+  if (status !== 200 && !trimmed.startsWith("{") && !trimmed.startsWith("[")) return true;
+  return false;
+}
+
+/** 端点疑似下线时打一次提示（同进程只打一次，避免每次续期都刷屏）。 */
+function noteEndpointMaybeGone(status: number): void {
+  paths.noteOnce(
+    "traecn-exchange-endpoint",
+    `traecn ExchangeToken returned HTTP ${status} on the legacy endpoint ` +
+      `(${OAUTH_EXCHANGE_PATH}). The upstream has migrated to /trae/api/v3/oauth/ExchangeToken ` +
+      `with PKCE + device key pair; the old endpoint may be retired. ` +
+      `See docs/channels/traecn/PROTOCOL.md §9.1 before assuming the credential is invalid.`,
+  );
+}
+
+/**
  * 调 `ExchangeToken` 用 refresh token 换新 token（**不落盘**）。
  *
  * **access 与 refresh 都轮换**，调用方必须把两个都写回。
@@ -808,6 +978,8 @@ async function exchangeWithClient(
   if (resp.status !== 200) {
     const text = await resp.text().catch(() => "");
     if (/10101|not matched to the client/i.test(text)) throw new ClientMismatchError("client mismatch");
+    // 端点消失（404/405）或网关返回 HTML 错误页：先提示，别让人误判成凭据失效
+    if (looksLikeEndpointGone(resp.status, text)) noteEndpointMaybeGone(resp.status);
     throw new Error(`ExchangeToken returned HTTP ${resp.status}`);
   }
 
@@ -823,6 +995,8 @@ async function exchangeWithClient(
     env = null;
   }
   if (!env) {
+    // 200 却给了 HTML：多半是网关/边缘层拦下的错误页，不是凭据问题
+    noteEndpointMaybeGone(resp.status);
     throw new ReloginRequiredError("ExchangeToken returned non-JSON (possibly an HTML error page), credential is invalid, please log in again");
   }
 
