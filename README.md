@@ -34,10 +34,23 @@ node packages/cli/dist/cli.js web                # 打开 Web 控制台（http:/
 npm run desktop      # 可选：打成 Windows 安装版 exe
 ```
 
+## Docker 部署
+
+需要 Docker Compose v2 与 BuildKit。首次使用前创建共享网络，然后构建并启动：
+
+```bash
+docker network create modelmux-net
+cp deploy/docker/.env.example deploy/docker/.env
+docker compose -f deploy/docker/docker-compose.yml up -d --build
+node scripts/docker-console.mjs   # 在宿主机运行；打开打印的地址，创建 API key 并登录渠道
+```
+
+宿主机通过 `http://127.0.0.1:4412/v1` 接入；加入 `modelmux-net` 的可信容器使用 `http://modelmux:4412/v1`。控制台不经共享入口暴露，由 `scripts/docker-console.mjs` 只经宿主回环接入。构建参数、端口与卷、容器内登录（traecn 回调端口、raccoon 粘贴深链）、备份与升级见 [docs/DOCKER-DEPLOY.md](docs/DOCKER-DEPLOY.md)。
+
 ## 接入任意客户端
 
 任何 OpenAI 兼容客户端把 base url 指到 `http://127.0.0.1:4412/v1`，模型填**裸模型名**
-（清单看 `GET /v1/models`，如 `deepseek-v4.1-flash`；API key 任意非空）即可 ——
+（清单看 `GET /v1/models`，如 `deepseek-v4.1-flash`；使用控制台创建的 API key）即可 ——
 哪家渠道出由网关按额度自动挑。
 
 ## Web 控制台

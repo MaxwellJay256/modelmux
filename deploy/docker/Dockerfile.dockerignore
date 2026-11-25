@@ -1,0 +1,16 @@
+.git
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.tmp
+.agents/worktrees
+.claude
+.zcode
+.dsh
+desktop
+**/reference
+**/*.log
+coverage

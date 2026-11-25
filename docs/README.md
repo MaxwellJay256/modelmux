@@ -41,6 +41,7 @@
 | [LOG-PAYLOAD-DESIGN.md](./LOG-PAYLOAD-DESIGN.md) | **日志正文抓取的设计依据**：单条上限 10MB、超限双端兜底；现行规则见 LOGGING.md §9 |
 | [ACCOUNT-ROTATION.md](./ACCOUNT-ROTATION.md) | **按账号账单与额度耗尽自动换号**：`mx bill --accounts` 的口径、两段式账单判据、换号边界 |
 | [ACCOUNT-CIRCUIT.md](./ACCOUNT-CIRCUIT.md) | **账号熔断自动恢复的设计依据**：三态 + 指数退避 + 惰性半开试探；现行规则见 POOL-ARCHITECTURE.md §2.4 / §3.3 |
+| [DOCKER-DEPLOY.md](./DOCKER-DEPLOY.md) | **Docker 部署**：Compose 构建与启动、网络边界、控制台通道、数据与密钥卷、容器内登录（traecn 回调 / raccoon 粘贴）、升级与备份 |
 
 ### 1.3 Web 控制台
 
