@@ -21,6 +21,20 @@ export const DISPLAY_NAME = "Loomy";
 /** 上游线型：标准 OpenAI 兼容 SSE，网关只需规范化透传。 */
 export const WIRE: "openai" | "custom" = "openai";
 
+/**
+ * 从 usage 帧读取**本次消耗的积分**（上游字段 `points_consumed`）。
+ *
+ * 实测（2026-11-26）：`usage: {prompt_tokens, completion_tokens, total_tokens,
+ * completion_tokens_details: {reasoning_tokens}, points_consumed: 1}`。
+ * 单位与 `billing.fetchCredits()` 的 `total.unit`（"积分"）一致，可直接扣减。
+ */
+export function consumedCredits(usage: Record<string, unknown>): { amount: number; unit: string } | null {
+  const raw = usage["points_consumed"];
+  const amount = typeof raw === "number" ? raw : Number.parseFloat(String(raw ?? ""));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return { amount, unit: "积分" };
+}
+
 const API_PREFIX = "/api/v1";
 export const OK_CODE = "000000";
 const AUTH_ERROR_CODE = "100002";
@@ -230,14 +244,39 @@ export function buildHeaders(
 }
 
 /**
+ * 请求体是否携带图片分片（`image_url` part）。
+ *
+ * 决定用途头取值：服务端**按用途路由**，不带 `kb.vision` 的带图请求不进视觉链路，
+ * 模型收不到图（真机 A/B：同样一张图，`chat.message` 下 prompt_tokens 63 且答盲话，
+ * `kb.vision` 下 168 且答对 —— 见 PROTOCOL §2.2.1）。
+ */
+export function hasImagePart(body: Buffer | undefined): boolean {
+  if (!body || body.length === 0) return false;
+  // 网关发出的 body 是本仓 `JSON.stringify` 的产物（键值间无空格），但入站请求可能已被
+  // 预格式化，故容忍 `"type"` 与值之间的空白。
+  return /"type"\s*:\s*"image_url"/.test(body.toString("utf8"));
+}
+
+/** 用途头取值：`chat.message` 为普通对话，`kb.vision` 为带图对话。 */
+const PURPOSE_CHAT = "chat.message";
+const PURPOSE_VISION = "kb.vision";
+
+/**
  * 对话请求头族（网关 `buildChatHeaders` 钩子）：基础头 + 官方 attribution 五头。
  *
  * 上游裁决层读这组头判「是否官方客户端」，缺它们是第三方网关与真实客户端最具体的
  * 差异（生态实测，见 PROTOCOL §2.2.2）。chatid/msgid **每请求新生**：会话级稳定 +
  * 每请求新 msgid 会被判成同对话并发/重放（偶发 409，Android-AI-gateway 2.11.0
  * 实测后回退为每请求唯一）。
+ *
+ * `body` 是网关已序列化的请求体（契约第三参）；带图时必须改用 `kb.vision`，
+ * 否则请求不进视觉链路。
  */
-export function buildChatHeaders(credential: AuthLike): Record<string, string> {
+export function buildChatHeaders(
+  credential: AuthLike,
+  _cfg?: unknown,
+  body?: Buffer,
+): Record<string, string> {
   const msgId = `msg-${randomUUID()}`;
   return {
     ...chatHeaders(credential),
@@ -245,7 +284,7 @@ export function buildChatHeaders(credential: AuthLike): Record<string, string> {
     MsgId: msgId,
     TurnId: msgId,
     InvokeOrigin: "user",
-    "X-Loomy-Request-Purpose": "chat.message",
+    "X-Loomy-Request-Purpose": hasImagePart(body) ? PURPOSE_VISION : PURPOSE_CHAT,
   };
 }
 

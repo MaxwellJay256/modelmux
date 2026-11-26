@@ -26,8 +26,9 @@
 | 凭据域（`X-Domain`） | `www.codebuddy.cn` |
 | 国际版端点 | `https://www.codebuddy.ai`（**不在本渠道**，凭据不通用） |
 | 登录/续期前缀 | `/v2/plugin` |
-| 对话路径 | `/v2/chat/completions` |
-| 模型目录 | `/v2/enterprises/personal/models`（POST，仅个人账号） |
+| 对话路径 | `/v2/chat/completions`（POST） |
+| 模型目录主源 | `https://copilot.tencent.com/v3/config`（GET，个人/企业都可用，可见性由 `agents[name=cli].models` 决定） |
+| 模型目录兜底 | `https://www.codebuddy.cn/v2/enterprises/personal/models`（GET，仅个人账号；账单主机） |
 
 ## 2. 登录（OAuth 授权页 + 轮询）
 
@@ -94,13 +95,19 @@ POST /v2/chat/completions
 
 ## 6. 模型目录
 
-`POST /v2/enterprises/personal/models`（个人账号专用；企业账号无此表）：
+**主源 `GET https://copilot.tencent.com/v3/config`**（个人/企业都可用，可见性由
+`agents[name=cli].models` 与条目 `disabled` 共同决定）；主源不可用（404/405/501）才回落
+**`GET https://www.codebuddy.cn/v2/enterprises/personal/models`**（仅个人账号）。
+
+两条端点的响应都是同一形态：
 
 ```
 { code: 0, data: { models: [{ id, name, aliases, disabled }], availableModels: [...] } }
 ```
 
-- 过滤：`disabled: true` 的剔除；`availableModels` 非空时只保留其中列出的 id。
+- 过滤：`disabled: true` 的剔除；`/v3/config` 另取 `agents[name=cli].models` 交集；
+  `availableModels` **非空**时只保留其中列出的 id，**空数组表示不过滤**
+  （当成有效过滤集会把整个目录清空）。
 - 兜底表（渠道包 `models.json`）用于未登录 / 离线；远端失败**不清空**缓存。
 - 规格（上下文 / 输出 / 模态）是数据，落在 `models.json`。
 - **deepseek-v4.1-flash 供给实测（2026-11-14）**：目录条目 `contextWindow: 1000000` /
@@ -159,8 +166,12 @@ HTTP 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"
   （Android-AI-gateway #16 增量探针）。**触发表过期时按上面出处重新取样。**
 - 网关行为：出站前对 system/assistant 文本做最小同义改写（`upstream.ts` 的
   `REFUSAL_REWRITES`），不用零宽字符；改写不了的形态（如 `11-128` 字面量）按 400 如实透传。
-- 消息条数硬上限：**512 条**（Agent2API #48 实测 511 过 / 512 断连，与体积无关）；
-  `buildChatBody` 在建连前就拒绝，报错文案带实际条数。
+- 消息条数硬上限：**511 条**（Agent2API #48 实测 511 过 / 512 断连，与体积无关）。
+  两条防线：`buildChatBody` 在建连前拒绝（抛 `UnsupportedInputError`，报错带实际条数），
+  `upstream.maxMessages()` 把上限声明给共享层做**选路预判** —— 超限的候选在路由阶段
+  就被跳过，长会话顺延到其它渠道而不是整条请求判成 400。
+  这是**渠道能力上限**，不是用户输入非法：`UnsupportedInputError` 让网关换候选重试
+  （与 catpaw 的图片守卫同一信号），不会被当成终局错误。
 - 判成渠道校验（而非协议 bug）的判据：`code:11128` + `unapproved channel` 文案。
 
 ## 8. 证据等级
@@ -194,7 +205,7 @@ HTTP 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"
 
 ### 10.1 怎么测这个渠道
 
-端到端由 Agent 跑 `dsh-mx-test` skill（dsh ACP 直连 `http://127.0.0.1:4412/v1`）：
+端到端由 Agent 直连 `http://127.0.0.1:4412/v1` 跑真实会话（验收判据见 [LOGGING.md §10.9](../../LOGGING.md)）：
 
 ```bash
 mx login codebuddycn

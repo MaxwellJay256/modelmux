@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { resolveModel } from "../dist/catalog.js";
-import { isCapacityError, parseEnvelope } from "../dist/upstream.js";
+import { hasImagePart, consumedCredits, isCapacityError, parseEnvelope } from "../dist/upstream.js";
 
 describe("parseEnvelope：业务信封解析", () => {
   it("非对象输入返回空信封，不抛错", () => {
@@ -49,5 +49,51 @@ describe("isCapacityError：推理集群过载识别", () => {
 describe("resolveModel：模型名归一", () => {
   it("未知名称原样透传（不编造映射）", () => {
     assert.equal(resolveModel("definitely-not-a-model-xyz"), "definitely-not-a-model-xyz");
+  });
+});
+
+describe("hasImagePart：图片分片识别（决定用途头取值）", () => {
+  const withImage = Buffer.from(
+    JSON.stringify({ messages: [{ role: "user", content: [
+      { type: "text", text: "这是什么" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,xxx" } },
+    ] }] }),
+  );
+
+  it("含 image_url 分片 → true（用途头要发 kb.vision）", () => {
+    assert.equal(hasImagePart(withImage), true);
+  });
+
+  it("容忍键值之间的空白（入站请求可能已预格式化）", () => {
+    assert.equal(hasImagePart(Buffer.from('{"messages":[{"type": "image_url"}]}')), true);
+  });
+
+  it("纯文本对话 → false（用途头发 chat.message）", () => {
+    assert.equal(
+      hasImagePart(Buffer.from(JSON.stringify({ messages: [{ role: "user", content: "hi" }] }))),
+      false,
+    );
+  });
+
+  it("空 body / undefined → false，不抛错", () => {
+    assert.equal(hasImagePart(undefined), false);
+    assert.equal(hasImagePart(Buffer.alloc(0)), false);
+  });
+});
+
+describe("consumedCredits：本次消耗额度", () => {
+  it("points_consumed 转成「积分」增量", () => {
+    assert.deepEqual(consumedCredits({ points_consumed: 1 }), { amount: 1, unit: "积分" });
+  });
+
+  it("缺失 / 非正 / 非数 → null（不编 0）", () => {
+    assert.equal(consumedCredits({}), null);
+    assert.equal(consumedCredits({ points_consumed: 0 }), null);
+    assert.equal(consumedCredits({ points_consumed: -2 }), null);
+    assert.equal(consumedCredits({ points_consumed: "abc" }), null);
+  });
+
+  it("数字字符串也认（上游版本差异）", () => {
+    assert.deepEqual(consumedCredits({ points_consumed: "3" }), { amount: 3, unit: "积分" });
   });
 });

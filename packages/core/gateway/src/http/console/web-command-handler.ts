@@ -13,15 +13,14 @@ import { channelCapabilities, channels, getChannel, hasChannel, type Channel } f
 import { runInChannel } from "../../runtime/channel-context.js";
 import { poolCandidates, poolModels } from "../../pool/pool-targets.js";
 import { isPrefsModel, loadModelPrefs, setPreferredChannel } from "../../pool/model-prefs.js";
-import { ledgerSnapshot, refreshBilling, sortChannelsByUsage } from "../../pool/pool-usage.js";
-import { listAccounts, activateAccount, clearAccountState, removeAccount, syncPool } from "../../runtime/account-pool.js";
+import * as poolUsage from "../../pool/pool-usage.js";
 import {
-  disabledChannelSet,
-  loadUserSettings,
-  normalizeSyncInterval,
-  saveUserSettings,
-  setChannelEnabled,
-} from "../../runtime/user-settings.js";
+  estimatedRemainOf,
+  ledgerSnapshot,
+  refreshBilling,
+  sortChannelsByUsage,
+} from "../../pool/pool-usage.js";
+import { listAccounts, activateAccount, clearAccountState, removeAccount, syncPool } from "../../runtime/account-pool.js";
 import {
   API_KEY_NAME_MAX,
   createApiKey,
@@ -32,6 +31,7 @@ import {
   updateApiKey,
 } from "../../runtime/api-key-store.js";
 import { signinTodaySnapshot, type ClaimToday } from "../../auth/signin-ledger.js";
+import { disabledChannelSet, setChannelEnabled } from "../../runtime/user-settings.js";
 import { renderChannelPool } from "./web-types.js";
 import type {
   WebChannelSignin,
@@ -65,29 +65,6 @@ export interface WebCommandDeps {
   submitInput?: (value: string) => void;
   /** 用户关掉了登录弹窗：不再等两步登录的输入（见 `ControlBridge.cancelInput`）。 */
   cancelInput?: () => void;
-  /**
-   * 一键接入：把本机 harness 的模型配置改写成网关的对外模型名。
-   *
-   * 实现由 app 层注入（写的是 `~/.zcode` / `~/.dsh`，不是网关运行时），
-   * 控制台只校验 target 并转交。省略时该动作返回「未就绪」。
-   */
-  integrate?: (target: "zcode" | "dsh") => {
-    ok: boolean;
-    error?: string;
-    /** 变更说明（人读，控制台作展示）。 */
-    notes?: string[];
-    /** 需要用户处置的警告（备份清单读不出 / 备份未登记 等）；不透出会被当噪音忽略。 */
-    warnings?: string[];
-  };
-  /** 一键还原：把目标恢复成接入前状态（取该目标最新一次备份，可重复使用）。 */
-  restore?: (target: "zcode" | "dsh") => {
-    ok: boolean;
-    error?: string;
-    restored: string[];
-    removed: string[];
-    /** 跳过条目 / 备份缺失等需要让用户知道的说明（不透出会伪装成「已还原」）。 */
-    notes: string[];
-  };
 }
 
 export type WebCommandHandler = (body: WebCommandBody) => Promise<WebCommandResult>;
@@ -117,7 +94,7 @@ const PUBLIC_ACTIONS = new Set([
   "pasteCallback",
   "submitInput",
   "cancelInput",
-  // 一键接入 / 还原不在此列：它们改写本机客户端配置（~/.zcode、~/.dsh），
+  // 一键接入 / 还原不在此列：它们改写本机客户端配置（~/.zcode），
   // 必须走 admin 判定（socket 回环）。控制台本就来自本机浏览器，admin 恒真，
   // 移出零成本；而一旦网关被绑到非回环地址，免鉴权远程写就是真缺口。
 ]);
@@ -188,16 +165,7 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
                   ok: entry?.ok ?? 0,
                   fail: entry?.fail ?? 0,
                   // 渠道 × 账号拆分：每个账号的 ok / fail 计数与额度快照
-                  accounts: Object.entries(entry?.accounts ?? {}).map(([key, count]) => ({
-                    key,
-                    ok: count.ok,
-                    fail: count.fail,
-                    credits: count.credits ?? null,
-                    billing_at: count.billing_at ?? null,
-                    billing_ok: count.billing_ok ?? false,
-                    // 当日基线（当天首个 bill 的 remain）：前端拿它当 100% 分母
-                    baseline: count.baseline ?? null,
-                  })),
+                  accounts: accountRowsOf(entry?.accounts),
                 };
               }),
           }))
@@ -227,15 +195,7 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
                 quota: channel.billing.quotaPeriod?.() ?? null,
                 ok: entry.ok,
                 fail: entry.fail,
-                accounts: Object.entries(entry.accounts ?? {}).map(([key, count]) => ({
-                  key,
-                  ok: count.ok,
-                  fail: count.fail,
-                  credits: count.credits ?? null,
-                  billing_at: count.billing_at ?? null,
-                  billing_ok: count.billing_ok ?? false,
-                  baseline: count.baseline ?? null,
-                })),
+                accounts: accountRowsOf(entry.accounts),
               },
             ],
           });
@@ -420,30 +380,6 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
         deps.cancelInput();
         return ok({ cancelled: true, message: "已取消登录输入" });
       }
-      case "integrate": {
-        // 一键接入：把本机 harness 的模型配置改成网关的对外模型名。
-        const target = args["target"];
-        const INTEGRATION_TARGETS = ["zcode", "dsh"] as const;
-        if (typeof target !== "string" || !(INTEGRATION_TARGETS as readonly string[]).includes(target)) {
-          return err(`参数 target 只能是 ${INTEGRATION_TARGETS.join(" / ")}`);
-        }
-        if (!deps.integrate) {
-          return err("当前运行形态不支持一键接入（未注入 integrate）");
-        }
-        const result = deps.integrate(target as "zcode" | "dsh");
-        if (!result.ok) {
-          // 失败也带上警告：只报 error 会把「备份没登记上」这类线索丢掉
-          const detail = (result.warnings ?? []).join("；");
-          const message = [result.error ?? "接入失败", detail].filter((part) => part !== "").join("；");
-          return err(message);
-        }
-        return ok({
-          target,
-          notes: result.notes ?? [],
-          warnings: result.warnings ?? [],
-          message: result.notes?.[0] ?? "已接入",
-        });
-      }
       case "checkUpdate": {
         // 手动检查更新（设置页按钮）：忽略每日节流，失败如实上报
         const [{ VERSION }, { forceCheckForUpdate }] = await Promise.all([
@@ -459,44 +395,6 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
           checkedAt: result.checkedAt,
         });
       }
-      case "integrationSync": {
-        // 只读当前间隔（公共面）。写入必须走 `setIntegrationSync`（admin）——
-        // 能改这条设置等于能关掉自动同步或触发高频重写客户端配置，
-        // 与 `setChannelEnabled` 同属「改全局配置」，不能免鉴权。
-        return ok({ interval_s: loadUserSettings().integration_sync_interval_s });
-      }
-      case "setIntegrationSync": {
-        const raw = args["interval_s"];
-        if (typeof raw !== "number" || !Number.isFinite(raw)) return err("参数 interval_s 必须是数字");
-        const next = normalizeSyncInterval(raw);
-        saveUserSettings({ integration_sync_interval_s: next });
-        return ok({ interval_s: next });
-      }
-      case "restore": {
-        // 一键还原：把该目标恢复成接入前的样子（取最新一次备份）。
-        const target = args["target"];
-        const INTEGRATION_TARGETS = ["zcode", "dsh"] as const;
-        if (typeof target !== "string" || !(INTEGRATION_TARGETS as readonly string[]).includes(target)) {
-          return err(`参数 target 只能是 ${INTEGRATION_TARGETS.join(" / ")}`);
-        }
-        if (!deps.restore) {
-          return err("当前运行形态不支持一键还原（未注入 restore）");
-        }
-        const result = deps.restore(target as "zcode" | "dsh");
-        if (!result.ok) return err(result.error ?? "还原失败");
-        const parts: string[] = [];
-        if (result.restored.length > 0) parts.push(`还原 ${result.restored.length} 个文件`);
-        if (result.removed.length > 0) parts.push(`删除 ${result.removed.length} 个接入新建的文件`);
-        // notes 必须透出：条目被跳过 / 备份文件缺失时，「已还原」会是假象
-        // （界面只报 ok 会让人以为配置真的回到接入前了）
-        return ok({
-          target,
-          restored: result.restored,
-          removed: result.removed,
-          notes: result.notes,
-          message: parts.length > 0 ? parts.join("、") : "已还原（无需改动）",
-        });
-      }
       default:
         return err(`未知 action: ${String(action)}`);
     }
@@ -505,6 +403,34 @@ export function createWebCommandHandler(deps: WebCommandDeps = {}): WebCommandHa
     return { ok: false, error: message };
   }
   };
+}
+
+/**
+ * 账本里的账号条目 → 控制台的账号额度行。
+ *
+ * `estimated_remain` 是「上次账单值 − 按 usage 累加的消耗」：**展示用估算**，
+ * 不可扣减（单位不一致 / 无增量）时为 `null`，前端回落到真实账单值。
+ * `tier` 是后台调度算出的刷新档位（active / idle / paused），排障时能看出
+ * 「为什么这个账号额度一分钟一更、另一个三分钟一更」。
+ */
+function accountRowsOf(
+  accounts: Record<string, poolUsage.AccountCount> | undefined,
+): Array<Record<string, unknown>> {
+  return Object.entries(accounts ?? {}).map(([key, count]) => ({
+    key,
+    ok: count.ok,
+    fail: count.fail,
+    credits: count.credits ?? null,
+    billing_at: count.billing_at ?? null,
+    billing_ok: count.billing_ok ?? false,
+    // 当日基线（当天首个 bill 的 remain）：前端拿它当 100% 分母
+    baseline: count.baseline ?? null,
+    // 估算余额（真实值 − 累计消耗增量）；null = 不可扣减
+    estimated_remain: estimatedRemainOf(count.credits, count.spent),
+    // 消费档位（active / idle / paused）与上次成功转发时刻
+    tier: count.billing_tier ?? null,
+    last_ok_at: count.last_ok_at ?? null,
+  }));
 }
 
 /**

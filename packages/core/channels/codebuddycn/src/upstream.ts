@@ -2,17 +2,18 @@
  * CodeBuddy 国内版上游：端点表 + 头族 + 请求体改写 + 模型目录拉取。
  *
  * 关键约束（端点/字段/实测见 docs/channels/codebuddycn/PROTOCOL.md）：
- *   - 对话端点是 `/v2/chat/completions`，请求体是 **gzip 压缩**的 OpenAI 形态
- *     （`Content-Encoding: gzip` + `Accept-Encoding: identity`）——不压缩会被上游拒。
+ *   - 对话端点是 `/v2/chat/completions`，请求体是**明文** OpenAI 形态：只设
+ *     `Accept-Encoding: identity`、不声明 `Content-Encoding`（声明 gzip 却发明文会被拒）。
  *   - 头族按账号带 `X-User-Id` / `X-Domain` / `X-Enterprise-Id`，并伪装官方 CLI
  *     身份（User-Agent / X-IDE-* / x-stainless-*）—— 上游按整组头判定是否官方客户端。
- *   - 模型目录在 `/v2/enterprises/personal/models`（仅个人账号；企业账号无此表）。
+ *   - 模型目录主源 `GET /v3/config`（可见性由 agents[name=cli].models 决定）；
+ *     `/v2/enterprises/personal/models` 仅在个人账号且主源不可用时兜底。
  */
 
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-import { login as shared, upstreamPath } from "@modelmux/gateway";
+import { login as shared, upstreamPath, UnsupportedInputError } from "@modelmux/gateway";
 
 import * as cred from "./cred.js";
 
@@ -37,6 +38,19 @@ const USER_AGENT = `CLI/${CLI_VERSION} CodeBuddy/${CLI_VERSION}`;
 
 /** 上游线型：标准 OpenAI 兼容 SSE（delta 帧 + usage 帧 + [DONE]）。 */
 export const WIRE: "openai" | "custom" = "openai";
+
+/**
+ * 从 usage 帧读取**本次消耗的 credits**（上游字段 `credit`）。
+ *
+ * 实测（2026-11-26）：`usage: {…, credit: 0, quota: {model, percent, reset_at}}`。
+ * `credit` 是本次消耗，`quota.percent` 是**剩余百分比**（不是绝对值，不参与扣减）。
+ */
+export function consumedCredits(usage: Record<string, unknown>): { amount: number; unit: string } | null {
+  const raw = usage["credit"];
+  const amount = typeof raw === "number" ? raw : Number.parseFloat(String(raw ?? ""));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return { amount, unit: "credits" };
+}
 
 const HTTP_TIMEOUT_MS = 60_000;
 
@@ -286,6 +300,16 @@ function writeText(content: unknown, rewrite: (text: string) => string): unknown
 /** 上游拒绝的消息条数硬上限（Agent2API #48 实测：512 条稳定 400，511 条通过）。 */
 const MAX_MESSAGES = 512;
 
+/**
+ * 本渠道单次请求能承载的消息条数上限（共享层选路据此提前跳过超限候选）。
+ *
+ * 与 `buildChatBody` 里的守卫同源：那里是最后一道防线（规范化后条数可能变化），
+ * 这里是**选路阶段的先验** —— 长会话不该先白撞一次上游才换渠道。
+ */
+export function maxMessages(): number {
+  return MAX_MESSAGES - 1;
+}
+
 /** 家族缺省 system：ccLoad/Agent2Providers 同款（上游要求首条必须是 system）。 */
 const DEFAULT_SYSTEM =
   "You are CodeBuddy Code. You are an interactive CLI tool that helps users with software engineering tasks.";
@@ -309,8 +333,11 @@ export function buildChatBody(
   if (Array.isArray(body["messages"])) {
     const messages = body["messages"] as unknown[];
     if (messages.length >= MAX_MESSAGES) {
-      throw new Error(
-        `messages exceed upstream limit: CodeBuddy accepts at most ${MAX_MESSAGES - 1} messages per request, got ${messages.length}`,
+      // 抛 `UnsupportedInputError` 而不是普通 Error：超长会话是**本渠道的能力上限**
+      // （换一家渠道本来能跑），不是用户输入非法 —— 普通 Error 会被网关判成终局 400，
+      // 长会话直接失败（实测 2026-11-25：1955 条消息的请求整条 400，而池里其它渠道能处理）。
+      throw new UnsupportedInputError(
+        `CodeBuddy accepts at most ${MAX_MESSAGES - 1} messages per request, got ${messages.length}`,
       );
     }
     const normalized = messages.map((message) => {
